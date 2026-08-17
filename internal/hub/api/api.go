@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -886,7 +887,8 @@ func (a *API) getServers(c *gin.Context) {
 	if reg := a.agentRegistry; reg != nil {
 		if recs := reg.List(); len(recs) > 0 {
 			servers := make([]gin.H, 0, len(recs))
-			for _, rec := range recs {
+			for i := range recs {
+				rec := &recs[i]
 				servers = append(servers, gin.H{
 					"id":          rec.AgentID,
 					"hostname":    rec.Hostname,
@@ -3610,6 +3612,7 @@ func FormatError(err error) string {
 }
 
 // importConfig handles config import from external tools via migrators.
+// 按名称去重：重复导入不会产生重复的守护目标。
 func (a *API) importConfig(c *gin.Context, migratorName string) {
 	m := conflict.GetMigrator(migratorName)
 	if m == nil {
@@ -3624,17 +3627,47 @@ func (a *API) importConfig(c *gin.Context, migratorName string) {
 		return
 	}
 
-	for i := range targets {
-		if err := a.storage.SaveGuardTarget(targets[i]); err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("保存目标失败: %v", err)})
-			return
-		}
+	existing, _ := a.storage.GetGuardTargets()
+	existingNames := make(map[string]bool, len(existing))
+	for _, t := range existing {
+		existingNames[t.Name] = true
 	}
+
+	imported, skipped := 0, 0
+	var importedNames []string
+	for i := range targets {
+		if existingNames[targets[i].Name] {
+			skipped++
+			continue
+		}
+		if targets[i].ID == "" {
+			targets[i].ID = uuid.NewString()
+		}
+		if err := a.storage.SaveGuardTarget(targets[i]); err != nil {
+			skipped++
+			continue
+		}
+		existingNames[targets[i].Name] = true
+		imported++
+		importedNames = append(importedNames, targets[i].Name)
+	}
+
+	a.storage.SaveAudit(types.AuditEntry{
+		ID:        uuid.NewString(),
+		Timestamp: time.Now(),
+		Actor:     c.GetString("username"),
+		Action:    "import:" + migratorName,
+		Target:    configPath,
+		Reason:    "从其他工具迁移守护配置",
+		Result:    fmt.Sprintf("imported=%d skipped=%d", imported, skipped),
+	})
 
 	c.JSON(200, gin.H{
 		"migrator": migratorName,
-		"imported": len(targets),
-		"targets":  targets,
+		"total":    len(targets),
+		"imported": imported,
+		"skipped":  skipped,
+		"targets":  importedNames,
 	})
 }
 
@@ -3645,15 +3678,25 @@ func (a *API) importBaota(c *gin.Context)      { a.importConfig(c, "baota") }
 func (a *API) importPM2(c *gin.Context)        { a.importConfig(c, "pm2") }
 
 func (a *API) dbVacuum(c *gin.Context) {
+	before := a.storage.GetDBSize()
 	if err := a.storage.Vacuum(); err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("VACUUM 失败: %v", err)})
 		return
 	}
-	c.JSON(200, gin.H{"status": "ok", "message": "数据库 VACUUM 完成"})
+	after := a.storage.GetDBSize()
+	c.JSON(200, gin.H{"status": "ok", "message": fmt.Sprintf("数据库 VACUUM 完成，%.2f MB → %.2f MB", float64(before)/1024/1024, float64(after)/1024/1024)})
 }
 
 func (a *API) dbCleanup(c *gin.Context) {
 	var errs []string
+	// 先按差异化保留策略清理（审计 WORM 不动），再清攻击数据
+	rp, err := a.storage.GetRetentionPolicy()
+	if err != nil {
+		rp = storage.DefaultRetentionPolicy()
+	}
+	if err := a.storage.EnforceRetention(rp); err != nil {
+		errs = append(errs, fmt.Sprintf("保留策略清理: %v", err))
+	}
 	if err := a.storage.PurgeOldAttackEvents(); err != nil {
 		errs = append(errs, fmt.Sprintf("清理攻击事件: %v", err))
 	}
@@ -3667,30 +3710,78 @@ func (a *API) dbCleanup(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "message": "数据清理完成"})
 }
 
+// parseExportParams 解析导出接口的公共查询参数。
+func parseExportParams(c *gin.Context, defaultHours int) (since time.Time, limit int, csv bool) {
+	hours, _ := strconv.Atoi(c.DefaultQuery("hours", strconv.Itoa(defaultHours)))
+	if hours <= 0 {
+		hours = defaultHours
+	}
+	limit, _ = strconv.Atoi(c.DefaultQuery("limit", "10000"))
+	if limit <= 0 || limit > 50000 {
+		limit = 10000
+	}
+	return time.Now().Add(-time.Duration(hours) * time.Hour), limit, strings.ToLower(c.Query("format")) == "csv"
+}
+
+// writeCSVResponse 将行数据以 CSV 流式写回响应。
+func writeCSVResponse(c *gin.Context, filename string, header []string, n int, rowAt func(i int) []string) {
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	w := csv.NewWriter(c.Writer)
+	_ = w.Write(header)
+	for i := 0; i < n; i++ {
+		_ = w.Write(rowAt(i))
+	}
+	w.Flush()
+}
+
 func (a *API) exportMetrics(c *gin.Context) {
-	since := time.Now().AddDate(0, -1, 0)
-	metrics, err := a.storage.GetMetrics("", "", since, 10000)
+	since, limit, asCSV := parseExportParams(c, 30*24)
+	metrics, err := a.storage.GetMetrics("", "", since, limit)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("导出指标失败: %v", err)})
+		return
+	}
+	if asCSV {
+		writeCSVResponse(c, "metrics_export.csv", []string{"timestamp", "type", "name", "value", "unit"}, len(metrics), func(i int) []string {
+			m := metrics[i]
+			return []string{m.Timestamp.Format(time.RFC3339), string(m.Type), m.Name, fmt.Sprintf("%g", m.Value), m.Unit}
+		})
 		return
 	}
 	c.JSON(200, gin.H{"metrics": metrics, "count": len(metrics)})
 }
 
 func (a *API) exportAlerts(c *gin.Context) {
-	alerts, err := a.storage.GetUnresolvedAlerts()
+	since, limit, asCSV := parseExportParams(c, 30*24)
+	alerts, err := a.storage.GetAlertsByTimeRange(since, time.Now(), limit)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("导出告警失败: %v", err)})
+		return
+	}
+	if asCSV {
+		writeCSVResponse(c, "alerts_export.csv", []string{"id", "timestamp", "level", "title", "source", "resolved", "acknowledged"}, len(alerts), func(i int) []string {
+			al := alerts[i]
+			return []string{al.ID, al.Timestamp.Format(time.RFC3339), string(al.Level), al.Title, al.Source,
+				strconv.FormatBool(al.Resolved), strconv.FormatBool(al.Acknowledged)}
+		})
 		return
 	}
 	c.JSON(200, gin.H{"alerts": alerts, "count": len(alerts)})
 }
 
 func (a *API) exportAudit(c *gin.Context) {
-	since := time.Now().AddDate(0, -1, 0)
-	logs, err := a.storage.GetAuditLog(since, 10000)
+	since, limit, asCSV := parseExportParams(c, 30*24)
+	logs, err := a.storage.GetAuditLog(since, limit)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("导出审计日志失败: %v", err)})
+		return
+	}
+	if asCSV {
+		writeCSVResponse(c, "audit_export.csv", []string{"id", "timestamp", "actor", "action", "target", "result", "reason"}, len(logs), func(i int) []string {
+			e := logs[i]
+			return []string{e.ID, e.Timestamp.Format(time.RFC3339), e.Actor, e.Action, e.Target, e.Result, e.Reason}
+		})
 		return
 	}
 	c.JSON(200, gin.H{"audit": logs, "count": len(logs)})

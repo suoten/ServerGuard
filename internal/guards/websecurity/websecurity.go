@@ -777,6 +777,9 @@ func (s *W3TamperScanner) Scan(ctx context.Context, target types.ScanTarget) ([]
 	// 2. 文件哈希基线检测（篡改检测）
 	s.detectTampering(rb, target.Path)
 
+	// 3. 可疑文件特征检测（最近创建、可疑权限等）
+	s.detectSuspiciousFiles(rb, target.Path)
+
 	findings := rb.GetFindings()
 	setSubScanner(findings, "W3")
 	return findings, nil
@@ -923,6 +926,77 @@ func (s *W3TamperScanner) detectTampering(rb *scannercommon.ReportBuilder, root 
 				)
 			}
 		}
+		return nil
+	})
+}
+
+// detectSuspiciousFiles 检测可疑文件特征：最近创建的脚本文件、可疑文件权限、隐藏文件等
+func (s *W3TamperScanner) detectSuspiciousFiles(rb *scannercommon.ReportBuilder, root string) {
+	// 检测最近 7 天内新建或修改的可执行脚本文件
+	recentThreshold := time.Now().Add(-7 * 24 * time.Hour)
+	// 可疑的文件名模式（随机字符串命名，常见于 Webshell）
+	suspiciousNamePattern := regexp.MustCompile(`^[0-9a-f]{8,}\.php$|^[a-z]{1,3}[0-9]{2,4}\.php$|^\d+\.php$`)
+
+	s.base.walkFilesForMalware(root, func(path string, info os.FileInfo) error {
+		ext := strings.ToLower(filepath.Ext(path))
+		isServerScript := ext == ".php" || ext == ".phtml" || ext == ".php3" ||
+			ext == ".php4" || ext == ".php5" || ext == ".phps" ||
+			ext == ".jsp" || ext == ".jspx" || ext == ".asp" || ext == ".aspx" || ext == ".ashx"
+		if !isServerScript {
+			return nil
+		}
+
+		baseName := filepath.Base(path)
+
+		// 1. 检测可疑文件名（随机哈希命名的 PHP 文件）
+		if suspiciousNamePattern.MatchString(baseName) {
+			rb.AddFinding(
+				types.SeverityMedium,
+				fmt.Sprintf("可疑文件名: %s", baseName),
+				fmt.Sprintf("文件 %s 使用随机/哈希式命名，常见于 Webshell 伪装", path),
+				path,
+				fmt.Sprintf("文件: %s，修改时间: %s，大小: %d 字节", path, info.ModTime().Format("2006-01-02 15:04"), info.Size()),
+				"人工审查文件内容，确认为合法文件后可加入白名单；如为恶意文件则隔离删除",
+				"删除文件后相关功能可能不可用；请先确认文件用途",
+			)
+		}
+
+		// 2. 检测最近创建的服务端脚本文件（可能是新植入的 Webshell）
+		if info.ModTime().After(recentThreshold) && info.Size() < 10*1024 {
+			// 只报告小文件（Webshell 通常小于 10KB）
+			data, err := s.base.readFileLimited(path)
+			if err == nil && len(data) > 0 {
+				// 检查是否包含可疑函数调用
+				content := string(data)
+				if strings.Contains(content, "eval") || strings.Contains(content, "assert") ||
+					strings.Contains(content, "system") || strings.Contains(content, "exec") ||
+					strings.Contains(content, "passthru") || strings.Contains(content, "shell_exec") {
+					rb.AddFinding(
+						types.SeverityHigh,
+						fmt.Sprintf("最近创建的可疑脚本: %s", baseName),
+						fmt.Sprintf("文件 %s 在最近 7 天内创建，且包含命令执行函数，疑似 Webshell", path),
+						path,
+						fmt.Sprintf("文件: %s，创建时间: %s，大小: %d 字节", path, info.ModTime().Format("2006-01-02 15:04"), info.Size()),
+						"隔离文件并人工审查代码内容；确认恶意后删除，排查入侵途径",
+						"隔离后相关功能不可用；确认安全后可恢复",
+					)
+				}
+			}
+		}
+
+		// 3. 检测可疑的文件权限（脚本文件不应有执行权限）
+		if info.Mode()&0111 != 0 { // 检查执行位
+			rb.AddFinding(
+				types.SeverityMedium,
+				fmt.Sprintf("脚本文件有执行权限: %s", baseName),
+				fmt.Sprintf("文件 %s 设置了执行权限（%v），服务端脚本不需要执行权限", path, info.Mode().Perm()),
+				path,
+				fmt.Sprintf("文件: %s，权限: %v", path, info.Mode().Perm()),
+				"建议移除执行权限：chmod 644 <file>，仅保留读写权限",
+				"移除执行权限不影响 Web 服务器解析该文件",
+			)
+		}
+
 		return nil
 	})
 }
