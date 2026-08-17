@@ -1,0 +1,178 @@
+schema_version: 1
+agent:
+    id: ""
+    name: serverguard-agent
+    data_dir: C:/ProgramData/ServerGuard
+    log_level: info
+    collect_interval: 10s
+    max_memory_mb: 100
+    max_cpu_percent: 80
+    learn_mode: false
+    learn_mode_days: 7
+    emergency_stop: false
+storage:
+    path: C:/ProgramData/ServerGuard/serverguard.db
+    encryption_key: ""
+    max_size_mb: 200
+    vacuum_interval: 168h0m0s
+    wal_checkpoint_interval: 5m0s
+    backup_count: 7
+collectors:
+    enable_processes: true
+    enable_disks: true
+    enable_network: true
+    enable_gpu: false
+    enable_temperature: false
+    enable_fd: true
+    process_max_count: 1000
+    inotify_max_watches: 500
+rules:
+    config_path: C:\Users\硕腾\.serverguard\rules.yaml
+    match_timeout: 10s
+    max_rules: 100
+    default_cooldown: 5m0s
+safety:
+    kill_budget_hourly: 15
+    kill_budget_daily: 50
+    kill_min_interval: 30s
+    circuit_breaker_threshold: 5
+    circuit_breaker_reset_duration: 30m0s
+    min_available_memory_mb: 100
+    max_load_factor: 2
+    max_disk_io_wait_percent: 50
+    min_disk_free_mb: 500
+    observation_window: 1m0s
+    cascade_suppression: true
+    whitelist_path: C:\Users\硕腾\.serverguard\whitelist.yaml
+    trash_dir: C:/ProgramData/ServerGuard/.trash
+    trash_retention_days: 7
+notify:
+    channels: []
+    silence:
+        enabled: false
+        silence_periods: []
+    wxpusher_app_token: ""
+wxpusher_uid: ""
+    smtp_host: smtp.exmail.qq.com
+    smtp_port: "465"
+    smtp_user: alert@mycompany.com
+    smtp_password: MyPass2024
+    email_to: ops@mycompany.com
+    digest_enabled: true
+    digest_hour: 8
+web:
+    enabled: true
+    listen: 127.0.0.1:8080
+    tls_cert: ""
+    tls_key: ""
+    auth_enabled: true
+    username: admin
+    password: admin123
+    jwt_secret: serverguard-dev-secret-key-2026
+    cors_origins:
+        - http://localhost:5173
+hub:
+    enabled: false
+    url: ""
+    token: ""
+    agent_id: ""
+    heartbeat_interval: 30s
+    reconnect_backoff: 1s
+    reconnect_max: 5m0s
+cert:
+    scan_interval: 24h0m0s
+    scan_ports:
+        - 443
+        - 8443
+        - 2096
+        - 2087
+        - 2083
+    alert_days:
+        - 30
+        - 14
+        - 7
+        - 3
+        - 1
+    auto_renew_days: 7
+    renew_cooldown: 1h0m0s
+    acme_directory: https://acme-v02.api.letsencrypt.org/directory
+    acme_email: ""
+    baota_auto_renew: true
+    preferred_cas:
+        - lets_encrypt
+        - zerossl
+        - trustasia
+        - buypass
+    nginx_reload_cmd: nginx -s reload
+    cert_cache_dir: C:/ProgramData/ServerGuard/cert-cache
+log:
+    max_file_size: 524288000
+    max_dir_size: 10737418240
+    max_write_rate: 10
+    compression_format: gzip
+    retention_days: 30
+    emergency_clean_threshold: 0.95
+    scan_paths:
+        - /var/log
+        - /www/wwwlogs
+    exclude_paths: []
+security:
+    brute_force_threshold: 5
+    brute_force_window: 5m0s
+    ban_duration: 1h0m0s
+    ban_progression: true
+    exclude_ips: []
+    monitor_paths: []
+    monitor_ssh_log: /var/log/auth.log
+    monitor_auth_log: /var/log/auth.log
+database:
+    mysql:
+        enabled: false
+        dsn: ""
+        max_conns: 100
+        slow_query_threshold: 5s
+    redis:
+        enabled: false
+        addr: ""
+        password: ""
+    influxdb:
+        enabled: false
+        addr: ""
+        token: ""
+        org: ""
+    mongodb:
+        enabled: false
+        uri: ""
+docker:
+    enabled: false
+    socket: ""
+    max_log_size: 100m
+    prune_interval: 24h0m0s
+system:
+    temp_file_clean_interval: 24h0m0s
+    temp_file_max_age: 168h0m0s
+    time_sync_check_interval: 1h0m0s
+    max_clock_drift: 100ms
+    temp_paths:
+        - /tmp
+        - /var/tmp
+    cache_paths:
+        - ~/.cache
+        - /var/cache
+network:
+    check_interval: 30s
+    targets: []
+    dns_servers:
+        - 8.8.8.8
+        - 114.114.114.114
+        - 223.5.5.5
+    probe_timeout: 5s
+offline:
+    enabled: false
+    package_dir: ""
+    local_rules_path: ""
+upgrade:
+    server_url: https://sg.jjtt.net/api/v1
+    channel: stable
+    check_interval: 6h0m0s
+    signing_key: ""

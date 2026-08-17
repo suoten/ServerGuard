@@ -1,0 +1,44 @@
+# CIS Benchmark 合规规则集 — 内核参数与网络
+# 对应 ServerGuard internal/guards/vulnscan/dependency_scanner.go CISComplianceScanner
+# 规则ID格式: CIS-KERNEL-XX
+
+rules:
+  - id: CIS-KERNEL-01
+    title: "禁用 IP 转发"
+    check: "sysctl"
+    key: "net.ipv4.ip_forward"
+    expected: "0"
+    severity: "medium"
+    fix: "sysctl -w net.ipv4.ip_forward=0"
+
+  - id: CIS-KERNEL-02
+    title: "启用 SYN Cookie"
+    check: "sysctl"
+    key: "net.ipv4.tcp_syncookies"
+    expected: "1"
+    severity: "high"
+    fix: "sysctl -w net.ipv4.tcp_syncookies=1"
+
+  - id: CIS-KERNEL-03
+    title: "禁用 ICMP 重定向"
+    check: "sysctl"
+    key: "net.ipv4.conf.all.accept_redirects"
+    expected: "0"
+    severity: "medium"
+    fix: "sysctl -w net.ipv4.conf.all.accept_redirects=0"
+
+  - id: CIS-KERNEL-04
+    title: "启用反向路径过滤"
+    check: "sysctl"
+    key: "net.ipv4.conf.all.rp_filter"
+    expected: "1"
+    severity: "medium"
+    fix: "sysctl -w net.ipv4.conf.all.rp_filter=1"
+
+  - id: CIS-KERNEL-05
+    title: "禁用源路由"
+    check: "sysctl"
+    key: "net.ipv4.conf.all.accept_source_route"
+    expected: "0"
+    severity: "medium"
+    fix: "sysctl -w net.ipv4.conf.all.accept_source_route=0"

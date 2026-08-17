@@ -1,0 +1,36 @@
+# CIS Benchmark 合规规则集 — SSH 配置
+# 对应 ServerGuard internal/guards/vulnscan/dependency_scanner.go CISComplianceScanner
+# 规则ID格式: CIS-SSH-XX
+
+rules:
+  - id: CIS-SSH-01
+    title: "SSH 禁止 root 登录"
+    check: "PermitRootLogin"
+    expected: "no"
+    severity: "high"
+    fix: "在 /etc/ssh/sshd_config 中设置 PermitRootLogin no"
+    file: "/etc/ssh/sshd_config"
+
+  - id: CIS-SSH-02
+    title: "SSH 禁止密码认证"
+    check: "PasswordAuthentication"
+    expected: "no"
+    severity: "high"
+    fix: "在 /etc/ssh/sshd_config 中设置 PasswordAuthentication no"
+    file: "/etc/ssh/sshd_config"
+
+  - id: CIS-SSH-03
+    title: "SSH 禁止空密码"
+    check: "PermitEmptyPasswords"
+    expected: "no"
+    severity: "critical"
+    fix: "在 /etc/ssh/sshd_config 中设置 PermitEmptyPasswords no"
+    file: "/etc/ssh/sshd_config"
+
+  - id: CIS-SSH-04
+    title: "SSH 限制最大重试次数"
+    check: "MaxAuthTries"
+    expected: "4"
+    severity: "medium"
+    fix: "在 /etc/ssh/sshd_config 中设置 MaxAuthTries 4"
+    file: "/etc/ssh/sshd_config"

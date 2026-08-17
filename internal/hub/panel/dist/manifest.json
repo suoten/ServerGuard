@@ -1,0 +1,19 @@
+{
+  "name": "ServerGuard 服务器守护",
+  "short_name": "ServerGuard",
+  "description": "服务器监控与自动运维系统",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f0f2f5",
+  "theme_color": "#1890ff",
+  "scope": "/"
+}

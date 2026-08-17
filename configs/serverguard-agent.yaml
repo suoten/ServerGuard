@@ -1,0 +1,39 @@
+# ServerGuard Agent 配置文件
+# 部署到 Linux 服务器时使用此配置
+
+# Agent 设置
+agent:
+  collect_interval: 15       # 采集间隔（秒）——宝塔模式下最低 15s
+  max_memory_mb: 50          # 最大内存使用（宝塔模式实际限制 60MB）
+  max_cpu_percent: 2         # 最大 CPU 使用百分比
+
+# Web 面板
+web:
+  enabled: true
+  listen: "0.0.0.0:9090"
+  auth_enabled: true
+  username: "admin"
+  password: "admin123"
+  jwt_secret: "CHANGE_ME_TO_RANDOM_STRING"
+
+# 安全设置
+safety:
+  kill_budget_hourly: 15
+  kill_budget_daily: 50
+  kill_min_interval: 30s
+  circuit_breaker_threshold: 3
+  circuit_breaker_reset_duration: 30m
+  observation_window: 60s
+  min_available_memory_mb: 50
+  max_load_factor: 3.0
+  min_disk_free_mb: 500
+  max_disk_io_wait_percent: 80
+  trash_dir: "/var/lib/serverguard/.trash"
+
+# 数据采集
+collectors:
+  process_max_count: 100     # 最多采集100个进程（降低内存）
+
+# 存储路径
+storage:
+  path: "/var/lib/serverguard/serverguard.db"

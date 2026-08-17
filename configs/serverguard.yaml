@@ -1,0 +1,246 @@
+# ServerGuard Configuration File
+# This is the default configuration. Edit as needed.
+
+schema_version: 1
+
+# Agent settings
+agent:
+  id: ""  # auto-generated on first run
+  name: serverguard-agent
+  data_dir: /var/lib/serverguard
+  log_level: info  # debug, info, warn, error
+  collect_interval: 10s
+  max_memory_mb: 50
+  max_cpu_percent: 3
+  learn_mode: true  # first 7 days: only alert, no auto-actions
+  learn_mode_days: 7
+  emergency_stop: false
+
+# Storage (SQLite with WAL mode)
+storage:
+  path: /var/lib/serverguard/serverguard.db
+  encryption_key: ""  # leave empty for no encryption, or set a 32-byte key
+  max_size_mb: 200
+  vacuum_interval: 168h  # weekly
+  wal_checkpoint_interval: 5m
+  backup_count: 7
+
+# Data collectors
+collectors:
+  enable_processes: true
+  enable_disks: true
+  enable_network: true
+  enable_gpu: false
+  enable_temperature: false
+  enable_fd: true
+  process_max_count: 100
+  inotify_max_watches: 500
+
+# Rule engine
+rules:
+  config_path: /var/lib/serverguard/rules.yaml
+  match_timeout: 5ms
+  max_rules: 100
+  default_cooldown: 300s
+
+# Safety mechanisms (5-layer protection)
+safety:
+  kill_budget_hourly: 5
+  kill_budget_daily: 20
+  kill_min_interval: 30s
+  circuit_breaker_threshold: 3  # 3 different processes in 10 min -> open breaker
+  circuit_breaker_reset_duration: 30m
+  min_available_memory_mb: 100
+  max_load_factor: 2.0  # cores * this = max load average
+  max_disk_io_wait_percent: 50
+  min_disk_free_mb: 500
+  observation_window: 60s  # cascade observation after each action
+  cascade_suppression: true
+  whitelist_path: /var/lib/serverguard/whitelist.yaml
+  trash_dir: /var/lib/serverguard/.trash
+  trash_retention_days: 7
+
+# Notification channels
+notify:
+  channels: []
+  # Example channels:
+  # - name: email
+  #   type: email
+  #   enabled: true
+  #   config:
+  #     smtp_host: smtp.qq.com
+  #     smtp_port: "587"
+  #     username: your@qq.com
+  #     password: your-password
+  #     from: your@qq.com
+  #     to: ["admin@example.com"]
+  # - name: dingtalk
+  #   type: dingtalk
+  #   enabled: true
+  #   config:
+  #     webhook: https://oapi.dingtalk.com/robot/send?access_token=xxx
+  #     secret: SECxxx
+  # - name: wechat
+  #   type: wechat
+  #   enabled: false
+  #   config:
+  #     webhook: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+  # - name: feishu
+  #   type: feishu
+  #   enabled: false
+  #   config:
+  #     webhook: https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+  # - name: slack
+  #   type: slack
+  #   enabled: false
+  #   config:
+  #     webhook: https://hooks.slack.com/services/xxx/xxx/xxx
+  # - name: telegram
+  #   type: telegram
+  #   enabled: false
+  #   config:
+  #     token: "123456:ABC-DEF"
+  #     chat_id: "123456789"
+  # - name: webhook
+  #   type: webhook
+  #   enabled: false
+  #   config:
+  #     url: https://your-webhook.example.com/alert
+  #     headers:
+  #       Authorization: Bearer xxx
+  silence:
+    enabled: false
+    silence_periods: []
+
+# Web panel
+web:
+  enabled: true
+  listen: "127.0.0.1:8443"  # only listen on localhost by default
+  tls_cert: ""  # empty = no TLS
+  tls_key: ""
+  auth_enabled: true
+  username: admin
+  password: ""  # empty = auto-generate on first run
+  jwt_secret: ""  # empty = auto-generate
+  cors_origins:
+    - "http://localhost:5173"
+
+# Hub connection (enterprise mode)
+hub:
+  enabled: false
+  url: ""  # e.g., wss://hub.serverguard.io
+  token: ""
+  agent_id: ""
+  heartbeat_interval: 30s
+  reconnect_backoff: 1s
+  reconnect_max: 300s
+
+# Certificate guard (core differentiator)
+cert:
+  scan_interval: 24h
+  scan_ports: [443, 8443, 8001, 8888]
+  alert_days: [30, 14, 7, 3, 1]
+  auto_renew_days: 14
+  renew_cooldown: 1h
+  acme_directory: "https://acme-v02.api.letsencrypt.org/directory"
+  acme_email: ""  # set your email for ACME
+  baota_auto_renew: true
+  preferred_cas: ["lets_encrypt", "zerossl", "trustasia", "buypass"]
+  nginx_reload_cmd: "nginx -s reload"
+  cert_cache_dir: /var/lib/serverguard/certs
+
+# Log guard
+log:
+  max_file_size: 524288000  # 500MB
+  max_dir_size: 10737418240  # 10GB
+  max_write_rate: 10  # MB/min
+  compression_format: gzip
+  retention_days: 30
+  emergency_clean_threshold: 0.95
+  scan_paths:
+    - /var/log
+    - /www/wwwlogs
+  exclude_paths: []
+
+# Security guard
+security:
+  brute_force_threshold: 5
+  brute_force_window: 5m
+  ban_duration: 1h
+  ban_progression: true
+  exclude_ips: []
+  monitor_paths: []
+  monitor_ssh_log: /var/log/auth.log
+  monitor_auth_log: /var/log/auth.log
+
+# Database guard
+database:
+  mysql:
+    enabled: false
+    dsn: ""
+    max_conns: 100
+    slow_query_threshold: 5s
+  redis:
+    enabled: false
+    addr: ""
+    password: ""
+  influxdb:
+    enabled: false
+    addr: ""
+    token: ""
+    org: ""
+  mongodb:
+    enabled: false
+    uri: ""
+
+# Docker guard
+docker:
+  enabled: false
+  socket: /var/run/docker.sock
+  max_log_size: 100m
+  prune_interval: 24h
+
+# System guard
+system:
+  temp_file_clean_interval: 24h
+  temp_file_max_age: 168h
+  time_sync_check_interval: 1h
+  max_clock_drift: 100ms
+  temp_paths:
+    - /tmp
+    - /var/tmp
+  cache_paths:
+    - ~/.cache
+    - /var/cache
+
+# Network guard
+network:
+  check_interval: 30s
+  targets: []
+  dns_servers:
+    - 8.8.8.8
+    - 114.114.114.114
+  probe_timeout: 5s
+
+# Offline mode
+offline:
+  enabled: false
+  package_dir: /var/lib/serverguard/packages
+  local_rules_path: /var/lib/serverguard/rules.yaml
+
+# Baota panel compatibility settings
+baota:
+  # 是否启用安全保护模式（auto=自动检测，true=强制启用，false=强制关闭）
+  safe_mode: auto
+  # 宝塔面板路径（自动检测失败时手动指定）
+  panel_path: "/www/server/panel"
+  # 是否使用宝塔命令管理服务（/etc/init.d/xxx）
+  use_baota_service_manager: true
+  # 磁盘清理在宝塔环境下的策略：disabled / var_log_only
+  cleanup_scope: "disabled"
+  # 日志轮转在宝塔环境下的策略：disabled / notify_only
+  log_rotation_scope: "disabled"
+  # WebShell 扫描排除路径（追加到全局排除）
+  webshell_exclusions:
+    - "/www/server/panel"
+    - "/www/server/panel/plugin"

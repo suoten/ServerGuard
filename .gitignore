@@ -1,0 +1,46 @@
+# 构建产物与发布包
+/dist/
+/release/
+/build/
+/bin/
+/tmp/
+/.gotmp/
+
+# 二进制
+*.exe
+serverguard-agent
+serverguard-hub
+sgctl
+
+# 测试与覆盖率残留
+*.cov
+cover_*
+*.out
+aa.txt
+
+# 运行时数据（SQLite 及 WAL）
+*.db
+*.db-shm
+*.db-wal
+serverguard_data*
+test_config_windows.yaml
+
+# 日志
+*.log
+release-log.txt
+
+# 前端
+web/node_modules/
+web/dist/
+website/node_modules/
+website/dist/
+
+# IDE / 工具
+.idea/
+.vscode/
+.zcode/
+.merkle-snapshot.json
+
+# 系统
+.DS_Store
+Thumbs.db

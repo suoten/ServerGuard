@@ -1,0 +1,49 @@
+# CIS Benchmark 合规规则集 — 系统用户与权限
+# 对应 ServerGuard internal/guards/vulnscan/dependency_scanner.go CISComplianceScanner
+# 规则ID格式: CIS-USER-XX / CIS-PERM-XX
+
+rules:
+  - id: CIS-USER-01
+    title: "检查 UID=0 的用户仅 root"
+    check: "uid_zero_users"
+    expected: "root"
+    severity: "critical"
+    fix: "检查 /etc/passwd 中 UID=0 的用户，仅保留 root"
+
+  - id: CIS-USER-02
+    title: "检查空密码用户"
+    check: "empty_password_users"
+    expected: "none"
+    severity: "critical"
+    fix: "检查 /etc/shadow 中空密码用户，设置密码或锁定账户"
+
+  - id: CIS-USER-03
+    title: "检查不必要的系统账户已禁用"
+    check: "inactive_system_accounts"
+    expected: "disabled"
+    severity: "medium"
+    fix: "禁用不必要的系统账户（如 games、news、uucp 等）"
+
+  - id: CIS-PERM-01
+    title: "/etc/passwd 权限 644"
+    check: "file_permission"
+    file: "/etc/passwd"
+    expected: "0644"
+    severity: "high"
+    fix: "chmod 644 /etc/passwd"
+
+  - id: CIS-PERM-02
+    title: "/etc/shadow 权限 640"
+    check: "file_permission"
+    file: "/etc/shadow"
+    expected: "0640"
+    severity: "high"
+    fix: "chmod 640 /etc/shadow"
+
+  - id: CIS-PERM-03
+    title: "/etc/group 权限 644"
+    check: "file_permission"
+    file: "/etc/group"
+    expected: "0644"
+    severity: "medium"
+    fix: "chmod 644 /etc/group"

@@ -1,0 +1,39 @@
+[Unit]
+Description=ServerGuard Agent - Server Guardian Daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/serverguard-agent -config /etc/serverguard/serverguard.yaml
+Restart=always
+RestartSec=3
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Resource limits (OS-level enforcement per §9.5.1)
+MemoryMax=80M
+CPUQuota=5%
+IOWeight=10
+LimitNOFILE=1024
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/serverguard /var/log /www/wwwlogs /www/server/panel/vhost/cert
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_KILL CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_SYS_PTRACE CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_KILL CAP_DAC_READ_SEARCH
+
+# Watchdog (§8.4 - systemd watchdog for crash recovery)
+WatchdogSec=30
+NotifyAccess=main
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=serverguard
+
+[Install]
+WantedBy=multi-user.target

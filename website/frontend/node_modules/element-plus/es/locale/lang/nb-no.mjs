@@ -1,0 +1,185 @@
+//#region ../../packages/locale/lang/nb-no.ts
+var nb_no_default = {
+	name: "nb-no",
+	el: {
+		breadcrumb: { label: "Brødsmulesti" },
+		colorpicker: {
+			confirm: "OK",
+			clear: "Tøm",
+			defaultLabel: "fargevelger",
+			description: "gjeldende farge er {color}. trykk enter for å velge en ny farge.",
+			alphaLabel: "velg alfaverdi",
+			alphaDescription: "alfa {alpha}, gjeldende farge er {color}",
+			hueLabel: "velg fargetone",
+			hueDescription: "fargetone {hue}, gjeldende farge er {color}",
+			svLabel: "velg metning og lysstyrke",
+			svDescription: "metning {saturation}, lysstyrke {brightness}, gjeldende farge er {color}",
+			predefineDescription: "velg {value} som farge"
+		},
+		datepicker: {
+			now: "Nå",
+			today: "I dag",
+			cancel: "Avbryt",
+			clear: "Tøm",
+			confirm: "OK",
+			dateTablePrompt: "Bruk piltastene og enter for å velge dag i måneden",
+			monthTablePrompt: "Bruk piltastene og enter for å velge måned",
+			yearTablePrompt: "Bruk piltastene og enter for å velge år",
+			selectedDate: "Valgt dato",
+			selectDate: "Velg dato",
+			selectTime: "Velg tidspunkt",
+			startDate: "Startdato",
+			startTime: "Starttidspunkt",
+			endDate: "Sluttdato",
+			endTime: "Sluttidspunkt",
+			prevYear: "I fjor",
+			nextYear: "Neste år",
+			prevMonth: "Forrige Måned",
+			nextMonth: "Neste Måned",
+			year: "",
+			month1: "Januar",
+			month2: "Februar",
+			month3: "Mars",
+			month4: "April",
+			month5: "Mai",
+			month6: "Juni",
+			month7: "Juli",
+			month8: "August",
+			month9: "September",
+			month10: "Oktober",
+			month11: "November",
+			month12: "Desember",
+			weeks: {
+				sun: "Søn",
+				mon: "Man",
+				tue: "Tir",
+				wed: "Ons",
+				thu: "Tor",
+				fri: "Fre",
+				sat: "Lør"
+			},
+			weeksFull: {
+				sun: "Søndag",
+				mon: "Mandag",
+				tue: "Tirsdag",
+				wed: "Onsdag",
+				thu: "Torsdag",
+				fri: "Fredag",
+				sat: "Lørdag"
+			},
+			months: {
+				jan: "Jan",
+				feb: "Feb",
+				mar: "Mar",
+				apr: "Apr",
+				may: "Mai",
+				jun: "Jun",
+				jul: "Jul",
+				aug: "Aug",
+				sep: "Sep",
+				oct: "Okt",
+				nov: "Nov",
+				dec: "Des"
+			}
+		},
+		inputNumber: {
+			decrease: "reduser tall",
+			increase: "øk tall"
+		},
+		select: {
+			loading: "Laster",
+			noMatch: "Ingen samsvarende resulater",
+			noData: "Ingen resulater",
+			placeholder: "Velg"
+		},
+		mention: { loading: "Laster" },
+		dropdown: { toggleDropdown: "Veksle nedtrekksmeny" },
+		cascader: {
+			noMatch: "Ingen samsvarende resultater",
+			loading: "Laster",
+			placeholder: "Velg",
+			noData: "Ingen resultater"
+		},
+		pagination: {
+			goto: "Gå til",
+			pagesize: "/side",
+			total: "Total {total}",
+			pageClassifier: "",
+			page: "Side",
+			prev: "Gå til forrige side",
+			next: "Gå til neste side",
+			currentPage: "side {pager}",
+			prevPages: "Forrige {pager} sider",
+			nextPages: "Neste {pager} sider",
+			deprecationWarning: "Utdatert bruk oppdaget, se el-pagination-dokumentasjonen for flere detaljer"
+		},
+		dialog: { close: "Lukk denne dialogen" },
+		drawer: { close: "Lukk denne dialogen" },
+		messagebox: {
+			title: "Melding",
+			confirm: "OK",
+			cancel: "Avbryt",
+			error: "Ugyldig input",
+			close: "Lukk denne dialogen"
+		},
+		upload: {
+			deleteTip: "trykk på x for å slette",
+			delete: "Slett",
+			preview: "Forhåndsvisning",
+			continue: "Fortsett"
+		},
+		slider: {
+			defaultLabel: "glidebryter mellom {min} og {max}",
+			defaultRangeStartLabel: "velg startverdi",
+			defaultRangeEndLabel: "velg sluttverdi"
+		},
+		table: {
+			emptyText: "Ingen Data",
+			confirmFilter: "Bekreft",
+			resetFilter: "Tilbakestill",
+			clearFilter: "Alle",
+			sumText: "Sum",
+			selectAllLabel: "Velg alle rader",
+			selectRowLabel: "Velg denne raden",
+			expandRowLabel: "Utvid denne raden",
+			collapseRowLabel: "Skjul denne raden",
+			sortLabel: "Sorter etter {column}",
+			filterLabel: "Filtrer etter {column}"
+		},
+		tag: { close: "Lukk denne taggen" },
+		tour: {
+			next: "Neste",
+			previous: "Forrige",
+			finish: "Fullfør",
+			close: "Lukk denne dialogen"
+		},
+		tree: { emptyText: "Ingen Data" },
+		transfer: {
+			noMatch: "Ingen samsvarende data",
+			noData: "Ingen data",
+			titles: ["Liste 1", "Liste 2"],
+			filterPlaceholder: "Skriv inn nøkkelord",
+			noCheckedFormat: "{total} gjenstander",
+			hasCheckedFormat: "{checked}/{total} valgt"
+		},
+		image: { error: "FEILET" },
+		pageHeader: { title: "Tilbake" },
+		popconfirm: {
+			confirmButtonText: "Ja",
+			cancelButtonText: "Nei"
+		},
+		carousel: {
+			leftArrow: "Karusellpil venstre",
+			rightArrow: "Karusellpil høyre",
+			indicator: "Karusell bytt til indeks {index}"
+		},
+		inputOTP: {
+			groupLabel: "OTP-inndata",
+			defaultLabel: "Skriv inn OTP-tegn {index}"
+		}
+	}
+};
+//#endregion
+export { nb_no_default as default };
+
+//# sourceMappingURL=nb-no.mjs.map

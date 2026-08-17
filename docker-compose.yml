@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  agent:
+    build: .
+    container_name: serverguard-agent
+    restart: always
+    volumes:
+      - agent-data:/opt/serverguard/data
+      - ./configs/agent.yaml:/opt/serverguard/configs/agent.yaml:ro
+    ports:
+      - "8443:8443"
+    deploy:
+      resources:
+        limits:
+          memory: 80M
+          cpus: '0.05'
+
+  hub:
+    build: .
+    container_name: serverguard-hub
+    restart: always
+    command: ["/opt/serverguard/serverguard-hub", "-config", "/opt/serverguard/configs/hub.yaml"]
+    volumes:
+      - hub-data:/opt/serverguard/data
+      - ./configs/hub.yaml:/opt/serverguard/configs/hub.yaml:ro
+    ports:
+      - "8444:8443"
+    depends_on:
+      - postgres
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: serverguard-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: serverguard
+      POSTGRES_USER: serverguard
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-changeme}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  agent-data:
+  hub-data:
+  pg-data:

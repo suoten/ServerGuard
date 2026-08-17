@@ -1,0 +1,188 @@
+/* ═══════════════════════════════════════════════════
+   ServerGuard 全局移动端响应式适配
+   ═══════════════════════════════════════════════════
+
+   断点规则：
+   ≥1280px  桌面端（4列）
+   768-1279px 平板（2列）
+   <768px   手机（1列）
+
+   触摸规范：
+   点击热区 ≥ 44×44px
+   按钮间距 ≥ 16px
+   字体 ≥ 14px
+*/
+
+/* ═══ 全局变量 ═══ */
+:root {
+  --sg-touch-min: 44px;
+  --sg-btn-mobile-h: 52px;
+  --sg-spacing-mobile: 16px;
+}
+
+/* ═══ 手机端 <768px ═══ */
+@media screen and (max-width: 767px) {
+  /* 侧边栏：隐藏，改为抽屉模式 */
+  .sidebar {
+    position: fixed !important;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    height: 100dvh;
+    z-index: 100;
+    transform: translateX(-100%);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: none;
+  }
+  .sidebar.mobile-open {
+    transform: translateX(0);
+    box-shadow: 12px 0 40px rgba(15, 23, 42, 0.35);
+  }
+
+  /* 主内容区：占满全宽 */
+  .main-content {
+    padding: 12px !important;
+  }
+
+  /* 顶部 header 简化 */
+  .header {
+    padding: 0 12px !important;
+  }
+  .header-left .el-tag {
+    font-size: 12px !important;
+  }
+  .header-right .user-info {
+    display: none;
+  }
+
+  /* 栅格：全部 1 列 */
+  .el-col-24 {
+    max-width: 100% !important;
+    flex: 0 0 100% !important;
+  }
+
+  /* ElCard 间距压缩 */
+  .el-card {
+    margin-bottom: 12px !important;
+  }
+
+  /* ElTable 改为横向滚动 */
+  .el-table {
+    overflow-x: auto;
+  }
+
+  /* ElDialog：90% 宽度或全屏 */
+  .el-dialog {
+    width: 92% !important;
+    margin: 8vh auto !important;
+  }
+
+  /* ElButton：增大触摸热区 */
+  .el-button {
+    min-height: var(--sg-touch-min);
+    font-size: 14px;
+  }
+  .el-button--large {
+    min-height: var(--sg-btn-mobile-h);
+    font-size: 16px;
+  }
+
+  /* ElForm：label 在上方 */
+  .el-form-item__label {
+    text-align: left !important;
+    float: none !important;
+    display: block !important;
+    padding-bottom: 4px !important;
+  }
+  .el-form-item__content {
+    margin-left: 0 !important;
+  }
+
+  /* ElSwitch：增大尺寸 */
+  .el-switch {
+    min-width: 60px;
+    min-height: 32px;
+  }
+
+  /* ElTag：增大可点击性 */
+  .el-tag {
+    min-height: 28px;
+    line-height: 26px;
+    padding: 0 10px;
+  }
+
+  /* 健康评分数字缩小 */
+  .health-score-num {
+    font-size: 36px !important;
+  }
+
+  /* 健康评分区域纵向堆叠 */
+  .health-content {
+    flex-direction: column !important;
+    gap: 16px !important;
+  }
+
+  /* 紧急停止按钮位置调整 */
+  .emergency-stop-btn {
+    right: 16px !important;
+    bottom: 16px !important;
+    width: 48px !important;
+    height: 48px !important;
+  }
+}
+
+/* ═══ 平板 768-1279px ═══ */
+@media screen and (min-width: 768px) and (max-width: 1279px) {
+  .main-content {
+    padding: 16px !important;
+  }
+}
+
+/* ═══ 桌面端 ≥1280px ═══ */
+@media screen and (min-width: 1280px) {
+  .main-content {
+    padding: 20px;
+  }
+}
+
+/* ═══ 触摸优化：消除 300ms 延迟 ═══ */
+* {
+  touch-action: manipulation;
+}
+
+/* ═══ 触摸反馈：点击高亮 ═══ */
+@media (hover: none) {
+  .el-button:active {
+    transform: scale(0.97);
+    transition: transform 0.1s;
+  }
+  .el-card:active {
+    transform: scale(0.99);
+    transition: transform 0.1s;
+  }
+}
+
+/* ═══ 滚动平滑 ═══ */
+* {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ═══ 安全区域适配（刘海屏/底部小横条）═══ */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .action-section {
+    padding-bottom: calc(16px + env(safe-area-inset-bottom)) !important;
+  }
+  .emergency-stop-btn {
+    bottom: calc(24px + env(safe-area-inset-bottom)) !important;
+  }
+}
+
+/* ═══ 文字大小适配 ═══ */
+@media screen and (max-width: 767px) {
+  html {
+    font-size: 14px;
+  }
+  .el-message {
+    min-width: calc(100% - 32px) !important;
+  }
+}

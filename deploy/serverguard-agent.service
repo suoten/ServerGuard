@@ -1,0 +1,47 @@
+[Unit]
+Description=ServerGuard Agent - Server Monitoring & Auto-Healing
+Documentation=https://github.com/suoten/serverguard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/serverguard/serverguard-agent -config /opt/serverguard/config.yaml
+WorkingDirectory=/opt/serverguard
+Restart=on-failure
+RestartSec=10
+
+# ====== 资源约束策略 ======
+# 内存：硬限制 256M，Go 软限制 200MiB（GC 更积极）
+MemoryMax=256M
+Environment=GOMEMLIMIT=200MiB
+
+# CPU：使用 CPUWeight 而非 CPUQuota
+# CPUWeight=20: 低优先级 — CPU 空闲时可用满，繁忙时自动让路给宝塔/MySQL/Nginx 等
+# 对比 CPUQuota=5%: 硬限制 5%，即使 CPU 空闲也不能用更多 → 启动极慢、面板无响应
+CPUWeight=20
+Environment=GOMAXPROCS=2
+
+# I/O：低优先级，避免磁盘扫描影响业务
+IOWeight=10
+LimitNOFILE=1024
+
+# OOM：优先牺牲 Agent 自己，保护服务器和宝塔
+# OOMScoreAdjust=500: 内存不足时 OOM Killer 优先杀 ServerGuard（会自动重启）
+# 而不是杀宝塔面板、MySQL、Nginx 等关键服务
+OOMScoreAdjust=500
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/serverguard /opt/serverguard
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=serverguard-agent
+
+[Install]
+WantedBy=multi-user.target
