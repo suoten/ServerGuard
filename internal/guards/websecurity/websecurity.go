@@ -617,7 +617,7 @@ var w3MalwarePatterns = []struct {
 	name     string
 	severity types.Severity
 }{
-	regexp.MustCompile(`eval\s*\(\s*base64_decode\s*\(`), "eval(base64_decode())", types.SeverityCritical},
+	{regexp.MustCompile(`eval\s*\(\s*base64_decode\s*\(`), "eval(base64_decode())", types.SeverityCritical},
 	{regexp.MustCompile(`eval\s*\(\s*gzinflate\s*\(`), "eval(gzinflate())", types.SeverityCritical},
 	{regexp.MustCompile(`eval\s*\(\s*gzuncompress\s*\(`), "eval(gzuncompress())", types.SeverityCritical},
 	{regexp.MustCompile(`eval\s*\(\s*str_rot13\s*\(`), "eval(str_rot13())", types.SeverityCritical},
