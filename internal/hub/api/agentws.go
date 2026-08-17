@@ -24,9 +24,15 @@ var agentUpgrader = websocket.Upgrader{
 	},
 }
 
-// supportedHubCommands is returned to an agent on registration so it can
-// register handlers for the commands the Hub currently supports.
-var supportedHubCommands = []string{"restart"}
+// supportedHubCommands is the whitelist of commands the Hub may dispatch to
+// agents. The list is sent to an agent on registration and enforced by
+// dispatchAgentCommand before anything is sent over the wire.
+var supportedHubCommands = []string{
+	"restart",      // 优雅重启 Agent 自身（由服务管理器拉起）
+	"status",       // 返回健康评分/安全模式/资源水位快照
+	"guard.pause",  // 远程紧急停止：暂停自动修复，监控继续
+	"guard.resume", // 恢复自动修复
+}
 
 // SetAgentRegistry injects the multi-agent registry into the API and wires the
 // /ws/agent WebSocket endpoint. Safe to call before Serve.
@@ -123,17 +129,30 @@ func (a *API) handleAgentMessage(reg *registry.Registry, agentID, remoteIP strin
 		a.saveAgentAlert(reg, agentID, msg)
 
 	case "command_response":
-		// Result of a previously dispatched command; log via audit.
+		// Result of a previously dispatched command; log via audit with the
+		// outcome and any result payload the agent returned.
 		if a.storage != nil {
+			result := "received"
+			action := "command_response"
+			if data, ok := msg.Data.(map[string]interface{}); ok {
+				if cmd, ok := data["command"].(string); ok && cmd != "" {
+					action = "command_response:" + cmd
+				}
+				if ok, _ := data["success"].(bool); ok {
+					result = "success"
+				} else if errMsg, _ := data["error"].(string); errMsg != "" {
+					result = "failed: " + errMsg
+				}
+			}
 			b, _ := json.Marshal(msg.Data)
 			a.storage.SaveAudit(types.AuditEntry{
 				ID:        uuid.NewString(),
 				Timestamp: time.Now(),
 				Actor:     "agent:" + agentID,
-				Action:    "command_response",
-				Target:    msg.Type,
+				Action:    action,
+				Target:    agentID,
 				Reason:    string(b),
-				Result:    "received",
+				Result:    result,
 			})
 		}
 	}

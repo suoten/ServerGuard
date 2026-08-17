@@ -32,8 +32,9 @@ type HubClient struct {
 	commandHandlers   map[string]CommandHandler
 }
 
-// CommandHandler handles a command from Hub.
-type CommandHandler func(ctx context.Context, params interface{}) error
+// CommandHandler handles a command from Hub and may return a result payload
+// that is reported back to the Hub in the command_response message.
+type CommandHandler func(ctx context.Context, params interface{}) (interface{}, error)
 
 // NewHubClient creates a new HubClient.
 func NewHubClient(bus *eventbus.EventBus, hubURL, agentID, token string) *HubClient {
@@ -225,7 +226,8 @@ func (c *HubClient) handleCommand(ctx context.Context, msg HubMessage) {
 			Type:    "command_response",
 			AgentID: c.agentID,
 			Data: map[string]interface{}{
-				"command_id": msg.Data,
+				"command_id": commandIDFromData(msg.Data),
+				"command":    msg.Type,
 				"success":    false,
 				"error":      "unknown command type: " + msg.Type,
 			},
@@ -233,16 +235,32 @@ func (c *HubClient) handleCommand(ctx context.Context, msg HubMessage) {
 		return
 	}
 
-	err := handler(ctx, msg.Data)
+	result, err := handler(ctx, msg.Data)
+	resp := map[string]interface{}{
+		"command_id": commandIDFromData(msg.Data),
+		"command":    msg.Type,
+		"success":    err == nil,
+	}
+	if err != nil {
+		resp["error"] = err.Error()
+	}
+	if result != nil {
+		resp["result"] = result
+	}
 	c.send(ctx, HubMessage{
 		Type:    "command_response",
 		AgentID: c.agentID,
-		Data: map[string]interface{}{
-			"command_id": msg.Data,
-			"success":    err == nil,
-			"error":      fmt.Sprintf("%v", err),
-		},
+		Data:    resp,
 	})
+}
+
+// commandIDFromData extracts the command_id the Hub attached to the command
+// payload, so responses can be correlated with their dispatch.
+func commandIDFromData(data interface{}) interface{} {
+	if m, ok := data.(map[string]interface{}); ok {
+		return m["command_id"]
+	}
+	return nil
 }
 
 // UploadAlert sends an alert to Hub.

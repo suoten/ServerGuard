@@ -262,6 +262,7 @@ func (a *API) setupRoutes() {
 		api.GET("/servers/:id", a.getServer)
 		api.GET("/servers/:id/metrics", a.getServerMetrics)
 		api.POST("/servers/:id/restart", a.restartServer)
+		api.POST("/servers/:id/command", a.dispatchAgentCommand)
 
 		// Alerts
 		api.GET("/alerts", a.getAlerts)
@@ -1021,6 +1022,76 @@ func (a *API) getServerMetrics(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"metrics": metrics})
+}
+
+// dispatchAgentCommand 向已注册的 Agent 下发白名单内的远程命令。
+// POST /api/servers/:id/command  body: {"type": "status", "data": {...}}
+// 命令类型必须在 supportedHubCommands 白名单内（见 agentws.go），
+// Agent 端同样只注册了这些命令的处理器 —— 双端白名单，杜绝任意命令执行。
+// 命令结果由 Agent 异步通过 command_response 回传并写入审计日志。
+func (a *API) dispatchAgentCommand(c *gin.Context) {
+	id := c.Param("id")
+
+	reg := a.agentRegistry
+	if reg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent registry 未初始化（非 Hub 模式）"})
+		return
+	}
+	if _, ok := reg.Get(id); !ok {
+		c.JSON(404, gin.H{"error": fmt.Sprintf("Agent %s 未注册", id)})
+		return
+	}
+
+	var req struct {
+		Type string                 `json:"type"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "请求体无效: " + err.Error()})
+		return
+	}
+
+	allowed := false
+	for _, cmd := range supportedHubCommands {
+		if cmd == req.Type {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("不支持的命令 %q，可用命令: %v", req.Type, supportedHubCommands)})
+		return
+	}
+
+	commandID := uuid.NewString()
+	if req.Data == nil {
+		req.Data = map[string]interface{}{}
+	}
+	req.Data["command_id"] = commandID
+	req.Data["requested"] = time.Now().UTC()
+
+	if err := reg.SendJSON(id, comm.HubMessage{
+		Type:    req.Type,
+		AgentID: id,
+		Data:    req.Data,
+	}); err != nil {
+		c.JSON(409, gin.H{"error": fmt.Sprintf("agent 离线或无法下发命令: %v", err)})
+		return
+	}
+
+	a.storage.SaveAudit(types.AuditEntry{
+		ID:        uuid.NewString(),
+		Timestamp: time.Now(),
+		Actor:     c.GetString("username"),
+		Action:    "agent_command:" + req.Type,
+		Target:    id,
+		Reason:    "用户通过 Hub 下发远程命令",
+		Result:    "dispatched",
+	})
+	c.JSON(200, gin.H{
+		"message":    fmt.Sprintf("命令 %s 已下发到 Agent %s，结果将通过审计日志回传", req.Type, id),
+		"command_id": commandID,
+	})
 }
 
 func (a *API) restartServer(c *gin.Context) {
