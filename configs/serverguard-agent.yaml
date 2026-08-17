@@ -13,6 +13,7 @@ web:
   listen: "0.0.0.0:9090"
   auth_enabled: true
   username: "admin"
+  # ⚠️ 示例密码，生产部署必须修改（一键安装脚本会自动生成随机密码）
   password: "admin123"
   jwt_secret: "CHANGE_ME_TO_RANDOM_STRING"
 
