@@ -236,6 +236,16 @@ func (c *HubClient) handleCommand(ctx context.Context, msg HubMessage) {
 	}
 
 	result, err := handler(ctx, msg.Data)
+	c.send(ctx, HubMessage{
+		Type:    "command_response",
+		AgentID: c.agentID,
+		Data:    buildCommandResponse(msg, result, err),
+	})
+}
+
+// buildCommandResponse 构造命令响应数据：command_id 回传 Hub 下发时的
+// 关联 ID，成功时携带 result 载荷，失败时携带 error 说明。
+func buildCommandResponse(msg HubMessage, result interface{}, err error) map[string]interface{} {
 	resp := map[string]interface{}{
 		"command_id": commandIDFromData(msg.Data),
 		"command":    msg.Type,
@@ -247,11 +257,7 @@ func (c *HubClient) handleCommand(ctx context.Context, msg HubMessage) {
 	if result != nil {
 		resp["result"] = result
 	}
-	c.send(ctx, HubMessage{
-		Type:    "command_response",
-		AgentID: c.agentID,
-		Data:    resp,
-	})
+	return resp
 }
 
 // commandIDFromData extracts the command_id the Hub attached to the command

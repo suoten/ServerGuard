@@ -110,6 +110,9 @@ type API struct {
 	// 多机 Agent 注册中心（Hub 集中管控）
 	agentRegistry *registry.Registry
 
+	// Hub 连接状态查询（Agent 接入外部 Hub 时注入，用于 /api/status 与 sgctl doctor）
+	hubConnected func() bool
+
 	// 智能洞察提供者（基线状态/内存趋势/变慢站点）
 	anomalyDet *anomaly.Detector
 
@@ -746,6 +749,14 @@ func (a *API) renewCert(c *gin.Context) {
 func (a *API) getStatus(c *gin.Context) {
 	mode := a.safety.GetMode()
 
+	a.mu.RLock()
+	hubConnected := a.hubConnected
+	a.mu.RUnlock()
+	hubStatus := gin.H{"enabled": false, "connected": false}
+	if hubConnected != nil {
+		hubStatus = gin.H{"enabled": true, "connected": hubConnected()}
+	}
+
 	// Collect system metrics
 	var cpuPercent float64
 	if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 {
@@ -851,6 +862,7 @@ func (a *API) getStatus(c *gin.Context) {
 		"status":               "online",
 		"mode":                 string(mode),
 		"emergency_stop":       a.safety.IsEmergencyStopped(),
+		"hub":                  hubStatus,
 		"baota_safe_mode":      a.safety.IsBaotaSafeMode(),
 		"maintenance_active":   a.IsInMaintenance(),
 		"learn_mode":           learnMode,

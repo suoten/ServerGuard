@@ -42,6 +42,14 @@ func (a *API) SetAgentRegistry(reg *registry.Registry) {
 	a.agentRegistry = reg
 }
 
+// SetHubStatusProvider 注入 Hub 连接状态查询函数（Agent 侧 hubClient.IsConnected）。
+// 未注入时 /api/status 报告 hub.enabled=false。
+func (a *API) SetHubStatusProvider(connected func() bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.hubConnected = connected
+}
+
 // handleAgentWS is the WebSocket endpoint accepting Agent connections.
 // It authenticates via Authorization: Bearer <token> and X-Agent-ID headers,
 // then processes register / heartbeat / alert / command_response messages.

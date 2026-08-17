@@ -44,6 +44,18 @@ func (g *TrafficGuard) Check(ctx context.Context) {
 
 	// R3: Check for port scanning
 	go g.checkPortScan(ctx)
+
+	// R4: Check connection state anomalies (TIME_WAIT/CLOSE_WAIT accumulation)
+	go g.checkConnectionStates(ctx)
+
+	// R5: Check suspicious outbound connections
+	go g.checkSuspiciousOutbound(ctx)
+
+	// R6: Check system slow connections
+	go g.checkSystemSlowConnections(ctx)
+
+	// R7: Check connection/FD limit
+	go g.checkConnLimit(ctx)
 }
 
 func (g *TrafficGuard) checkTrafficAnomaly(ctx context.Context) {
@@ -184,5 +196,40 @@ func (g *TrafficGuard) recordSample(sentRate, recvRate float64) {
 	}
 	if len(g.recvHistory) > g.historyMax {
 		g.recvHistory = g.recvHistory[len(g.recvHistory)-g.historyMax:]
+	}
+}
+
+// checkSystemSlowConnections 检测系统级慢连接
+func (g *TrafficGuard) checkSystemSlowConnections(ctx context.Context) {
+	slowConns := CheckSystemSlowConnections(30 * time.Second)
+	for _, sc := range slowConns {
+		var severity types.AlertLevel
+		switch sc.State {
+		case "SYN_RECV":
+			severity = types.AlertError
+		case "CLOSE_WAIT":
+			severity = types.AlertError
+		default:
+			severity = types.AlertWarning
+		}
+		g.eventBus.PublishAlert(severity, "traffic",
+			"慢连接检测",
+			fmt.Sprintf("检测到慢连接: %s -> %s (%s) - %s",
+				sc.LocalAddr, sc.RemoteAddr, sc.State, sc.Reason),
+			"slow-conn-001")
+	}
+}
+
+// checkConnLimit 检测连接数/FD限制使用情况
+func (g *TrafficGuard) checkConnLimit(ctx context.Context) {
+	info, err := CheckConnLimit()
+	if err != nil || info == nil {
+		return
+	}
+	if info.Warning != "" {
+		g.eventBus.PublishAlert(types.AlertWarning, "traffic",
+			"连接数接近限制",
+			info.Warning,
+			"conn-limit-001")
 	}
 }
