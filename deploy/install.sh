@@ -97,6 +97,8 @@ chmod +x "${INSTALL_DIR}/serverguard-agent"
 # ── 生成配置文件 ──────────────────────────────────────
 echo -e "${GREEN}[3/7]${NC} 生成配置文件"
 JWT_SECRET=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+# 随机面板密码：安全产品不应有固定默认口令，安装时生成并只显示一次
+ADMIN_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
 
 # 宝塔环境下生成兼容模式配置
 if [ "$IS_BAOTA" = true ]; then
@@ -110,7 +112,7 @@ web:
   listen: "0.0.0.0:18090"
   auth_enabled: true
   username: "admin"
-  password: "admin123"
+  password: "${ADMIN_PASSWORD}"
   jwt_secret: "${JWT_SECRET}"
 safety:
   kill_budget_hourly: 15
@@ -160,7 +162,7 @@ web:
   listen: "0.0.0.0:18090"
   auth_enabled: true
   username: "admin"
-  password: "admin123"
+  password: "${ADMIN_PASSWORD}"
   jwt_secret: "${JWT_SECRET}"
 safety:
   kill_budget_hourly: 15

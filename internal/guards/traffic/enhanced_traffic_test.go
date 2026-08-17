@@ -173,7 +173,7 @@ func TestSlowAttackDetector_New(t *testing.T) {
 
 func TestSlowAttackDetector_OnConnect(t *testing.T) {
 	d := NewSlowAttackDetector()
-	d.OnConnect("conn-1")
+	d.OnConnect("conn-1", "192.0.2.1", 80)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if d.connections["conn-1"] == nil {
@@ -183,7 +183,7 @@ func TestSlowAttackDetector_OnConnect(t *testing.T) {
 
 func TestSlowAttackDetector_OnActivity(t *testing.T) {
 	d := NewSlowAttackDetector()
-	d.OnConnect("conn-1")
+	d.OnConnect("conn-1", "192.0.2.1", 80)
 	d.OnActivity("conn-1", 100)
 	d.OnActivity("conn-1", 200)
 
@@ -207,7 +207,7 @@ func TestSlowAttackDetector_OnActivityUnknownConn(t *testing.T) {
 
 func TestSlowAttackDetector_OnDisconnect(t *testing.T) {
 	d := NewSlowAttackDetector()
-	d.OnConnect("conn-1")
+	d.OnConnect("conn-1", "192.0.2.1", 80)
 	d.OnDisconnect("conn-1")
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -218,7 +218,7 @@ func TestSlowAttackDetector_OnDisconnect(t *testing.T) {
 
 func TestSlowAttackDetector_CheckSlowAttacks(t *testing.T) {
 	d := NewSlowAttackDetector()
-	d.OnConnect("conn-1")
+	d.OnConnect("conn-1", "192.0.2.1", 80)
 
 	// Manually set the connection info to simulate an old, idle connection
 	d.mu.Lock()
@@ -228,14 +228,14 @@ func TestSlowAttackDetector_CheckSlowAttacks(t *testing.T) {
 	d.mu.Unlock()
 
 	slow := d.CheckSlowAttacks()
-	if len(slow) != 1 || slow[0] != "conn-1" {
+	if len(slow) != 1 || slow[0].ConnID != "conn-1" {
 		t.Errorf("expected conn-1 in slow attacks, got %v", slow)
 	}
 }
 
 func TestSlowAttackDetector_CheckSlowAttacksNone(t *testing.T) {
 	d := NewSlowAttackDetector()
-	d.OnConnect("conn-1")
+	d.OnConnect("conn-1", "192.0.2.1", 80)
 	d.OnActivity("conn-1", 2048)
 
 	if slow := d.CheckSlowAttacks(); len(slow) != 0 {
