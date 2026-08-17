@@ -1,53 +1,46 @@
 version: '3.8'
 
+# ServerGuard Docker 部署
+# - agent：守护进程（容器内监控；pid:host 模式下可监控宿主机进程）
+# - hub：多机集中管控面板（可选，单机部署可删除该服务）
+# - postgres：Hub 的外部数据库（可选，Hub 默认用内置 SQLite）
+
 services:
   agent:
     build: .
     container_name: serverguard-agent
     restart: always
+    # 监控宿主机进程/资源需要 pid:host；仅守护容器内服务时可去掉
+    pid: host
     volumes:
-      - agent-data:/opt/serverguard/data
-      - ./configs/agent.yaml:/opt/serverguard/configs/agent.yaml:ro
+      # 数据目录与 configs/serverguard-agent.yaml 中 storage.path 保持一致
+      - agent-data:/var/lib/serverguard
+      - ./configs/serverguard-agent.yaml:/opt/serverguard/configs/serverguard-agent.yaml:ro
     ports:
-      - "8443:8443"
+      # Agent 面板（configs/serverguard-agent.yaml 中 web.listen 为 0.0.0.0:9090）
+      - "9090:9090"
     deploy:
       resources:
         limits:
-          memory: 80M
-          cpus: '0.05'
+          memory: 128M
+          cpus: '0.1'
 
   hub:
     build: .
     container_name: serverguard-hub
     restart: always
-    command: ["/opt/serverguard/serverguard-hub", "-config", "/opt/serverguard/configs/hub.yaml"]
+    command: ["/opt/serverguard/serverguard-hub", "-config", "/opt/serverguard/configs/hub.yaml", "-addr", "0.0.0.0:8443"]
     volumes:
-      - hub-data:/opt/serverguard/data
+      - hub-data:/var/lib/serverguard
       - ./configs/hub.yaml:/opt/serverguard/configs/hub.yaml:ro
     ports:
       - "8444:8443"
-    depends_on:
-      - postgres
     deploy:
       resources:
         limits:
           memory: 512M
           cpus: '1.0'
 
-  postgres:
-    image: postgres:15-alpine
-    container_name: serverguard-postgres
-    restart: always
-    environment:
-      POSTGRES_DB: serverguard
-      POSTGRES_USER: serverguard
-      POSTGRES_PASSWORD: ${PG_PASSWORD:-changeme}
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-
 volumes:
   agent-data:
   hub-data:
-  pg-data:

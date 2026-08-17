@@ -665,6 +665,70 @@ var w3MalwarePatterns = []struct {
 	{regexp.MustCompile(`eval\s*\(\s*urldecode\s*\(`), "eval(urldecode())", types.SeverityCritical},
 	{regexp.MustCompile(`eval\s*\(\s*rawurldecode\s*\(`), "eval(rawurldecode())", types.SeverityCritical},
 	{regexp.MustCompile(`eval\s*\(\s*substr\s*\(`), "eval(substr())", types.SeverityCritical},
+	// ===== 新增：更高级 Webshell 检测模式 =====
+	// 变量函数调用型 Webshell：$a($b) 其中 $a 来自用户输入
+	{regexp.MustCompile(`\$\w+\s*\(\s*\$\w+\s*\)`), "变量函数调用型Webshell", types.SeverityHigh},
+	// PHP $_FILES 上传后直接执行
+	{regexp.MustCompile(`move_uploaded_file\s*\(.*\$_FILES`), "上传文件执行", types.SeverityCritical},
+	// preg_replace /e 修饰符的更多变体
+	{regexp.MustCompile(`preg_replace\s*\(\s*["'][^"']*["']\s*,\s*\\e`), "preg_replace /e变体", types.SeverityCritical},
+	// PHP assert 变体
+	{regexp.MustCompile(`\bassert\s*\(\s*base64_decode\s*\(`), "assert(base64_decode())", types.SeverityCritical},
+	{regexp.MustCompile(`\bassert\s*\(\s*gzinflate\s*\(`), "assert(gzinflate())", types.SeverityCritical},
+	{regexp.MustCompile(`\bassert\s*\(\s*gzuncompress\s*\(`), "assert(gzuncompress())", types.SeverityCritical},
+	// call_user_func 混淆执行
+	{regexp.MustCompile(`call_user_func\s*\(\s*base64_decode\s*\(`), "call_user_func(base64_decode())", types.SeverityCritical},
+	{regexp.MustCompile(`call_user_func_array\s*\(\s*base64_decode\s*\(`), "call_user_func_array(base64_decode())", types.SeverityCritical},
+	// array_map/filter/walk 执行用户输入
+	{regexp.MustCompile(`array_map\s*\(\s*\$_(POST|GET|REQUEST)`), "array_map执行用户输入", types.SeverityCritical},
+	{regexp.MustCompile(`array_filter\s*\(\s*\$_(POST|GET|REQUEST)`), "array_filter执行用户输入", types.SeverityCritical},
+	{regexp.MustCompile(`array_walk\s*\(\s*\$_(POST|GET|REQUEST)`), "array_walk执行用户输入", types.SeverityCritical},
+	{regexp.MustCompile(`usort\s*\(.*\$_(POST|GET|REQUEST)`), "usort执行用户输入", types.SeverityCritical},
+	{regexp.MustCompile(`array_map\s*\(\s*base64_decode\s*\(`), "array_map(base64_decode())", types.SeverityCritical},
+	// 反射型 Webshell
+	{regexp.MustCompile(`ReflectionFunction\s*\(\s*\$_(POST|GET|REQUEST)`), "反射执行用户输入", types.SeverityCritical},
+	// PHP 7+ dynamic function call
+	{regexp.MustCompile(`\(\$_(POST|GET|REQUEST|COOKIE)\[\w+\]\)\s*\(`), "动态函数调用Webshell", types.SeverityCritical},
+	// 可疑的 PHP 短标签执行
+	{regexp.MustCompile(`<\?\=\s*\$_(POST|GET|REQUEST)`), "PHP短标签执行用户输入", types.SeverityCritical},
+	// Google/Baidu SEO 挂马特征：隐藏链接
+	{regexp.MustCompile(`<div[^>]*style\s*=\s*["'][^"']*position\s*:\s*absolute[^"']*left\s*:\s*-9999`), "SEO挂马隐藏层", types.SeverityHigh},
+	{regexp.MustCompile(`<span[^>]*style\s*=\s*["'][^"']*display\s*:\s*none[^"']*>\s*<a\s+href`), "隐藏链接挂马", types.SeverityHigh},
+	// 挖矿脚本检测
+	{regexp.MustCompile(`coinhive|coin-hive|cryptonight|crypto-loot|webminerpool|jsecoin|coinerra`), "挖矿脚本注入", types.SeverityCritical},
+	{regexp.MustCompile(`var\s+\w+\s*=\s*new\s+CoinHive`), "CoinHive挖矿对象", types.SeverityCritical},
+	{regexp.MustCompile(`navigator\.hardwareConcurrency.*\bwhile\s*\(\s*true\s*\)`), "CPU挖矿循环", types.SeverityHigh},
+	// JS 混淆+eval 组合
+	{regexp.MustCompile(`eval\s*\(\s*function\s*\(`), "eval(function())混淆", types.SeverityHigh},
+	{regexp.MustCompile(`eval\s*\(\s*atob\s*\(`), "eval(atob())Base64执行", types.SeverityHigh},
+	// PHP 特征函数组合（Webshell 常用）
+	{regexp.MustCompile(`\barray_map\s*\(.*\bassert\b`), "array_map+assert组合", types.SeverityCritical},
+	{regexp.MustCompile(`\barray_filter\s*\(.*\bassert\b`), "array_filter+assert组合", types.SeverityCritical},
+	{regexp.MustCompile(`\barray_walk\s*\(.*\bassert\b`), "array_walk+assert组合", types.SeverityCritical},
+	// Webshell 常见特征字符串
+	{regexp.MustCompile(`(?i)GodMode|b374k|c99|r57|wso|shellphp|IndoXploit|b374k\s*m1n1`), "已知Webshell特征", types.SeverityCritical},
+	{regexp.MustCompile(`(?i)phpspy|phplist|phpjackal|NCC-Group|RootShell|NST`), "已知Webshell名称", types.SeverityCritical},
+	// 可疑的 PHP 变量拼接执行
+	{regexp.MustCompile(`\$\w+\s*\=\s*\$_(POST|GET|REQUEST)\[`), "用户输入赋值变量", types.SeverityMedium},
+	// Content-Disposition 注入检测
+	{regexp.MustCompile(`Content-Disposition\s*:.*\r?\n\s*\r?\n`), "Header注入检测", types.SeverityHigh},
+	// PHP 混淆变量名（常见于 Webshell）
+	{regexp.MustCompile(`\$[a-z0-9_]{40,}`), "超长变量名混淆", types.SeverityMedium},
+	// 可疑的 null byte 注入
+	{regexp.MustCompile(`%00|\\x00|\\0`), "Null Byte注入", types.SeverityHigh},
+	// 恶意 iframe 注入（更多变体）
+	{regexp.MustCompile(`<iframe[^>]*width\s*=\s*["']?0["']?[^>]*height\s*=\s*["']?0["']?`), "零尺寸iframe挂马", types.SeverityHigh},
+	{regexp.MustCompile(`<iframe[^>]*src\s*=\s*["']javascript:`), "JavaScript协议iframe", types.SeverityCritical},
+	// document.write 写入外部脚本
+	{regexp.MustCompile(`document\.write\s*\(\s*['"]<script[^>]*src\s*=`), "document.write注入外部脚本", types.SeverityHigh},
+	//可疑的 setTimeout/setInterval 执行外部代码
+	{regexp.MustCompile(`setTimeout\s*\(\s*['"]?\w+\(\)\s*\{.*eval\s*\(`), "setTimeout+eval混淆", types.SeverityHigh},
+	// Base64 编码的 PHP 标签
+	{regexp.MustCompile(`(?i)PD9waA|PD8g|PD9waHAg|<?php.*eval`), "Base64编码PHP标签", types.SeverityHigh},
+	// 可疑的 str_replace 混淆
+	{regexp.MustCompile(`str_replace\s*\(\s*["'][^"']{50,}`), "str_replace长字符串混淆", types.SeverityMedium},
+	// PHP goto 混淆（PHP Webshell 新型混淆）
+	{regexp.MustCompile(`goto\s+\w+\s*;.*goto\s+\w+\s*;`), "goto混淆控制流", types.SeverityHigh},
 }
 
 // w3CDNWhitelist 常见 CDN 域名，外部 JS 引用指向这些域名时不报告

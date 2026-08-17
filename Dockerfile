@@ -19,4 +19,4 @@ COPY --from=builder /build/sgctl /usr/local/bin/sgctl
 COPY configs/ /opt/serverguard/configs/
 
 ENTRYPOINT ["/opt/serverguard/serverguard-agent"]
-CMD ["-config", "/opt/serverguard/configs/agent.yaml"]
+CMD ["-config", "/opt/serverguard/configs/serverguard-agent.yaml"]

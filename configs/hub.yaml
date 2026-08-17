@@ -1,0 +1,34 @@
+# ServerGuard Hub 多机集中管控配置（Docker / 自建均可使用）
+# 启动：serverguard-hub -config configs/hub.yaml [-addr 0.0.0.0:8443]
+
+agent:
+  id: "serverguard-hub"
+  name: "ServerGuard Hub"
+  data_dir: "/var/lib/serverguard"
+  log_level: "info"
+
+# Hub 面板登录（改掉默认密码！）
+web:
+  enabled: true
+  auth_enabled: true
+  username: "admin"
+  # 生产环境必须修改：面板登录密码
+  password: "CHANGE_ME_HUB_PASSWORD"
+  # 生产环境必须修改：同时作为 Agent 接入 /ws/agent 的共享 Token
+  # （Agent 侧 cfg.hub.token 必须与该值一致）
+  jwt_secret: "CHANGE_ME_AGENT_SHARED_TOKEN"
+
+storage:
+  path: "/var/lib/serverguard/hub.db"
+
+safety:
+  kill_budget_hourly: 15
+  kill_budget_daily: 50
+  kill_min_interval: 30s
+  circuit_breaker_threshold: 3
+  circuit_breaker_reset_duration: 30m
+  observation_window: 60s
+  min_available_memory_mb: 50
+  max_load_factor: 3.0
+  min_disk_free_mb: 500
+  max_disk_io_wait_percent: 80
