@@ -4,7 +4,7 @@ import "fmt"
 
 // Version information set at build time
 var (
-	Version   = "0.2.0"
+	Version   = "0.3.4"
 	BuildTime = "unknown"
 	GitCommit = "unknown"
 	GoVersion = "unknown"

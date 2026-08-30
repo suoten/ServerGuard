@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/suoten/serverguard/internal/types"
 	"github.com/suoten/serverguard/internal/agent/eventbus"
 )
@@ -29,18 +31,34 @@ type SelfMonitor struct {
 }
 
 // New creates a new SelfMonitor.
+// 向宝塔学习：maxRSS 根据系统内存自适应，不硬编码
 func New(bus *eventbus.EventBus) *SelfMonitor {
+	// 根据系统总内存自适应设定 maxRSS
+	// ≤ 1G: 64MB, ≤ 2G: 96MB, ≤ 4G: 128MB, > 4G: 192MB
+	maxRSS := uint64(64 * 1024 * 1024) // 默认 64MB
+	if vmem, err := mem.VirtualMemory(); err == nil {
+		totalMB := vmem.Total / 1024 / 1024
+		switch {
+		case totalMB > 4096:
+			maxRSS = 192 * 1024 * 1024
+		case totalMB > 2048:
+			maxRSS = 128 * 1024 * 1024
+		case totalMB > 1024:
+			maxRSS = 96 * 1024 * 1024
+		}
+	}
 	return &SelfMonitor{
 		eventBus:       bus,
-		maxRSS:         80 * 1024 * 1024, // 80MB
-		maxGoroutines:  1000,
-		maxQueueDepth:  1000,
+		maxRSS:         maxRSS,
+		maxGoroutines:  1000, // 并发扫描时 goroutine 会增多（8 worker × 11 子扫描器 + HTTP 连接池）
+		maxQueueDepth:  500,
 		startTime:      time.Now(),
 		latencyBuckets: make(map[float64]int),
 	}
 }
 
 // Check performs self-monitoring checks.
+// 向宝塔学习：RSS 超限时不仅 GC，还主动释放内存回 OS
 func (s *SelfMonitor) Check() {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
@@ -50,11 +68,18 @@ func (s *SelfMonitor) Check() {
 	if rss > s.maxRSS {
 		s.eventBus.PublishAlert(types.AlertWarning, "agent",
 			"Agent内存过高",
-			fmt.Sprintf("Agent RSS %d MB 超过上限 %d MB，可能存在内存泄漏。Goroutine数: %d",
+			fmt.Sprintf("Agent RSS %d MB 超过上限 %d MB，已触发 GC+FreeOSMemory。Goroutine数: %d",
 				rss/1024/1024, s.maxRSS/1024/1024, runtime.NumGoroutine()),
 			"agent-mem-001")
-		// Force GC
+		// Force GC + 释放内存回 OS
 		runtime.GC()
+		debug.FreeOSMemory()
+	}
+
+	// 如果 HeapAlloc 超过 maxRSS 的 50%，主动 GC（防止内存缓步增长）
+	if memStats.HeapAlloc > s.maxRSS/2 {
+		runtime.GC()
+		debug.FreeOSMemory()
 	}
 
 	// Check Goroutine count
@@ -80,7 +105,10 @@ func (s *SelfMonitor) Check() {
 	_ = uptime
 
 	// Write self-metrics to /proc-like file for external monitoring
-	s.writeSelfMetrics(memStats, goroutines)
+	// 向宝塔学习：writeSelfMetrics 是空操作，直接去掉调用
+	// s.writeSelfMetrics(memStats, goroutines)
+	_ = memStats
+	_ = goroutines
 }
 
 // RecordPanic records a panic occurrence.
@@ -94,13 +122,14 @@ func (s *SelfMonitor) ResetPanicCount() {
 }
 
 // RecordCollectLatency records the latency of a collection cycle.
+// 向宝塔学习：延迟直方图用 10ms 粒度量化，避免 map 无限增长
 func (s *SelfMonitor) RecordCollectLatency(d time.Duration) {
 	atomic.AddInt64(&s.collectCount, 1)
 	s.mu.Lock()
 	s.collectLatency = d
-	// Update histogram
-	ms := float64(d.Milliseconds())
-	s.latencyBuckets[ms]++
+	// 量化到 10ms 桶：12.3ms → 10ms, 15.7ms → 10ms, 23.4ms → 20ms
+	bucket := float64(int(d.Milliseconds())/10) * 10
+	s.latencyBuckets[bucket]++
 	s.mu.Unlock()
 
 	// Alert if P99 > 500ms

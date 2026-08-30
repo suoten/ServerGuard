@@ -36,10 +36,12 @@ type CCAttackDetector struct {
 func NewCCAttackDetector() *CCAttackDetector {
 	return &CCAttackDetector{
 		requestCounts: make(map[string]map[string]int),
-		threshold:     100,
-		window:        10 * time.Second,
-		lastCleanup:   time.Now(),
-		flaggedIPs:    make(map[string]time.Time),
+		// 阈值从 100 提高到 500：100 次/10 秒对正常浏览宝塔面板可能误触，
+		// 此检测器只做告警标记，真正的 CC 封禁由 attackwarn 模块的行为分析完成
+		threshold:   500,
+		window:      10 * time.Second,
+		lastCleanup: time.Now(),
+		flaggedIPs:  make(map[string]time.Time),
 	}
 }
 
@@ -268,7 +270,9 @@ type PortScanDetector struct {
 func NewPortScanDetector() *PortScanDetector {
 	return &PortScanDetector{
 		ipPortHits:  make(map[string]map[int]bool),
-		threshold:   20,
+		// 从 20 提高到 50：正常多站点浏览（宝塔面板8888 + 多个站点443/80 + SSH22 + 数据库3306等）
+		// 可能连接 10+ 个不同端口，20 太低会误报
+		threshold:   50,
 		windowStart: time.Now(),
 		window:      5 * time.Minute,
 	}
@@ -467,8 +471,9 @@ func CheckConnectionStates() []ConnectionStateAnomaly {
 		})
 	}
 
-	// CLOSE_WAIT 过多（超过 100，可能应用未正确关闭连接）
-	if stats.CLOSE_WAIT > 100 {
+	// CLOSE_WAIT 过多——从 100 提高到 200
+	// 正常应用可能有少量 CLOSE_WAIT（连接关闭有延迟），100 太低
+	if stats.CLOSE_WAIT > 200 {
 		anomalies = append(anomalies, ConnectionStateAnomaly{
 			Type:    "CLOSE_WAIT堆积",
 			Count:   stats.CLOSE_WAIT,
@@ -478,8 +483,9 @@ func CheckConnectionStates() []ConnectionStateAnomaly {
 		})
 	}
 
-	// SYN_RECV 过多（可能 SYN Flood）
-	if stats.SYN_RECV > 100 {
+	// SYN_RECV 过多（可能 SYN Flood）——从 100 提高到 500
+	// 正常高负载服务器的 SYN_RECV 可能达到几十到上百，100 太低会误报
+	if stats.SYN_RECV > 500 {
 		anomalies = append(anomalies, ConnectionStateAnomaly{
 			Type:    "SYN_RECV异常",
 			Count:   stats.SYN_RECV,
@@ -590,6 +596,9 @@ func (g *TrafficGuard) checkSuspiciousOutbound(ctx context.Context) {
 		return
 	}
 
+	// 获取本机所有网卡 IP，用于排除服务器自身 IP（包括公网 IP）
+	localIPs := getLocalIPs()
+
 	detector := NewOutboundAnomalyDetector()
 	suspiciousIPs := make(map[string][]string)
 
@@ -603,15 +612,28 @@ func (g *TrafficGuard) checkSuspiciousOutbound(ctx context.Context) {
 			continue
 		}
 
+		rip := conn.Raddr.IP
+
 		// 排除本地回环地址
-		if conn.Raddr.IP == "127.0.0.1" || conn.Raddr.IP == "::1" {
+		if rip == "127.0.0.1" || rip == "::1" {
+			continue
+		}
+
+		// 排除内网私有 IP（10.x / 172.16-31.x / 192.168.x）
+		if isPrivateIP(rip) {
+			continue
+		}
+
+		// 排除服务器自身的 IP（包括公网 IP）
+		// 服务器可能通过自己的公网 IP 回环访问自己的服务（如 MySQL 3306、Redis 6379）
+		if localIPs[rip] {
 			continue
 		}
 
 		port := int(conn.Raddr.Port)
-		if reason, suspicious := detector.RecordSuspiciousOutbound(conn.Raddr.IP, port); suspicious {
+		if reason, suspicious := detector.RecordSuspiciousOutbound(rip, port); suspicious {
 			entry := fmt.Sprintf("端口 %d (%s)", port, reason)
-			suspiciousIPs[conn.Raddr.IP] = append(suspiciousIPs[conn.Raddr.IP], entry)
+			suspiciousIPs[rip] = append(suspiciousIPs[rip], entry)
 		}
 	}
 
@@ -623,6 +645,38 @@ func (g *TrafficGuard) checkSuspiciousOutbound(ctx context.Context) {
 				ip, strings.Join(entries, ", ")),
 			"suspicious-outbound-001")
 	}
+}
+
+// getLocalIPs 返回本机所有网卡的 IP 地址集合
+// 用于排除服务器自身的 IP（包括公网 IP），避免误报
+func getLocalIPs() map[string]bool {
+	ips := make(map[string]bool)
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil {
+				ips[ip.String()] = true
+			}
+		}
+	}
+	return ips
 }
 
 // ============================================================

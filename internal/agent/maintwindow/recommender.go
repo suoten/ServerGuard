@@ -54,7 +54,14 @@ func (r *Recommender) Recommend() (*Recommendation, error) {
 	// 获取 30 天的 CPU 指标
 	cpuMetrics, err := r.store.GetMetrics("", "system.cpu_percent", since, 50000)
 	if err != nil || len(cpuMetrics) == 0 {
-		return nil, fmt.Errorf("无足够历史数据（需要至少运行 1 天）")
+		// 无历史数据（刚安装），返回空推荐而非错误
+		return &Recommendation{
+			Timestamp:     time.Now(),
+			BestSlots:     []TimeSlot{},
+			AnalysisRange: "30天",
+			Reason:        "无足够历史数据，需运行至少 1 天后才能推荐变更窗口",
+			TotalSamples:  0,
+		}, nil
 	}
 
 	// 获取内存指标

@@ -21,6 +21,7 @@ type DiscoveredSite struct {
 	Port      int    `json:"port"`
 	SSL       bool   `json:"ssl"`
 	ConfigFile string `json:"config_file,omitempty"`
+	WebRoot   string `json:"web_root,omitempty"` // 网站文件根目录（从 Nginx root / Apache DocumentRoot 提取）
 }
 
 // Discovery scans the system for configured websites.
@@ -35,44 +36,42 @@ func New() *Discovery {
 }
 
 // Discover scans all sources and returns found websites.
+// 优化：每个配置目录扫描完立即去重，避免 117+ 站点时一次性分配大 slice。
+// 去重用 map，最终只在返回前转为 slice，中间过程内存占用极小。
 func (d *Discovery) Discover() []DiscoveredSite {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.sites = d.sites[:0]
+	// 用 map 做去重，避免先收集全部再过滤（减少峰值内存）
+	seen := make(map[string]DiscoveredSite)
 
 	if runtime.GOOS == "windows" {
-		d.discoverIIS()
+		d.discoverIISStream(seen)
 	} else {
-		d.discoverNginx()
-		d.discoverApache()
-		d.discoverBaoTa()
+		// 逐个目录扫描，每扫完一个目录后 seen map 已去重
+		// 不再像原来那样把全部原始结果 append 到 d.sites 再去重
+		d.discoverNginxStream(seen)
+		d.discoverApacheStream(seen)
+		d.discoverBaoTaStream(seen)
 	}
 
-	// Deduplicate by domain
-	seen := make(map[string]bool)
-	unique := make([]DiscoveredSite, 0, len(d.sites))
-	for _, s := range d.sites {
-		key := s.Domain
-		if key == "" {
-			key = s.URL
-		}
+	// 从 map 提取为 slice（此时已经是去重后的，比原来先收集再去重省内存）
+	result := make([]DiscoveredSite, 0, len(seen))
+	for _, s := range seen {
 		// 过滤本地回环地址和无意义的站点
+		key := s.Domain
 		if key == "127.0.0.1" || key == "localhost" || key == "::1" || key == "0.0.0.0" {
 			continue
 		}
-		if !seen[key] {
-			seen[key] = true
-			unique = append(unique, s)
-		}
+		result = append(result, s)
 	}
 
-	sort.Slice(unique, func(i, j int) bool {
-		return unique[i].Name < unique[j].Name
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
 	})
 
-	d.sites = unique
-	return unique
+	d.sites = result
+	return result
 }
 
 // GetSites returns the last discovery result.
@@ -82,10 +81,20 @@ func (d *Discovery) GetSites() []DiscoveredSite {
 	return d.sites
 }
 
+// addSite adds a site to the seen map with deduplication.
+func addSite(seen map[string]DiscoveredSite, site DiscoveredSite) {
+	key := site.Domain
+	if key == "" {
+		key = site.URL
+	}
+	if _, exists := seen[key]; !exists {
+		seen[key] = site
+	}
+}
+
 // --- IIS Discovery (Windows) ---
 
-func (d *Discovery) discoverIIS() {
-	// Use appcmd to list sites
+func (d *Discovery) discoverIISStream(seen map[string]DiscoveredSite) {
 	appcmd := `C:\Windows\System32\inetsrv\appcmd.exe`
 	if _, err := os.Stat(appcmd); err != nil {
 		return
@@ -103,26 +112,22 @@ func (d *Discovery) discoverIIS() {
 			continue
 		}
 
-		// Get bindings for this site
 		bindingsOutput, err := exec.Command(appcmd, "list", "site", name, "/text:bindings").Output()
 		if err != nil {
 			continue
 		}
 		bindings := strings.TrimSpace(string(bindingsOutput))
-
-		// Parse bindings like "http/*:80:example.com,https/*:443:example.com"
-		d.parseIISBindings(name, bindings)
+		parseIISBindingsStream(seen, name, bindings)
 	}
 }
 
-func (d *Discovery) parseIISBindings(siteName, bindings string) {
+func parseIISBindingsStream(seen map[string]DiscoveredSite, siteName, bindings string) {
 	for _, binding := range strings.Split(bindings, ",") {
 		binding = strings.TrimSpace(binding)
 		if binding == "" {
 			continue
 		}
 
-		// Format: protocol/ip:port:hostheader or protocol/port
 		parts := strings.Split(binding, ":")
 		if len(parts) < 2 {
 			continue
@@ -131,7 +136,6 @@ func (d *Discovery) parseIISBindings(siteName, bindings string) {
 		protocol := parts[0]
 		ssl := protocol == "https"
 
-		// Extract port and host
 		port := 80
 		host := ""
 		if len(parts) >= 3 {
@@ -146,7 +150,6 @@ func (d *Discovery) parseIISBindings(siteName, bindings string) {
 			scheme = "https"
 		}
 
-		// If SSL is detected but port is 80, the actual SSL port is 443
 		if ssl && port == 80 {
 			port = 443
 		}
@@ -162,7 +165,7 @@ func (d *Discovery) parseIISBindings(siteName, bindings string) {
 			host = siteName
 		}
 
-		d.sites = append(d.sites, DiscoveredSite{
+		addSite(seen, DiscoveredSite{
 			Name:   siteName,
 			URL:    url,
 			Domain: host,
@@ -180,9 +183,12 @@ var (
 	nginxListenRe     = regexp.MustCompile(`listen\s+(\d+)`)
 	nginxListenSSLRe  = regexp.MustCompile(`listen\s+(\d+)\s+ssl`)
 	nginxSSLRe        = regexp.MustCompile(`ssl\s+on|listen\s+\d+\s+ssl`)
+	// Nginx root 指令：root /www/wwwroot/example.com;
+	// 兼容带引号和不带引号的路径，兼容 root $variable; （跳过变量）
+	nginxRootRe = regexp.MustCompile(`(?m)^\s*root\s+([^;\s$]+)\s*;`)
 )
 
-func (d *Discovery) discoverNginx() {
+func (d *Discovery) discoverNginxStream(seen map[string]DiscoveredSite) {
 	configDirs := []string{
 		"/etc/nginx/conf.d/",
 		"/etc/nginx/sites-enabled/",
@@ -200,26 +206,24 @@ func (d *Discovery) discoverNginx() {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			d.parseNginxConfig(path)
+			parseNginxConfigStream(seen, path)
 		}
 	}
 }
 
-func (d *Discovery) parseNginxConfig(path string) {
+func parseNginxConfigStream(seen map[string]DiscoveredSite, path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
 	content := string(data)
 
-	// Extract server names
 	serverNameMatches := nginxServerNameRe.FindStringSubmatch(content)
 	if len(serverNameMatches) < 2 {
 		return
 	}
 	serverNames := strings.Split(strings.TrimSpace(serverNameMatches[1]), " ")
 
-	// Extract listen port — prefer SSL listen port if present (BaoTa configs have both listen 80 and listen 443 ssl)
 	port := 80
 	if sslListenMatches := nginxListenSSLRe.FindStringSubmatch(content); len(sslListenMatches) >= 2 {
 		fmt.Sscanf(sslListenMatches[1], "%d", &port)
@@ -227,8 +231,20 @@ func (d *Discovery) parseNginxConfig(path string) {
 		fmt.Sscanf(listenMatches[1], "%d", &port)
 	}
 
-	// Check SSL
 	ssl := nginxSSLRe.MatchString(content) || port == 443
+
+	// 提取 root 指令（网站文件根目录）
+	webRoot := ""
+	if rootMatches := nginxRootRe.FindStringSubmatch(content); len(rootMatches) >= 2 {
+		rootPath := strings.TrimSpace(rootMatches[1])
+		// 跳过 Nginx 变量（如 $root_path）
+		if !strings.HasPrefix(rootPath, "$") && rootPath != "/" {
+			// 验证路径是否存在
+			if _, statErr := os.Stat(rootPath); statErr == nil {
+				webRoot = rootPath
+			}
+		}
+	}
 
 	for _, name := range serverNames {
 		name = strings.TrimSuffix(strings.TrimSpace(name), ";")
@@ -241,8 +257,6 @@ func (d *Discovery) parseNginxConfig(path string) {
 			scheme = "https"
 		}
 
-		// If SSL is detected but port is 80 (common in BaoTa combined configs),
-		// the actual SSL port is 443
 		if ssl && port == 80 {
 			port = 443
 		}
@@ -252,7 +266,7 @@ func (d *Discovery) parseNginxConfig(path string) {
 			url = fmt.Sprintf("%s://%s:%d", scheme, name, port)
 		}
 
-		d.sites = append(d.sites, DiscoveredSite{
+		addSite(seen, DiscoveredSite{
 			Name:       name,
 			URL:        url,
 			Domain:     name,
@@ -260,15 +274,13 @@ func (d *Discovery) parseNginxConfig(path string) {
 			Port:       port,
 			SSL:        ssl,
 			ConfigFile: path,
+			WebRoot:    webRoot,
 		})
 	}
 }
 
 // isApacheRunning checks if Apache (httpd or apache2) is actually running.
-// 宝塔会为每个站点生成 Apache vhost 文件，即使没装 Apache 也会有。
-// 只在 Apache 实际运行时才扫描其配置。
 func isApacheRunning() bool {
-	// 检查 httpd 或 apache2 进程是否存在
 	for _, pattern := range []string{"httpd", "apache2"} {
 		cmd := exec.Command("pgrep", "-x", pattern)
 		if output, err := cmd.Output(); err == nil && len(output) > 0 {
@@ -281,13 +293,12 @@ func isApacheRunning() bool {
 // --- Apache Discovery (Linux) ---
 
 var (
-	apacheServerNameRe = regexp.MustCompile(`ServerName\s+(\S+)`)
-	apacheVhostPortRe  = regexp.MustCompile(`VirtualHost\s+\*:(\d+)`)
+	apacheServerNameRe   = regexp.MustCompile(`ServerName\s+(\S+)`)
+	apacheVhostPortRe    = regexp.MustCompile(`VirtualHost\s+\*:(\d+)`)
+	apacheDocumentRootRe = regexp.MustCompile(`(?i)DocumentRoot\s+"?([^"\s]+)"?`)
 )
 
-func (d *Discovery) discoverApache() {
-	// 先检查 Apache 是否在运行 — 宝塔创建站点时会同时生成 Apache vhost 文件，
-	// 即使没装 Apache 也会生成。只扫描实际运行的 Apache 配置。
+func (d *Discovery) discoverApacheStream(seen map[string]DiscoveredSite) {
 	if !isApacheRunning() {
 		return
 	}
@@ -308,26 +319,24 @@ func (d *Discovery) discoverApache() {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			d.parseApacheConfig(path)
+			parseApacheConfigStream(seen, path)
 		}
 	}
 }
 
-func (d *Discovery) parseApacheConfig(path string) {
+func parseApacheConfigStream(seen map[string]DiscoveredSite, path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
 	content := string(data)
 
-	// Extract port from VirtualHost
 	port := 80
 	portMatches := apacheVhostPortRe.FindStringSubmatch(content)
 	if len(portMatches) >= 2 {
 		fmt.Sscanf(portMatches[1], "%d", &port)
 	}
 
-	// Extract ServerName
 	nameMatches := apacheServerNameRe.FindStringSubmatch(content)
 	if len(nameMatches) < 2 {
 		return
@@ -336,13 +345,22 @@ func (d *Discovery) parseApacheConfig(path string) {
 
 	ssl := port == 443 || strings.Contains(content, "SSLEngine on")
 
+	// 提取 DocumentRoot（网站文件根目录）
+	webRoot := ""
+	if rootMatches := apacheDocumentRootRe.FindStringSubmatch(content); len(rootMatches) >= 2 {
+		rootPath := strings.TrimSpace(rootMatches[1])
+		if rootPath != "/" {
+			if _, statErr := os.Stat(rootPath); statErr == nil {
+				webRoot = rootPath
+			}
+		}
+	}
+
 	scheme := "http"
 	if ssl {
 		scheme = "https"
 	}
 
-	// If SSL is detected but port is 80 (common in combined configs),
-	// the actual SSL port is 443
 	if ssl && port == 80 {
 		port = 443
 	}
@@ -352,7 +370,7 @@ func (d *Discovery) parseApacheConfig(path string) {
 		url = fmt.Sprintf("%s://%s:%d", scheme, name, port)
 	}
 
-	d.sites = append(d.sites, DiscoveredSite{
+	addSite(seen, DiscoveredSite{
 		Name:       name,
 		URL:        url,
 		Domain:     name,
@@ -360,13 +378,13 @@ func (d *Discovery) parseApacheConfig(path string) {
 		Port:       port,
 		SSL:        ssl,
 		ConfigFile: path,
+		WebRoot:    webRoot,
 	})
 }
 
 // --- BaoTa Discovery (Linux) ---
 
-func (d *Discovery) discoverBaoTa() {
-	// BaoTa nginx vhost directory
+func (d *Discovery) discoverBaoTaStream(seen map[string]DiscoveredSite) {
 	vhostDir := "/www/server/panel/vhost/nginx/"
 	entries, err := os.ReadDir(vhostDir)
 	if err != nil {
@@ -397,21 +415,30 @@ func (d *Discovery) discoverBaoTa() {
 			fmt.Sscanf(listenMatches[1], "%d", &port)
 		}
 
-		ssl := nginxSSLRe.MatchString(content) || port == 443
+	ssl := nginxSSLRe.MatchString(content) || port == 443
 
-		for _, name := range serverNames {
-			name = strings.TrimSuffix(strings.TrimSpace(name), ";")
-			if name == "" || name == "_" {
-				continue
+	// 提取 root 指令（宝塔 Nginx 配置中的 root 指向站点根目录）
+	webRoot := ""
+	if rootMatches := nginxRootRe.FindStringSubmatch(content); len(rootMatches) >= 2 {
+		rootPath := strings.TrimSpace(rootMatches[1])
+		if !strings.HasPrefix(rootPath, "$") && rootPath != "/" {
+			if _, statErr := os.Stat(rootPath); statErr == nil {
+				webRoot = rootPath
 			}
+		}
+	}
 
-			scheme := "http"
-			if ssl {
-				scheme = "https"
-			}
+	for _, name := range serverNames {
+		name = strings.TrimSuffix(strings.TrimSpace(name), ";")
+		if name == "" || name == "_" {
+			continue
+		}
 
-		// If SSL is detected but port is 80 (common in BaoTa combined configs),
-		// the actual SSL port is 443
+		scheme := "http"
+		if ssl {
+			scheme = "https"
+		}
+
 		if ssl && port == 80 {
 			port = 443
 		}
@@ -421,16 +448,17 @@ func (d *Discovery) discoverBaoTa() {
 			url = fmt.Sprintf("%s://%s:%d", scheme, name, port)
 		}
 
-		d.sites = append(d.sites, DiscoveredSite{
+		addSite(seen, DiscoveredSite{
 			Name:       name,
 			URL:        url,
 			Domain:     name,
 			Source:     "baota",
-				Port:       port,
-				SSL:        ssl,
-				ConfigFile: path,
-			})
-		}
+			Port:       port,
+			SSL:        ssl,
+			ConfigFile: path,
+			WebRoot:    webRoot,
+		})
+	}
 	}
 }
 

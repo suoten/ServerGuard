@@ -18,6 +18,23 @@ import (
 	"github.com/suoten/serverguard/internal/agent/eventbus"
 )
 
+// 向宝塔学习：包级共享 HTTP client，替代 http.DefaultClient
+// DefaultClient 没有超时、没有连接池限制，在低配服务器上容易泄漏 goroutine
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        5,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     60 * time.Second,
+	},
+}
+
+// AlertHumanizer 可选的告警文案增强接口（由 LLM 增强器实现）
+type AlertHumanizer interface {
+	IsEnabled() bool
+	HumanizeAlert(alert types.Alert) string
+}
+
 // Notifier manages all alert notification channels.
 // Supports: email, webhook, WxPusher, DingTalk, Feishu, Slack, Telegram, SMS.
 type Notifier struct {
@@ -41,12 +58,21 @@ type Notifier struct {
 	// 未注入时退回默认占位内容。
 	digestProvider func() (string, string)
 
+	// historyProvider 历史相似故障查询器（可选注入，告警推送时附经验提示）
+	historyProvider HistoryProvider
+
 	// P0 告警升级 + 时区感知延迟推送
 	escalationMgr *EscalationManager
 	timeZoneDelay *TimeZoneDelay
 
 	// 智能降噪：抖动抑制 + 同源关联归并
 	corr *correlator
+
+	// V4.0 — LLM 增强层（可选，默认 nil）
+	humanizer AlertHumanizer
+
+	// V4.0 — 双向通知器（可选，默认 nil）
+	biNotifier *BidirectionalNotifier
 }
 
 // Channel interface for alert delivery.
@@ -86,20 +112,10 @@ func New(bus *eventbus.EventBus) *Notifier {
 	// Subscribe to alert events
 	bus.Subscribe(types.EventAlert, n.handleAlert)
 
-	// Start aggregation flusher (checks every 30 seconds)
-	go n.aggregationFlusher()
-
-	// Start daily digest checker (checks every 10 minutes)
-	go n.dailyDigestChecker()
-
-	// Start P0 escalation checker (checks every 30 seconds)
-	go n.escalationChecker()
-
-	// Start time-zone delay flusher (checks every 5 minutes)
-	go n.timeZoneDelayFlusher()
-
-	// Start correlator flusher (incident updates every 60 seconds)
-	go n.correlatorFlusher()
+	// 向宝塔学习：5 个独立 goroutine 合并为 1 个
+	// 原来每个功能各启一个 goroutine 各一个 ticker，5 个 ticker 每次都唤醒一次调度器
+	// 合并后只需 1 个 goroutine、1 个 ticker，按内部计数器分频执行
+	go n.backgroundLoop()
 
 	return n
 }
@@ -116,6 +132,33 @@ func (n *Notifier) SetSilence(s SilenceConfig) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.silence = s
+}
+
+// HistoryProvider 根据告警症状返回历史相似故障的处理经验（无命中返回空串）。
+// 由 main 注入知识库查询，避免 notifier 直接依赖 knowledge 包。
+type HistoryProvider func(title, source string) string
+
+// SetHistoryProvider 注入历史相似故障查询器——告警推送时自动附上
+// "这个症状历史上是怎么解决的"，让每条告警自带药方。
+func (n *Notifier) SetHistoryProvider(p HistoryProvider) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.historyProvider = p
+}
+
+// historyHint 查询历史经验并格式化为可追加的提示文本。
+func (n *Notifier) historyHint(title, source string) string {
+	n.mu.RLock()
+	p := n.historyProvider
+	n.mu.RUnlock()
+	if p == nil {
+		return ""
+	}
+	hint := p(title, source)
+	if hint == "" {
+		return ""
+	}
+	return "\n\n📚 历史相似故障经验：\n" + hint
 }
 
 // handleAlert handles incoming alert events with aggregation.
@@ -169,6 +212,12 @@ func (n *Notifier) handleAlert(event types.Event) {
 
 	// P0 告警升级跟踪
 	n.escalationMgr.Track(alert)
+
+	// 历史经验注入：知识库里有相似症状的处置记录时，附在告警后一起推送——
+	// 让收到告警的人第一眼就知道"上次是怎么解决的"
+	if hint := n.historyHint(event.Title, event.Source); hint != "" {
+		alert.Message += hint
+	}
 
 	// Aggregate: buffer the alert, flush will send merged notifications
 	key := fmt.Sprintf("%s|%s|%s", event.Level, event.Source, event.Title)
@@ -227,6 +276,26 @@ func (n *Notifier) sendToChannels(alert types.Alert) {
 		return
 	}
 
+	// V4.0 — LLM 增强层：如果启用，用 LLM 人性化告警文案
+	n.mu.RLock()
+	humanizer := n.humanizer
+	biNotifier := n.biNotifier
+	n.mu.RUnlock()
+
+	if humanizer != nil && humanizer.IsEnabled() {
+		if enhanced := humanizer.HumanizeAlert(alert); enhanced != "" {
+			alert.Message = enhanced
+		}
+	}
+
+	// V4.0 — 双向通知：如果启用，给告警附加回复编号
+	if biNotifier != nil {
+		shortID, formattedMsg := biNotifier.FormatAlertWithActionCode(alert)
+		if shortID != "" {
+			alert.Message = formattedMsg
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -258,83 +327,137 @@ func (n *Notifier) sendToChannels(alert types.Alert) {
 			}
 		}
 
-		go func(c Channel) {
-			if err := c.Send(ctx, alert); err != nil {
-				_ = err
-			}
-		}(ch)
+		// 向宝塔学习：低配服务器通知渠道通常只有 1-2 个
+		// 不为每个 channel 开 goroutine，串行发送更省资源
+		// 只有渠道数 > 2 时才并发
+		if len(channels) > 2 {
+			go func(c Channel) {
+				if err := c.Send(ctx, alert); err != nil {
+					_ = err
+				}
+			}(ch)
+		} else {
+			// 串行发送，不开 goroutine
+			_ = ch.Send(ctx, alert)
+		}
 	}
 }
 
-// aggregationFlusher periodically checks for buffered alerts and sends aggregated summaries.
-func (n *Notifier) aggregationFlusher() {
+// backgroundLoop 合并版后台循环：1 个 goroutine、1 个 ticker 管所有周期任务。
+// 向宝塔学习：不搞 5 个 goroutine 各一个 ticker，1 个就够
+//
+// 分频方案（base = 30s）：
+//   tick % 1  → aggregation flush + escalation check（每 30s）
+//   tick % 2  → correlator flush（每 60s）
+//   tick % 10 → timeZoneDelay flush（每 5min）
+//   tick % 20 → dailyDigest check（每 10min）
+func (n *Notifier) backgroundLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	tick := 0
 	for range ticker.C {
-		n.aggMu.Lock()
-		for key, alerts := range n.aggBuffer {
-			if len(alerts) <= 1 {
-				// Only one alert, already sent immediately
-				delete(n.aggBuffer, key)
-				continue
-			}
-
-			// Check if cooldown has passed since last send
-			lastSend, exists := n.aggLastSend[key]
-			if exists && time.Since(lastSend) < n.aggCooldown {
-				continue // Still in cooldown, keep buffering
-			}
-
-			// Send aggregated summary
-			first := alerts[0]
-			last := alerts[len(alerts)-1]
-			summary := types.Alert{
-				Level:     first.Level,
-				Title:     first.Title,
-				Source:    first.Source,
-				Timestamp: time.Now(),
-				Message: fmt.Sprintf("%s\n\n（5分钟内共发生 %d 次，首次：%s，末次：%s）",
-					first.Message, len(alerts),
-					first.Timestamp.Format("15:04:05"),
-					last.Timestamp.Format("15:04:05")),
-			}
-			n.aggLastSend[key] = time.Now()
-			delete(n.aggBuffer, key)
-			n.aggMu.Unlock()
-
-			n.sendToChannels(summary)
-			n.aggMu.Lock()
-		}
-		n.aggMu.Unlock()
-	}
-}
-
-// dailyDigestChecker checks if it's time to send the daily digest.
-func (n *Notifier) dailyDigestChecker() {
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if !n.digestEnabled {
-			continue
-		}
-
+		tick++
 		now := time.Now()
-		today := now.Format("2006-01-02")
 
-		// Already sent today
-		if today == n.digestLastDate {
-			continue
+		// 每 30s：告警聚合 flush
+		n.flushAggregation()
+
+		// 每 30s：P0 升级检查
+		n.flushEscalation()
+
+		// 每 60s：关联事件 flush
+		if tick%2 == 0 {
+			n.flushCorrelator()
 		}
 
-		// Check if it's past the digest hour
-		if now.Hour() >= n.digestHour {
-			n.sendDailyDigest()
-			n.digestLastDate = today
+		// 每 5min：时区延迟 flush
+		if tick%10 == 0 {
+			n.flushTimeZoneDelay()
+		}
+
+		// 每 10min：每日摘要检查
+		if tick%20 == 0 {
+			n.checkDailyDigest(now)
 		}
 	}
 }
+
+// flushAggregation sends aggregated alert summaries.
+func (n *Notifier) flushAggregation() {
+	n.aggMu.Lock()
+	for key, alerts := range n.aggBuffer {
+		if len(alerts) <= 1 {
+			delete(n.aggBuffer, key)
+			continue
+		}
+		lastSend, exists := n.aggLastSend[key]
+		if exists && time.Since(lastSend) < n.aggCooldown {
+			continue
+		}
+		first := alerts[0]
+		last := alerts[len(alerts)-1]
+		summary := types.Alert{
+			Level:     first.Level,
+			Title:     first.Title,
+			Source:    first.Source,
+			Timestamp: time.Now(),
+			Message: fmt.Sprintf("%s\n\n（5分钟内共发生 %d 次，首次：%s，末次：%s）",
+				first.Message, len(alerts),
+				first.Timestamp.Format("15:04:05"),
+				last.Timestamp.Format("15:04:05")),
+		}
+		n.aggLastSend[key] = time.Now()
+		delete(n.aggBuffer, key)
+		n.aggMu.Unlock()
+		n.sendToChannels(summary)
+		n.aggMu.Lock()
+	}
+	n.aggMu.Unlock()
+}
+
+// flushEscalation checks and sends P0 escalations.
+func (n *Notifier) flushEscalation() {
+	for _, alert := range n.escalationMgr.CheckAndEscalate() {
+		escalatedAlert := alert
+		escalatedAlert.Title = "[升级] " + alert.Title
+		escalatedAlert.Message = fmt.Sprintf("P0 告警已超过阈值未确认，自动升级推送。\n\n原始告警：%s", alert.Message)
+		n.sendToChannels(escalatedAlert)
+	}
+}
+
+// flushCorrelator sends correlator flush summaries.
+func (n *Notifier) flushCorrelator() {
+	for _, summary := range n.corr.Flush(time.Now()) {
+		n.sendToChannels(summary)
+	}
+}
+
+// flushTimeZoneDelay flushes delayed alerts.
+func (n *Notifier) flushTimeZoneDelay() {
+	for _, alert := range n.timeZoneDelay.Flush(time.Now()) {
+		delayedAlert := alert
+		delayedAlert.Title = "[延迟推送] " + alert.Title
+		delayedAlert.Message = fmt.Sprintf("凌晨静默期积压告警，现统一推送。\n\n原始告警：%s", alert.Message)
+		n.sendToChannels(delayedAlert)
+	}
+}
+
+// checkDailyDigest checks and sends daily digest if due.
+func (n *Notifier) checkDailyDigest(now time.Time) {
+	if !n.digestEnabled {
+		return
+	}
+	today := now.Format("2006-01-02")
+	if today == n.digestLastDate {
+		return
+	}
+	if now.Hour() >= n.digestHour {
+		n.sendDailyDigest()
+		n.digestLastDate = today
+	}
+}
+
 
 // sendDailyDigest sends a daily summary of all alerts and actions.
 func (n *Notifier) sendDailyDigest() {
@@ -362,50 +485,20 @@ func (n *Notifier) SetDigestProvider(p func() (string, string)) {
 	n.digestProvider = p
 }
 
-// escalationChecker 定期检查 P0 告警是否需要升级（5min 全渠道再推送，30min 通知第二联系人）。
-func (n *Notifier) escalationChecker() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		toEscalate := n.escalationMgr.CheckAndEscalate()
-		for _, alert := range toEscalate {
-			// 升级后强制发送到所有渠道（包括 email）
-			escalatedAlert := alert
-			escalatedAlert.Title = "[升级] " + alert.Title
-			escalatedAlert.Message = fmt.Sprintf("P0 告警已超过阈值未确认，自动升级推送。\n\n原始告警：%s", alert.Message)
-			n.sendToChannels(escalatedAlert)
-		}
-	}
+// SetHumanizer 注入 LLM 增强器（可选，nil 表示不启用）
+func (n *Notifier) SetHumanizer(h AlertHumanizer) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.humanizer = h
 }
 
-// timeZoneDelayFlusher 定期检查延迟队列，8 点后统一推送积压的 P2/P3 告警。
-func (n *Notifier) timeZoneDelayFlusher() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		toFlush := n.timeZoneDelay.Flush(time.Now())
-		for _, alert := range toFlush {
-			delayedAlert := alert
-			delayedAlert.Title = "[延迟推送] " + alert.Title
-			delayedAlert.Message = fmt.Sprintf("凌晨静默期积压告警，现统一推送。\n\n原始告警：%s", alert.Message)
-			n.sendToChannels(delayedAlert)
-		}
-	}
+// SetBidirectionalNotifier 注入双向通知器（可选，nil 表示不启用）
+func (n *Notifier) SetBidirectionalNotifier(b *BidirectionalNotifier) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.biNotifier = b
 }
 
-// correlatorFlusher 定期推送关联事件更新摘要。
-func (n *Notifier) correlatorFlusher() {
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		for _, summary := range n.corr.Flush(time.Now()) {
-			n.sendToChannels(summary)
-		}
-	}
-}
 
 // MarkAlertConfirmed 标记告警已确认，停止升级跟踪。
 func (n *Notifier) MarkAlertConfirmed(alertID string) {
@@ -431,6 +524,9 @@ func (n *Notifier) UpdateChannels(channels []Channel) {
 
 // SetDigest configures the daily digest.
 func (n *Notifier) SetDigest(enabled bool, hour int) {
+	if hour < 0 || hour > 23 {
+		hour = 8 // 非法值回退默认早 8 点
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.digestEnabled = enabled
@@ -546,7 +642,7 @@ func (c *WebhookChannel) Send(ctx context.Context, alert types.Alert) error {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -597,7 +693,7 @@ func (c *DingTalkChannel) Send(ctx context.Context, alert types.Alert) error {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -636,7 +732,7 @@ func (c *WeChatChannel) Send(ctx context.Context, alert types.Alert) error {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", c.webhook, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -675,7 +771,7 @@ func (c *FeishuChannel) Send(ctx context.Context, alert types.Alert) error {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", c.webhook, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -724,7 +820,7 @@ func (c *SlackChannel) Send(ctx context.Context, alert types.Alert) error {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", c.webhook, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -764,7 +860,7 @@ func (c *TelegramChannel) Send(ctx context.Context, alert types.Alert) error {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -838,7 +934,7 @@ func (c *WxPusherChannel) Send(ctx context.Context, alert types.Alert) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

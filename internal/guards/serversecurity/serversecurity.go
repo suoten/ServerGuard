@@ -275,13 +275,14 @@ func (s *ServerSecurityGuard) ScanAbnormalProcesses(ctx context.Context) ([]type
 			}
 		}
 
-		suspiciousNames := []string{"kworker", "kthreadd", "systemd-network", "ksoftirqd"}
+		// 仿冒内核进程检测：进程名包含内核线程名但从 /tmp 等非标准路径启动
+		suspiciousNames := []string{"kworker", "kthreadd", "systemd-network", "ksoftirqd", "migration", "rcu_"}
 		procName := fields[10]
 		for _, suspicious := range suspiciousNames {
-			if strings.HasPrefix(procName, suspicious) && !strings.HasPrefix(procName, suspicious) {
-				continue
-			}
-			if strings.Contains(procName, suspicious) && strings.Contains(cmdline, "/tmp/") {
+			// 真正的内核线程的 cmdline 应为 [kworker/...] 格式，且 PID 通常很小
+			// 如果进程名包含内核线程名但从 /tmp/ 等用户路径启动，则可疑
+			if strings.Contains(procName, suspicious) &&
+				(strings.Contains(cmdline, "/tmp/") || strings.Contains(cmdline, "/dev/shm/") || strings.Contains(cmdline, "/var/tmp/")) {
 				rb.AddFinding(
 					types.SeverityHigh,
 					fmt.Sprintf("仿冒内核进程: %s", procName),
@@ -325,9 +326,12 @@ func (s *ServerSecurityGuard) ScanCronTasks(ctx context.Context) ([]types.ScanFi
 }
 
 func (s *ServerSecurityGuard) analyzeCronContent(rb *scannercommon.ReportBuilder, content, source string) {
+	// 只保留高置信度的恶意模式，避免对正常运维脚本误报
+	// 单独的 curl/wget/tmp 路径是常见合法运维操作，需组合其他可疑特征才告警
 	suspiciousPatterns := []string{
-		"nc -e", "bash -i", "/dev/tcp/", "python -c", "perl -e",
-		"wget -q", "curl -s", "chmod +x", "/tmp/", "base64 -d",
+		"nc -e", "bash -i", "/dev/tcp/", "python -c import", "perl -e ",
+		"chmod +x /tmp/", "base64 -d |", "curl -s | bash", "wget -q -O - | bash",
+		"curl | sh", "wget | sh", "/dev/shm/", "nc -lvvp",
 	}
 
 	for _, line := range strings.Split(content, "\n") {
@@ -1008,29 +1012,27 @@ func (s *ServerSecurityGuard) ScanNetworkMisconfig(ctx context.Context) ([]types
 	}
 
 	// 检查 iptables 是否有可疑的 NAT/转发规则
+	// 仅当 NAT 规则指向非私有 IP 时才告警（私有 IP 的 DNAT/SNAT 是 Docker/K8s 正常行为）
 	if output, err := exec.CommandContext(ctx, "iptables", "-t", "nat", "-L", "-n").Output(); err == nil {
-		suspiciousPatterns := []string{
-			"REDIRECT", "DNAT", "SNAT",
-		}
+		suspiciousPatterns := []string{"REDIRECT", "DNAT", "SNAT"}
 		for _, line := range strings.Split(string(output), "\n") {
 			for _, pattern := range suspiciousPatterns {
 				if strings.Contains(line, pattern) {
 					fields := strings.Fields(line)
-					if len(fields) >= 0 {
-						// 检查是否重定向到外部 IP
-						for _, field := range fields {
-							if net.ParseIP(field) != nil && !net.ParseIP(field).IsLoopback() && !net.ParseIP(field).IsPrivate() {
-								rb.AddFinding(
-									types.SeverityHigh,
-									fmt.Sprintf("可疑 iptables NAT 规则: %s", pattern),
-									fmt.Sprintf("iptables NAT 表包含重定向到外部 IP %s 的规则，可能是流量劫持: %s", field, line),
-									"iptables",
-									fmt.Sprintf(`{"table":"nat","rule":"%s"}`, line),
-									fmt.Sprintf("审查并删除可疑规则: iptables -t nat -D <规则>"),
-									"删除 NAT 规则后，依赖该规则的端口映射/转发将失效",
-								)
-								break
-							}
+					// 检查是否重定向到外部（非私有）IP
+					for _, field := range fields {
+						parsed := net.ParseIP(field)
+						if parsed != nil && !parsed.IsLoopback() && !parsed.IsPrivate() && !parsed.IsLinkLocalUnicast() {
+							rb.AddFinding(
+								types.SeverityHigh,
+								fmt.Sprintf("可疑 iptables NAT 规则: %s", pattern),
+								fmt.Sprintf("iptables NAT 表包含重定向到外部 IP %s 的规则，可能是流量劫持: %s", field, line),
+								"iptables",
+								fmt.Sprintf(`{"table":"nat","rule":"%s"}`, line),
+								fmt.Sprintf("审查并删除可疑规则: iptables -t nat -D <规则>"),
+								"删除 NAT 规则后，依赖该规则的端口映射/转发将失效",
+							)
+							break
 						}
 					}
 					break
@@ -1039,22 +1041,40 @@ func (s *ServerSecurityGuard) ScanNetworkMisconfig(ctx context.Context) ([]types
 		}
 	}
 
-	// 检查是否禁用了 IP 转发（作为网关时才需要开启）
+	// IP 转发检测：Docker/K8s/VPN 等场景需要开启 ip_forward
+	// 仅当未安装 Docker 且非容器环境时才检测
 	ipForwardPath := "/proc/sys/net/ipv4/ip_forward"
 	if data, err := os.ReadFile(ipForwardPath); err == nil {
 		value := strings.TrimSpace(string(data))
 		if value == "1" {
-			// 检查是否是网关/路由器场景
-			// 如果不是网关但开启了 IP 转发，可能是攻击者用于流量中转
-			rb.AddFinding(
-				types.SeverityLow,
-				"IP 转发已开启",
-				"服务器开启了 IP 转发 (net.ipv4.ip_forward=1)，如果非网关/路由器场景，可能被攻击者用于流量中转",
-				ipForwardPath,
-				fmt.Sprintf(`{"param":"ip_forward","value":"%s"}`, value),
-				"如非网关场景，建议关闭: sysctl -w net.ipv4.ip_forward=0",
-				"关闭 IP 转发后，作为路由/网关的功能将失效",
-			)
+			// 检查是否运行了 Docker 或 K8s（这些场景需要 ip_forward=1）
+			isDockerHost := false
+			if _, err := os.Stat("/var/run/docker.sock"); err == nil {
+				isDockerHost = true
+			}
+			if _, err := os.Stat("/run/containerd/containerd.sock"); err == nil {
+				isDockerHost = true
+			}
+			// 检查是否有 Docker 网络接口
+			if _, err := os.Stat("/sys/class/net/docker0"); err == nil {
+				isDockerHost = true
+			}
+			// 检查是否是容器内运行（/.dockerenv 存在）
+			if _, err := os.Stat("/.dockerenv"); err == nil {
+				isDockerHost = true
+			}
+
+			if !isDockerHost {
+				rb.AddFinding(
+					types.SeverityLow,
+					"IP 转发已开启",
+					"服务器开启了 IP 转发 (net.ipv4.ip_forward=1)，如果非网关/路由器/Docker 场景，可能被攻击者用于流量中转",
+					ipForwardPath,
+					fmt.Sprintf(`{"param":"ip_forward","value":"%s"}`, value),
+					"如非网关/Docker 场景，建议关闭: sysctl -w net.ipv4.ip_forward=0",
+					"关闭 IP 转发后，作为路由/网关的功能将失效；Docker 容器网络也会中断",
+				)
+			}
 		}
 	}
 

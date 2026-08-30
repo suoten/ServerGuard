@@ -59,7 +59,7 @@ func (m *LogrotateTakeoverManager) TakeOverFromLogrotate(logPath string) error {
 	// 备份原配置
 	backupPath := configFile + ".sg.bak"
 	if err := copyFile(configFile, backupPath); err != nil {
-		return fmt.Errorf("backup logrotate config: %w", err)
+		return fmt.Errorf("备份 logrotate 配置失败: %w", err)
 	}
 
 	// 注释掉对应的 block

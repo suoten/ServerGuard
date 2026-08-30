@@ -95,6 +95,7 @@ function actionLabel(action: string): string {
   const labels: Record<string, string> = {
     emergency_stop: '紧急停止',
     emergency_resume: '恢复运行',
+    emergency_rollback: '紧急回滚',
     kill: '关闭进程',
     restart: '重启服务',
     ban_ip: '封禁IP',
@@ -102,6 +103,8 @@ function actionLabel(action: string): string {
     clean_log: '清理日志',
     rotate_log: '日志轮转',
     renew_cert: '续期证书',
+    cert_renew: '证书续期',
+    cert_scan: '证书扫描',
     cve_feed_check: 'CVE漏洞检测',
     security_update_check: '安全补丁检测',
     config_change: '修改配置',
@@ -109,6 +112,9 @@ function actionLabel(action: string): string {
     mark_false_positive: '标记误报',
     resolve_alert: '解决告警',
     delete_large_file: '删除大文件',
+    batch_delete_large_file: '批量删除大文件',
+    auto_fix_finding: '自动修复',
+    fix_finding: '修复安全发现',
     save_settings: '保存设置',
     add_rule: '添加规则',
     update_rule: '更新规则',
@@ -122,11 +128,35 @@ function actionLabel(action: string): string {
     scan_vulnscan: '漏洞扫描',
     scan_serversecurity: '服务器安全扫描',
     scan_attackwarn: '攻击预警扫描',
-    cert_renew: '证书续期',
-    cert_scan: '证书扫描',
-    emergency_rollback: '紧急回滚',
-    fix_finding: '修复安全发现',
+    create_maintenance_window: '创建维护窗口',
+    delete_maintenance_window: '删除维护窗口',
+    incident_ack: '确认事件',
+    create_user: '创建用户',
+    update_user: '更新用户',
+    reset_password: '重置密码',
+    delete_user: '删除用户',
+    ghost_scan: '幽灵文件扫描',
+    sigterm: '关闭进程',
+    sigkill: '强制关闭',
+    nice: '调整优先级',
+    reload_nginx: '重载Nginx',
+    clean_disk: '清理磁盘',
+    run_script: '执行脚本',
+    alert: '发送告警',
+    snapshot: '创建快照',
+    cve_alert: 'CVE漏洞告警',
+    security_update: '安全补丁告警',
+    killed: '已终止',
+    suggested: '建议操作',
+    batch_resolve_findings: '批量清理误报',
+    command_response: '命令响应',
+    trust_auto_confirm: '信任自动确认',
+    agent_command: '远程命令',
   }
+  // 处理动态前缀的 action
+  if (action.startsWith('agent_command:')) return '远程命令: ' + action.substring('agent_command:'.length)
+  if (action.startsWith('import:')) return '导入: ' + action.substring('import:'.length)
+  if (action.startsWith('command_response:')) return '命令响应: ' + action.substring('command_response:'.length)
   return labels[action] || action
 }
 
@@ -156,7 +186,31 @@ function reasonLabel(reason: string): string {
     '用户确认安全发现': '用户确认安全发现',
     '用户标记为误报': '用户标记为误报',
     '用户手动解决告警': '用户手动解决告警',
+    '用户手动触发证书扫描': '用户手动触发证书扫描',
+    '用户手动触发证书续期': '用户手动触发证书续期',
+    '用户通过 Hub 下发远程命令': '用户通过 Hub 下发远程命令',
+    '用户通过 Hub 下发 restart 命令': '用户通过 Hub 下发重启命令',
+    '批量清理误报告警': '批量清理误报告警',
+    '从其他工具迁移守护配置': '从其他工具迁移守护配置',
+    '人工确认故障事件': '人工确认故障事件',
+    '用户手动删除维护窗口': '用户手动删除维护窗口',
+    '管理员重置用户密码': '管理员重置用户密码',
+    '管理员删除用户': '管理员删除用户',
   }
+  // 处理动态 reason（含 Sprintf 生成的）
+  if (reason.startsWith('自动修复安全头缺失')) return '自动修复安全头缺失'
+  if (reason.startsWith('攻击预警发现项已自动处置')) return '攻击预警自动处置'
+  if (reason.startsWith('自动收紧目录权限')) return '自动收紧目录权限'
+  if (reason.startsWith('自动收紧敏感文件权限')) return '自动收紧敏感文件权限'
+  if (reason.startsWith('自动加固 SSH 配置')) return '自动加固SSH配置'
+  if (reason.startsWith('自动关闭 server_tokens')) return '自动关闭server_tokens'
+  if (reason.startsWith('自动加固 SSL 配置')) return '自动加固SSL配置'
+  if (reason.startsWith('自动关闭目录遍历')) return '自动关闭目录遍历'
+  if (reason.startsWith('自动添加 nginx 拒绝规则')) return '自动添加Nginx拒绝规则'
+  if (reason.startsWith('批量删除大文件')) return '批量删除大文件'
+  if (reason.startsWith('删除大文件')) return '删除大文件'
+  if (reason.startsWith('创建用户')) return '创建用户'
+  if (reason.startsWith('更新用户角色')) return '更新用户角色'
   return labels[reason] || reason || '-'
 }
 

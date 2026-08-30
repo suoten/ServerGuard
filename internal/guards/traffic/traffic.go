@@ -116,7 +116,9 @@ func (g *TrafficGuard) checkSYNFlood(ctx context.Context) {
 		}
 	}
 
-	if synRecvCount > 100 {
+	// SYN Flood 阈值：100 个 SYN_RECV 在正常高负载服务器上是可能的（多站点+宝塔面板）
+	// 真正的 SYN Flood 通常 500+ 甚至上千。提高到 500 避免误报。
+	if synRecvCount > 500 {
 		g.eventBus.PublishAlert(types.AlertError, "traffic",
 			"SYN Flood攻击",
 			fmt.Sprintf("检测到 %d 个SYN_RECV连接，疑似遭受SYN Flood攻击，服务器资源可能被耗尽", synRecvCount),
@@ -144,7 +146,10 @@ func (g *TrafficGuard) checkPortScan(ctx context.Context) {
 	}
 
 	for ip, ports := range ipPortMap {
-		if len(ports) > 20 {
+		// 正常多站点浏览（宝塔面板8888 + 多个站点443/80 + SSH22 + 数据库3306等）
+		// 可能连接 10+ 个不同端口，提高到 50 避免误报。
+		// 真正的端口扫描器通常探测 50-100+ 个端口。
+		if len(ports) > 50 {
 			g.eventBus.PublishAlert(types.AlertWarning, "traffic",
 				fmt.Sprintf("端口扫描: %s", ip),
 				fmt.Sprintf("IP %s 在短时间内连接了 %d 个不同端口，可能是端口扫描", ip, len(ports)),

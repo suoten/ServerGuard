@@ -4,13 +4,17 @@
     <div class="page-header">
       <div class="header-left">
         <h2>故障知识库</h2>
-        <span class="header-sub">症状指纹匹配 · 历史方案检索</span>
+        <span class="header-sub">症状指纹匹配 · 历史方案检索 · 动作推荐</span>
       </div>
       <el-button-group>
         <el-button :icon="Search" @click="searchDialogVisible = true">搜索相似故障</el-button>
         <el-button :icon="Refresh" @click="fetchData" :loading="loading">刷新</el-button>
       </el-button-group>
     </div>
+
+    <!-- Tab 切换 -->
+    <el-tabs v-model="activeTab" @tab-change="onTabChange">
+      <el-tab-pane label="知识条目" name="entries">
 
     <!-- 统计卡片 -->
     <el-row :gutter="16" v-if="stats" style="margin-bottom: 16px">
@@ -19,7 +23,7 @@
           <div class="stat-content">
             <el-icon class="stat-icon" style="color: #4c6fff"><Document /></el-icon>
             <div>
-              <div class="stat-num">{{ stats.total_entries || 0 }}</div>
+              <div class="stat-num"><CountUp :value="stats.total_entries || 0" /></div>
               <div class="stat-name">知识条目总数</div>
             </div>
           </div>
@@ -30,7 +34,7 @@
           <div class="stat-content">
             <el-icon class="stat-icon" style="color: #e6a23c"><Warning /></el-icon>
             <div>
-              <div class="stat-num">{{ stats.recurring_issues || 0 }}</div>
+              <div class="stat-num"><CountUp :value="stats.recurring_issues || 0" /></div>
               <div class="stat-name">反复出现问题</div>
             </div>
           </div>
@@ -41,7 +45,7 @@
           <div class="stat-content">
             <el-icon class="stat-icon" style="color: #22c55e"><Histogram /></el-icon>
             <div>
-              <div class="stat-num">{{ Object.keys(stats.by_source || {}).length }}</div>
+              <div class="stat-num"><CountUp :value="Object.keys(stats.by_source || {}).length" /></div>
               <div class="stat-name">来源模块数</div>
             </div>
           </div>
@@ -54,7 +58,7 @@
       <template #header><span>按来源模块分布</span></template>
       <div class="source-distribution">
         <div v-for="(count, source) in stats.by_source" :key="source" class="source-bar">
-          <span class="source-name">{{ source || '未知' }}</span>
+          <span class="source-name">{{ ({vulnscan:'漏洞扫描',serversecurity:'服务器安全',websecurity:'网站安全',attackwarn:'攻击预警',resource:'资源守护',service:'服务守护',security:'安全防护',log:'日志防护',network:'网络守护',system:'系统守护',cert:'证书守护',docker:'容器守护',config:'配置守护',database:'数据库守护',storage:'存储管理',traffic:'流量守护',ai:'AI 异常检测',tuning:'调优顾问',devops:'DevOps',datagovern:'数据治理',forecast:'趋势预测',correlation:'故障关联'} as Record<string,string>)[String(source)] || source || '未知' }}</span>
           <el-progress
             :percentage="Math.round((count as number) / (stats.total_entries || 1) * 100)"
             :format="() => `${count}`"
@@ -95,7 +99,7 @@
         </el-table-column>
         <el-table-column label="严重度" width="80">
           <template #default="{ row }">
-            <el-tag :type="severityTagType(row.severity)" size="small">{{ row.severity || '-' }}</el-tag>
+            <el-tag :type="severityTagType(row.severity)" size="small">{{ severityText(row.severity) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="修复动作" min-width="180" show-overflow-tooltip>
@@ -127,6 +131,77 @@
 
       <el-empty v-if="!loading && entries.length === 0" description="知识库暂无条目，自动修复时将自动记录" />
     </el-card>
+      </el-tab-pane>
+
+      <!-- 推荐动作 Tab -->
+      <el-tab-pane label="推荐动作" name="recommend">
+        <el-card shadow="hover">
+          <template #header>
+            <span>基于历史成功率的动作推荐</span>
+          </template>
+          <el-alert type="info" :closable="false" show-icon style="margin-bottom: 16px">
+            系统根据「症状 → 动作 → 结果」历史记录，自动推荐成功率最高的处置动作。
+          </el-alert>
+          <el-table :data="recommendations" v-loading="recLoading" stripe>
+            <el-table-column label="症状" min-width="200" show-overflow-tooltip prop="symptom" />
+            <el-table-column label="推荐动作" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span style="font-weight: 600; color: #1890ff">{{ row.action }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="成功率" width="100" align="center">
+              <template #default="{ row }">
+                <el-progress
+                  :percentage="Math.round((row.success_rate || 0) * 100)"
+                  :color="row.success_rate > 0.7 ? '#52c41a' : row.success_rate > 0.4 ? '#faad14' : '#ff4d4f'"
+                  :stroke-width="10"
+                  type="circle"
+                  :width="40"
+                />
+              </template>
+            </el-table-column>
+            <el-table-column label="历史执行" width="80" align="center" prop="exec_count" />
+            <el-table-column label="最近使用" width="150">
+              <template #default="{ row }">{{ formatTime(row.last_used) }}</template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!recLoading && recommendations.length === 0" description="暂无推荐，系统自动修复时会逐步积累" />
+        </el-card>
+      </el-tab-pane>
+
+      <!-- 反复故障 Tab -->
+      <el-tab-pane label="反复故障" name="recurring">
+        <el-card shadow="hover">
+          <template #header>
+            <span>反复出现的故障（同一症状出现 ≥ 3 次）</span>
+          </template>
+          <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 16px">
+            ⚠️ 这些故障反复出现，说明根因未解决。建议人工介入排查或升级处理策略。
+          </el-alert>
+          <div v-for="item in recurringIssues" :key="item.symptom" class="recurring-item">
+            <div class="recurring-header">
+              <span class="recurring-symptom">{{ item.symptom }}</span>
+              <el-tag type="danger" effect="dark" size="small">出现 {{ item.count }} 次</el-tag>
+            </div>
+            <div class="recurring-meta">
+              <span>来源: {{ item.source || '—' }}</span>
+              <span>严重度: {{ item.severity || '—' }}</span>
+              <span>最近: {{ formatTime(item.last_seen) }}</span>
+            </div>
+            <div v-if="item.action" class="recurring-action">
+              已尝试动作: {{ item.action }}
+              <el-tag :type="item.action_result === 'success' ? 'success' : 'danger'" size="small" style="margin-left: 8px">
+                {{ item.action_result || '未知' }}
+              </el-tag>
+            </div>
+            <div class="recurring-suggest">
+              💡 建议: 根因未消除，考虑升级处理策略或人工介入
+            </div>
+          </div>
+          <el-empty v-if="!recLoading && recurringIssues.length === 0" description="暂无反复故障" />
+        </el-card>
+      </el-tab-pane>
+    </el-tabs>
 
     <!-- 搜索对话框 -->
     <el-dialog v-model="searchDialogVisible" title="搜索相似故障" width="500px">
@@ -152,7 +227,7 @@
         </el-alert>
         <div v-for="(r, i) in searchResults" :key="i" class="search-result-item">
           <div class="result-header">
-            <el-tag :type="severityTagType(r.severity)" size="small">{{ r.severity }}</el-tag>
+            <el-tag :type="severityTagType(r.severity)" size="small">{{ severityText(r.severity) }}</el-tag>
             <span class="result-symptom">{{ r.symptom }}</span>
             <el-tag v-if="r.occurrence_count > 1" type="danger" size="small">出现 {{ r.occurrence_count }} 次</el-tag>
           </div>
@@ -193,6 +268,7 @@ import { ref, onMounted } from 'vue'
 import axios from 'axios'
 import dayjs from 'dayjs'
 import { Search, Refresh, Document, Warning, Histogram } from '@element-plus/icons-vue'
+import CountUp from '../components/CountUp.vue'
 
 const loading = ref(false)
 const entries = ref<any[]>([])
@@ -200,6 +276,7 @@ const stats = ref<any>(null)
 const total = ref(0)
 const pageSize = 50
 const currentPage = ref(1)
+const activeTab = ref('entries')
 
 const searchDialogVisible = ref(false)
 const searchSymptom = ref('')
@@ -210,6 +287,40 @@ const resultDialogVisible = ref(false)
 
 const detailDialogVisible = ref(false)
 const detailEntry = ref<any>(null)
+
+// 推荐动作
+const recommendations = ref<any[]>([])
+const recurringIssues = ref<any[]>([])
+const recLoading = ref(false)
+
+async function fetchRecommendations() {
+  recLoading.value = true
+  try {
+    const resp = await axios.get('/api/knowledge/recommendations')
+    recommendations.value = resp.data.recommendations || []
+  } catch {
+    recommendations.value = []
+  } finally {
+    recLoading.value = false
+  }
+}
+
+async function fetchRecurring() {
+  recLoading.value = true
+  try {
+    const resp = await axios.get('/api/knowledge/recurring')
+    recurringIssues.value = resp.data.entries || []
+  } catch {
+    recurringIssues.value = []
+  } finally {
+    recLoading.value = false
+  }
+}
+
+function onTabChange(name: string) {
+  if (name === 'recommend' && recommendations.value.length === 0) fetchRecommendations()
+  if (name === 'recurring' && recurringIssues.value.length === 0) fetchRecurring()
+}
 
 async function fetchEntries() {
   loading.value = true
@@ -267,6 +378,14 @@ function severityTagType(sev: string): string {
     case 'info': case 'low': return 'info'
     default: return 'info'
   }
+}
+
+function severityText(sev: string): string {
+  const labels: Record<string, string> = {
+    critical: '严重', fatal: '致命', error: '错误', warning: '警告', info: '提醒',
+    high: '高危', medium: '中危', low: '低危',
+  }
+  return labels[sev] || sev || '—'
 }
 
 function formatTime(ts: string): string {
@@ -382,5 +501,25 @@ onMounted(() => {
 .result-time {
   color: var(--sg-text-3) !important;
   font-size: 12px !important;
+}
+
+/* 推荐动作 & 反复故障 */
+.recurring-item {
+  padding: 16px; border: 1px solid var(--sg-border); border-radius: 8px;
+  margin-bottom: 12px; transition: box-shadow 0.25s;
+}
+.recurring-item:hover { box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06); }
+.recurring-header {
+  display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
+}
+.recurring-symptom { font-weight: 600; font-size: 15px; color: var(--sg-text-1); }
+.recurring-meta {
+  display: flex; gap: 16px; font-size: 13px; color: var(--sg-text-3); margin-bottom: 8px;
+}
+.recurring-action {
+  font-size: 13px; color: var(--sg-text-2); margin-bottom: 8px;
+}
+.recurring-suggest {
+  font-size: 13px; color: #e6a23c; background: #fffbe6; border-radius: 4px; padding: 8px;
 }
 </style>

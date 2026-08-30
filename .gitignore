@@ -11,6 +11,15 @@
 serverguard-agent
 serverguard-hub
 sgctl
+serverguard-web
+serverguard-web-*
+serverguard-*-linux-*
+serverguard-*-windows-*
+*.zip
+
+# AI 工具工作目录（不入库）
+.codeartsdoer/
+.joycode/
 
 # 测试与覆盖率残留
 *.cov
@@ -32,8 +41,9 @@ release-log.txt
 # 前端
 web/node_modules/
 web/dist/
-website/node_modules/
-website/dist/
+
+# 官网源码与部署（独立维护，不入主仓库）
+website/
 
 # IDE / 工具
 .idea/
@@ -44,3 +54,4 @@ website/dist/
 # 系统
 .DS_Store
 Thumbs.db
+*.exe.bak

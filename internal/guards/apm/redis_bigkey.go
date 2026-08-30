@@ -1,6 +1,7 @@
 package apm
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -111,8 +112,18 @@ func (a *RedisAnalyzer) GetLastReport() *RedisKeyReport {
 	return a.last
 }
 
+// redis-cli 外部调用统一超时预算。
+// 尤其是redis-cli --bigkeys：在大实例上会遍历采样整个键空间，
+// 可能跑数分钟并给 Redis 带来压力——必须限时兜底，超时视为本轮放弃。
+const (
+	redisCmdTimeout     = 5 * time.Second
+	redisBigKeysTimeout = 90 * time.Second
+)
+
 func (a *RedisAnalyzer) pingRedis() bool {
-	cmd := exec.Command(a.redisCLI, "ping")
+	ctx, cancel := context.WithTimeout(context.Background(), redisCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, a.redisCLI, "ping")
 	output, err := cmd.Output()
 	if err != nil {
 		return false
@@ -121,7 +132,9 @@ func (a *RedisAnalyzer) pingRedis() bool {
 }
 
 func (a *RedisAnalyzer) getTotalKeys() int64 {
-	cmd := exec.Command(a.redisCLI, "DBSIZE")
+	ctx, cancel := context.WithTimeout(context.Background(), redisCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, a.redisCLI, "DBSIZE")
 	output, err := cmd.Output()
 	if err != nil {
 		return 0
@@ -137,7 +150,9 @@ func (a *RedisAnalyzer) getTotalKeys() int64 {
 }
 
 func (a *RedisAnalyzer) getUsedMemory() int64 {
-	cmd := exec.Command(a.redisCLI, "INFO", "memory")
+	ctx, cancel := context.WithTimeout(context.Background(), redisCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, a.redisCLI, "INFO", "memory")
 	output, err := cmd.Output()
 	if err != nil {
 		return 0
@@ -154,11 +169,13 @@ func (a *RedisAnalyzer) getUsedMemory() int64 {
 	return 0
 }
 
-// scanBigKeys 使用 redis-cli --bigkeys 采样大 Key
+// scanBigKeys 使用 redis-cli --bigkeys 采样大 Key（限时 90s，超时返回已解析部分）
 func (a *RedisAnalyzer) scanBigKeys() []RedisBigKey {
-	cmd := exec.Command(a.redisCLI, "--bigkeys", "--sample", "1000")
+	ctx, cancel := context.WithTimeout(context.Background(), redisBigKeysTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, a.redisCLI, "--bigkeys", "--sample", "1000")
 	output, err := cmd.CombinedOutput()
-	if err != nil {
+	if err != nil && ctx.Err() == nil && output == nil {
 		return nil
 	}
 
@@ -203,7 +220,9 @@ func (a *RedisAnalyzer) scanBigKeys() []RedisBigKey {
 }
 
 func (a *RedisAnalyzer) getMemoryUsage(key string) int64 {
-	cmd := exec.Command(a.redisCLI, "MEMORY", "USAGE", key)
+	ctx, cancel := context.WithTimeout(context.Background(), redisCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, a.redisCLI, "MEMORY", "USAGE", key)
 	output, err := cmd.Output()
 	if err != nil {
 		return 0

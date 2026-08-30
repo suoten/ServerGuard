@@ -1,5 +1,74 @@
 <template>
   <div class="large-files-page">
+    <!-- 幽灵文件检测 -->
+    <el-card v-if="ghostScanning || ghostScanned" :class="['ghost-card', ghostCount > 0 ? 'ghost-card-danger' : 'ghost-card-safe']" style="margin-bottom: 15px">
+      <template #header>
+        <div class="card-header">
+          <span>
+            <el-icon :color="ghostCount > 0 ? '#f56c6c' : '#52c41a'"><Warning v-if="ghostCount > 0" /><CircleCheck v-else /></el-icon>
+            幽灵文件检测
+            <el-tag v-if="ghostScanning" size="small" type="warning">扫描中...</el-tag>
+            <template v-else>
+              <el-tag v-if="ghostCount > 0" size="small" type="danger">{{ ghostCount }} 个幽灵文件</el-tag>
+              <el-tag v-if="ghostTotalSizeGB > 0" size="small" type="danger" style="margin-left: 5px">
+                占用 {{ ghostTotalSizeGB.toFixed(2) }}GB
+              </el-tag>
+              <el-tag v-else size="small" type="success" style="margin-left: 5px">未发现幽灵文件</el-tag>
+              <el-tag v-if="ghostAutoScanned" size="small" type="primary" effect="plain" style="margin-left: 5px">自动巡检</el-tag>
+              <span v-if="lastGhostScanTime" style="margin-left: 8px; color: #909399; font-size: 12px">
+                最后扫描: {{ formatGhostScanTime(lastGhostScanTime) }}
+              </span>
+            </template>
+          </span>
+          <div>
+            <el-button size="small" @click="scanGhostFiles" :loading="ghostScanning">手动扫描</el-button>
+            <el-button v-if="ghostCount > 0" size="small" type="danger" @click="cleanGhostFiles" :loading="ghostCleaning">自动清理</el-button>
+          </div>
+        </div>
+      </template>
+
+      <!-- 有幽灵文件时显示告警和列表 -->
+      <template v-if="ghostCount > 0">
+        <el-alert type="error" :closable="false" style="margin-bottom: 10px">
+          幽灵文件 = 已删除但进程仍持有句柄的文件。du 看不到但 df 显示空间被占用。自动清理会重启持有句柄的进程来释放空间。
+        </el-alert>
+        <el-table :data="ghostFiles" style="width: 100%" size="small">
+          <el-table-column label="进程" min-width="120">
+            <template #default="{ row }">
+              <span>{{ row.process_name }}</span>
+              <el-tag v-if="row.is_java" size="small" type="warning" style="margin-left: 4px">Java</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="pid" label="PID" width="70" />
+          <el-table-column prop="fd" label="FD" width="50" />
+          <el-table-column prop="original_path" label="原始路径" min-width="200" show-overflow-tooltip />
+          <el-table-column label="大小" width="80">
+            <template #default="{ row }">{{ row.size_gb.toFixed(2) }}GB</template>
+          </el-table-column>
+          <el-table-column prop="systemd_unit" label="服务" width="120" />
+        </el-table>
+      </template>
+
+      <!-- 无幽灵文件时显示安全状态 -->
+      <template v-else-if="!ghostScanning">
+        <div class="ghost-safe-state">
+          <el-icon color="#52c41a" :size="32"><CircleCheck /></el-icon>
+          <p style="color: #52c41a; font-weight: 600; margin: 8px 0 4px">系统无幽灵文件</p>
+          <p style="color: #909399; font-size: 13px; margin: 0">
+            ServerGuard 后端每 10 分钟自动扫描所有进程的文件句柄，未发现已删除但未释放的文件。磁盘空间显示一致。
+          </p>
+          <p style="color: #c0c4cc; font-size: 12px; margin: 6px 0 0">
+            扫描范围：/proc/*/fd 下的 (deleted) 符号链接 · 无需手动触发，自动巡检中
+          </p>
+        </div>
+      </template>
+
+      <!-- 扫描中骨架屏 -->
+      <template v-else>
+        <div v-loading="true" style="height: 80px"></div>
+      </template>
+    </el-card>
+
     <!-- 快捷删除卡片 -->
     <el-card v-if="quickCategories.length > 0" style="margin-bottom: 15px">
       <template #header>
@@ -27,6 +96,31 @@
         </div>
       </div>
     </el-card>
+
+    <!-- 大小范围筛选卡片 -->
+    <div style="display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap">
+      <div
+        v-for="tab in sizeTabs"
+        :key="tab.key"
+        @click="filterSize = tab.key; onFilterChange()"
+        :style="{
+          cursor: 'pointer',
+          flex: '1 1 120px',
+          minWidth: '120px',
+          padding: '10px 14px',
+          borderRadius: '8px',
+          border: filterSize === tab.key ? `2px solid ${tab.color}` : '1px solid #e4e7ed',
+          background: filterSize === tab.key ? tab.bg : '#fff',
+          transition: 'all 0.2s',
+          textAlign: 'center',
+        }"
+      >
+<div :style="{ fontSize: '22px', fontWeight: 700, color: tab.color, lineHeight: '1.2' }">
+<CountUp :value="tab.count" />
+</div>
+        <div style="font-size: 12px; color: #909399; margin-top: 4px">{{ tab.label }}</div>
+      </div>
+    </div>
 
     <!-- 大文件列表 -->
     <el-card>
@@ -202,12 +296,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { TableInstance } from 'element-plus'
-import { Search, FolderOpened } from '@element-plus/icons-vue'
+import { Search, FolderOpened, Warning, CircleCheck } from '@element-plus/icons-vue'
 import axios from 'axios'
 import dayjs from 'dayjs'
+import CountUp from '../components/CountUp.vue'
 
 interface LargeFile {
   path: string
@@ -246,6 +341,17 @@ const selectedFiles = ref<LargeFile[]>([])
 const deletableCount = ref(0)
 const deletableSizeMB = ref(0)
 
+// 幽灵文件状态
+const ghostFiles = ref<any[]>([])
+const ghostCount = ref(0)
+const ghostTotalSizeGB = ref(0)
+const ghostScanning = ref(false)
+const ghostScanned = ref(false)
+const ghostCleaning = ref(false)
+const lastGhostScanTime = ref('')
+const ghostAutoScanned = ref(false)
+let scanPollTimer: ReturnType<typeof setInterval> | null = null
+
 // 分类文件对话框状态
 const categoryDialogVisible = ref(false)
 const currentCategoryName = ref('')
@@ -277,6 +383,25 @@ const filteredFiles = computed(() => {
 })
 
 const total = computed(() => filteredFiles.value.length)
+
+const sizeStats = computed(() => {
+  const all = files.value
+  return {
+    all: all.length,
+    ge50: all.filter(f => f.size_mb >= 50).length,
+    ge100: all.filter(f => f.size_mb >= 100).length,
+    ge500: all.filter(f => f.size_mb >= 500).length,
+    ge1g: all.filter(f => f.size_mb >= 1024).length,
+    deletable: all.filter(f => f.can_delete).length,
+  }
+})
+
+const sizeTabs = computed(() => [
+  { key: '50', label: '≥ 50MB', count: sizeStats.value.ge50, color: '#409eff', bg: '#ecf5ff' },
+  { key: '100', label: '≥ 100MB', count: sizeStats.value.ge100, color: '#e6a23c', bg: '#fdf6ec' },
+  { key: '500', label: '≥ 500MB', count: sizeStats.value.ge500, color: '#f56c6c', bg: '#fef0f0' },
+  { key: '1024', label: '≥ 1GB', count: sizeStats.value.ge1g, color: '#f56c6c', bg: '#fef0f0' },
+])
 
 const pagedFiles = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
@@ -346,27 +471,105 @@ const formatTime = (ts: string) => {
   return dayjs(ts).format('YYYY-MM-DD HH:mm')
 }
 
+const formatGhostScanTime = (ts: string) => {
+  if (!ts || ts === '0001-01-01T00:00:00Z') return '-'
+  return dayjs(ts).format('MM-DD HH:mm:ss')
+}
+
 const handleSelectionChange = (selection: LargeFile[]) => {
   selectedFiles.value = selection
 }
 
 async function scanFiles() {
   scanning.value = true
+  stopScanPolling() // 清除可能存在的旧轮询
   try {
     const resp = await axios.get('/api/large-files', { params: { min_size_mb: filterSize.value } })
-    files.value = resp.data.files || []
-    deletableCount.value = resp.data.deletable_count || 0
-    deletableSizeMB.value = resp.data.deletable_size_mb || 0
-    currentPage.value = 1
-    if (files.value.length > 0) {
-      ElMessage.success(`发现 ${files.value.length} 个大文件，其中 ${deletableCount.value} 个可删除`)
+    const data = resp.data
+
+    // 后端可能返回三种状态：
+    // - "cached": 直接返回缓存结果
+    // - "scanning": 后台正在扫描，可能附带上次缓存
+    // - 202 Accepted: 扫描刚启动，可能附带上次缓存
+    if (data.files && data.files.length > 0) {
+      files.value = data.files
+      deletableCount.value = data.deletable_count || 0
+      deletableSizeMB.value = data.deletable_size_mb || 0
+      currentPage.value = 1
+    }
+
+    if (data.status === 'scanning') {
+      // 后台正在扫描，开始轮询
+      startScanPolling()
+    } else if (data.status === 'cached') {
+      // 使用了缓存，直接显示
+      scanning.value = false
+      if (files.value.length > 0) {
+        ElMessage.success(`发现 ${files.value.length} 个大文件，其中 ${deletableCount.value} 个可删除（缓存数据）`)
+      } else {
+        ElMessage.info('未发现大文件')
+      }
     } else {
-      ElMessage.info('未发现大文件')
+      // 直接返回了结果
+      scanning.value = false
+      if (files.value.length > 0) {
+        ElMessage.success(`发现 ${files.value.length} 个大文件，其中 ${deletableCount.value} 个可删除`)
+      } else {
+        ElMessage.info('未发现大文件')
+      }
     }
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.error || '扫描失败')
-  } finally {
     scanning.value = false
+    ElMessage.error(e?.response?.data?.error || '扫描失败')
+  }
+}
+
+function startScanPolling() {
+  scanning.value = true
+  if (scanPollTimer) clearInterval(scanPollTimer)
+  scanPollTimer = setInterval(async () => {
+    try {
+      const resp = await axios.get('/api/large-files', { params: { min_size_mb: filterSize.value } })
+      const data = resp.data
+      if (data.status === 'cached' || (data.files && data.status !== 'scanning')) {
+        // 扫描完成
+        files.value = data.files || []
+        deletableCount.value = data.deletable_count || 0
+        deletableSizeMB.value = data.deletable_size_mb || 0
+        currentPage.value = 1
+        scanning.value = false
+        stopScanPolling()
+        if (files.value.length > 0) {
+          ElMessage.success(`扫描完成：发现 ${files.value.length} 个大文件，其中 ${deletableCount.value} 个可删除`)
+        } else {
+          ElMessage.info('扫描完成：未发现大文件')
+        }
+      } else if (data.files && data.files.length > 0) {
+        // 扫描中但有上次缓存，更新显示
+        files.value = data.files
+        deletableCount.value = data.deletable_count || 0
+        deletableSizeMB.value = data.deletable_size_mb || 0
+      }
+    } catch {
+      scanning.value = false
+      stopScanPolling()
+    }
+  }, 3000) // 每 3 秒轮询
+
+  // 安全超时：3 分钟后停止
+  setTimeout(() => {
+    if (scanning.value) {
+      scanning.value = false
+      stopScanPolling()
+      ElMessage.warning('扫描超时，请稍后重试')
+    }
+  }, 180000)
+}
+
+function stopScanPolling() {
+  if (scanPollTimer) {
+    clearInterval(scanPollTimer)
+    scanPollTimer = null
   }
 }
 
@@ -535,13 +738,88 @@ async function confirmQuickDelete() {
 onMounted(() => {
   scanFiles()
   loadQuickCategories()
+  fetchGhostFiles()
 })
+
+onUnmounted(() => {
+  stopScanPolling()
+})
+
+// 幽灵文件方法 — 获取后端自动扫描的缓存结果，不触发新扫描
+async function fetchGhostFiles() {
+  try {
+    const r = await axios.get('/api/ghost-files')
+    ghostFiles.value = r.data.ghosts || []
+    ghostCount.value = r.data.count || 0
+    ghostTotalSizeGB.value = r.data.totalSizeGB || 0
+    lastGhostScanTime.value = r.data.lastScanTime || ''
+    ghostAutoScanned.value = r.data.autoScanned || false
+    ghostScanned.value = true
+  } catch { /* 静默 */ }
+}
+
+async function scanGhostFiles() {
+  ghostScanning.value = true
+  try {
+    const r = await axios.post('/api/ghost-files/scan')
+    ghostFiles.value = r.data.ghosts || []
+    ghostCount.value = r.data.count || 0
+    ghostTotalSizeGB.value = r.data.totalSizeGB || 0
+    lastGhostScanTime.value = r.data.lastScanTime || ''
+    ghostAutoScanned.value = false
+    ghostScanned.value = true
+    if (ghostCount.value > 0) {
+      ElMessage.warning(`发现 ${ghostCount.value} 个幽灵文件，占用 ${ghostTotalSizeGB.value.toFixed(2)}GB`)
+    } else {
+      ElMessage.success('未发现幽灵文件，磁盘空间显示一致')
+    }
+  } catch { ElMessage.error('扫描失败') }
+  finally { ghostScanning.value = false }
+}
+
+async function cleanGhostFiles() {
+  try {
+    await ElMessageBox.confirm(
+      `检测到 ${ghostCount.value} 个幽灵文件，占用 ${ghostTotalSizeGB.value.toFixed(2)}GB。\n自动清理会重启持有句柄的进程来释放空间，确定继续？`,
+      '幽灵文件清理',
+      { type: 'warning', confirmButtonText: '自动清理', cancelButtonText: '取消' }
+    )
+  } catch { return }
+
+  ghostCleaning.value = true
+  try {
+    const r = await axios.post('/api/ghost-files/clean', {}, { timeout: 120000 }) // 2 分钟超时：大量进程需要批量 kill
+    const freed = r.data.freedGB || 0
+    const remaining = r.data.count || 0
+    if (freed > 0) {
+      ElMessage.success(`已释放 ${freed.toFixed(2)}GB 幽灵空间` + (remaining > 0 ? `，剩余 ${remaining} 个需手动处理` : ''))
+    } else if (remaining > 0) {
+      ElMessage.warning(r.data.message || `${remaining} 个幽灵文件由关键进程持有，需手动重启服务释放`)
+    } else {
+      ElMessage.info('没有幽灵文件需要清理')
+    }
+    // 更新为清理后剩余的幽灵文件
+    ghostFiles.value = r.data.ghosts || []
+    ghostCount.value = r.data.count || 0
+    ghostTotalSizeGB.value = r.data.totalSizeGB || 0
+    await scanFiles() // 刷新大文件列表
+  } catch (e: any) { ElMessage.error('清理失败: ' + (e?.response?.data?.error || '')) }
+  finally { ghostCleaning.value = false }
+}
 </script>
 
 <style scoped>
 .large-files-page { width: 100%; }
 .card-header { display: flex; justify-content: space-between; align-items: center; }
 .header-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+.ghost-card { border-left: 4px solid transparent; }
+.ghost-card-danger { border-left-color: #f56c6c; }
+.ghost-card-safe { border-left-color: #52c41a; }
+.ghost-safe-state {
+  text-align: center;
+  padding: 20px 0;
+}
 
 .quick-categories {
   display: flex;

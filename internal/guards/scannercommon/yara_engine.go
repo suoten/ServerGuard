@@ -60,7 +60,7 @@ func (e *YaraEngine) loadBuiltinRules() {
 	}{
 		{"php_eval_base64", `eval\s*\(\s*base64_decode\s*\(`, []string{"webshell", "php"}},
 		{"php_assert_post", `assert\s*\(\s*\$_POST\s*\[`, []string{"webshell", "php"}},
-		{"php_system", `\b(system|exec|shell_exec|passthru|popen)\s*\(`, []string{"webshell", "php"}},
+		{"php_system", `\b(system|exec|shell_exec|passthru|popen)\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)`, []string{"webshell", "php"}},
 		{"php_eval_get", `eval\s*\(\s*\$_GET\s*\[`, []string{"webshell", "php"}},
 		{"php_gzuncompress", `gzuncompress\s*\(\s*base64_decode\s*\(`, []string{"webshell", "php"}},
 		{"php_str_replace_rot13", `str_replace\s*\(.{0,20}rot13`, []string{"webshell", "php"}},

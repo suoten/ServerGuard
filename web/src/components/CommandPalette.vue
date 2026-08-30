@@ -58,6 +58,7 @@ import {
   Search, Odometer, Monitor, Bell, Warning, DocumentChecked, Lock, Cpu, Key,
   Connection, FolderOpened, Compass, Document, Tickets, UserFilled, Finished,
   Setting, Sunny, Moon, SwitchButton, Position, Refresh, CircleClose, CircleCheck,
+  Aim, Files, Collection, Guide, Tools, DataLine,
 } from '@element-plus/icons-vue'
 import { useDark } from '@/composables/useDark'
 
@@ -96,20 +97,25 @@ const commands: Cmd[] = [
   nav('/dashboard', '仪表盘', Odometer, 'yibiaopan home 首页 概览'),
   nav('/servers', '服务器', Monitor, 'fuwuqi server 主机'),
   nav('/alerts', '告警中心', Bell, 'gaojing alert 告警'),
-  nav('/findings', '安全发现', Search, 'anquan faxian finding 基线'),
+  nav('/findings', '安全扫描', Search, 'anquan faxian finding 基线'),
   nav('/attacks', '攻击预警', Warning, 'gongji attack 攻击'),
   nav('/rules', '规则管理', DocumentChecked, 'guize rule 规则'),
   nav('/safety', '安全控制', Lock, 'anquan kongzhi safety 维护窗口 熔断'),
-  nav('/guards', '守护管理', Cpu, 'shouhu guard 守护 进程'),
+  nav('/guards', '服务守护', Cpu, 'shouhu guard 守护 进程'),
   nav('/certs', '证书管理', Key, 'zhengshu cert 证书 ssl'),
   nav('/monitoring', '网站监控', Connection, 'wangzhan monitoring 监控 存活'),
-  nav('/large-files', '大文件扫描', FolderOpened, 'dawenjian large file 磁盘'),
+  nav('/large-files', '磁盘与文件', FolderOpened, 'dawenjian large file 磁盘'),
   nav('/baota', '宝塔发现', Compass, 'baota bt 宝塔'),
   nav('/logs', '操作日志', Document, 'rizhi log 日志'),
   nav('/audit', '审计日志', Tickets, 'shenji audit 审计'),
   nav('/rbac', '用户角色', UserFilled, 'yonghu rbac 角色 权限'),
   nav('/config-approval', '配置审批', Finished, 'peizhi approval 审批'),
   nav('/settings', '系统设置', Setting, 'xitong setting 设置 通知'),
+  nav('/incidents', '故障事件', Aim, 'guzhang incident 事件 根因 因果链'),
+  nav('/knowledge', '知识库与报告', Collection, 'zhishiku knowledge 知识库 推荐 反复 报告'),
+  nav('/devops', 'DevOps 运维', Tools, 'devops deploy 部署 webhook 构建清理 批处理'),
+  nav('/data-governance', '数据治理', DataLine, 'shuju data govern 备份 敏感数据 死锁 归档'),
+  nav('/onboarding', '初始化向导', Guide, 'onboarding xiangdao 向导 初始化'),
 
   // ─── 快捷操作 ───
   {

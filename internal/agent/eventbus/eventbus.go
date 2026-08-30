@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ type subscription struct {
 }
 
 // EventBus is an in-memory event bus for the agent.
+// 向宝塔学习：告警冷却时间分级——Critical 立即告警，Warning 合并去重，减少噪音和 DB 写入
 type EventBus struct {
 	mu       sync.RWMutex
 	handlers map[types.EventType][]subscription
@@ -31,8 +33,11 @@ type EventBus struct {
 	cancel   context.CancelFunc
 
 	// Alert deduplication: maps alert key (ruleID:title) to last publish time
-	alertCooldown time.Duration
-	lastAlerts    map[string]time.Time
+	// 向宝塔学习：按告警级别分级冷却——Critical 快速通过，Warning 合并
+	alertCooldownCritical time.Duration // Critical: 1 分钟
+	alertCooldownWarning  time.Duration // Warning: 10 分钟
+	alertCooldownInfo     time.Duration // Info/其他: 30 分钟
+	lastAlerts            map[string]time.Time
 
 	// next subscription ID counter
 	nextSubID int64
@@ -42,12 +47,14 @@ type EventBus struct {
 func New(bufferSize int) *EventBus {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &EventBus{
-		handlers:      make(map[types.EventType][]subscription),
-		queue:         make(chan types.Event, bufferSize),
-		ctx:           ctx,
-		cancel:        cancel,
-		alertCooldown: 5 * time.Minute,
-		lastAlerts:    make(map[string]time.Time),
+		handlers:              make(map[types.EventType][]subscription),
+		queue:                 make(chan types.Event, bufferSize),
+		ctx:                   ctx,
+		cancel:                cancel,
+		alertCooldownCritical: 1 * time.Minute,  // Critical: 1 分钟冷却
+		alertCooldownWarning:  10 * time.Minute, // Warning: 10 分钟冷却
+		alertCooldownInfo:     30 * time.Minute,  // Info: 30 分钟冷却
+		lastAlerts:            make(map[string]time.Time),
 	}
 }
 
@@ -86,6 +93,7 @@ func (b *EventBus) Unsubscribe(eventType types.EventType, id SubscriptionID) {
 
 // Publish sends an event to all subscribers. Non-blocking.
 // For alert events, deduplicates based on ruleID + title within a cooldown period.
+// 向宝塔学习：按级别分级冷却，减少重复告警对 DB 和 notifier 的压力
 func (b *EventBus) Publish(event types.Event) {
 	// Deduplicate alerts: skip if same alert was published recently
 	if event.Type == types.EventAlert {
@@ -95,9 +103,20 @@ func (b *EventBus) Publish(event types.Event) {
 		}
 		alertKey := fmt.Sprintf("%s:%s", ruleID, event.Title)
 
+		// 按告警级别选择冷却时间
+		var cooldown time.Duration
+		switch event.Level {
+		case types.AlertCritical, types.AlertFatal:
+			cooldown = b.alertCooldownCritical
+		case types.AlertWarning:
+			cooldown = b.alertCooldownWarning
+		default:
+			cooldown = b.alertCooldownInfo
+		}
+
 		b.mu.Lock()
 		if lastTime, exists := b.lastAlerts[alertKey]; exists {
-			if time.Since(lastTime) < b.alertCooldown {
+			if time.Since(lastTime) < cooldown {
 				b.mu.Unlock()
 				return // Skip duplicate alert within cooldown
 			}
@@ -105,9 +124,9 @@ func (b *EventBus) Publish(event types.Event) {
 		// Clean old entries periodically
 		if len(b.lastAlerts) > 200 {
 			for k, t := range b.lastAlerts {
-				if time.Since(t) > b.alertCooldown {
+				if time.Since(t) > b.alertCooldownInfo {
 					delete(b.lastAlerts, k)
-				}
+			}
 			}
 		}
 		b.lastAlerts[alertKey] = time.Now()
@@ -146,13 +165,23 @@ func (b *EventBus) processLoop() {
 }
 
 // dispatch sends an event to all registered handlers.
+// 向宝塔学习：同步执行 handler，不为每个订阅者开 goroutine
+// handler 通常只是 DB 写入或告警发布，执行很快
+// goroutine 创建/调度开销在低配服务器上远大于同步执行
 func (b *EventBus) dispatch(event types.Event) {
 	b.mu.RLock()
 	subs := b.handlers[event.Type]
 	b.mu.RUnlock()
 
 	for _, s := range subs {
-		go s.handler(event)
+		func(sub subscription) {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "[EventBus] handler %s panicked: %v\n", sub.id, r)
+				}
+			}()
+			sub.handler(event)
+		}(s)
 	}
 }
 

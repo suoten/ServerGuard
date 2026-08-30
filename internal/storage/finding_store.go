@@ -47,15 +47,16 @@ func (s *Storage) SaveFinding(f *Finding) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 去重检查：如果已存在相同 scanner+title+target 且状态为 open 的记录，则跳过
+	// 去重检查：如果已存在相同 scanner+title+target 且状态为 open/false_positive/auto_resolved 的记录，则跳过
+	// 这样用户标记为误报后，重新扫描不会再产生新的 open 记录
 	var existingID string
 	if f.Status == "open" {
 		err := s.db.QueryRow(
-			`SELECT id FROM findings WHERE scanner=? AND title=? AND target=? AND status='open' ORDER BY created_at DESC LIMIT 1`,
+			`SELECT id FROM findings WHERE scanner=? AND title=? AND target=? AND status IN ('open', 'false_positive', 'auto_resolved') ORDER BY created_at DESC LIMIT 1`,
 			f.Scanner, f.Title, f.Target,
 		).Scan(&existingID)
 		if err == nil && existingID != "" {
-			// 已存在相同的未处理发现，跳过不重复保存
+			// 已存在相同的发现项（无论状态如何），跳过不重复保存
 			return nil
 		}
 	}
@@ -178,6 +179,13 @@ func (s *Storage) GetFinding(id string) (*Finding, error) {
 // 在每次扫描完成后调用：传入扫描器名称和本次扫描检测到的所有 key（title+target 组合），
 // 该扫描器下所有未在 currentKeys 中的 open 状态发现项将被标记为 auto_resolved。
 func (s *Storage) ResolveStaleFindings(scanner string, currentKeys []string) error {
+	// 【关键修复】当本次扫描返回 0 条发现时，不应清除历史 open 发现。
+	// 此前传入空 currentKeys 会导致所有 open 记录被标记为 auto_resolved，
+	// 使仪表盘上的安全发现数量瞬间归零。
+	if len(currentKeys) == 0 {
+		return nil
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -221,6 +229,103 @@ func (s *Storage) ResolveStaleFindings(scanner string, currentKeys []string) err
 		fmt.Printf("[Storage] 自动标记 %d 个 %s 发现项为已消失\n", resolvedCount, scanner)
 	}
 	return nil
+}
+
+// ResolveStaleFindingsByTarget 按站点路径清理已消失的发现项
+// 用于 W 模块（网站安全）：只清理本次实际扫描到的站点的旧发现项，
+// 不影响未扫描到的站点（因为超时导致部分站点未扫完时不会误清）。
+// scanner: 扫描器名称，targetPrefix: 站点路径前缀，currentKeys: 本次扫描该站点的 key 集合
+func (s *Storage) ResolveStaleFindingsByTarget(scanner string, targetPrefix string, currentKeys []string) error {
+	// 当本次扫描返回 0 条发现时，不清理（保护历史数据）
+	if len(currentKeys) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 查询该扫描器+该站点路径下所有 open 状态的发现项
+	rows, err := s.db.Query(
+		`SELECT id, title, target FROM findings WHERE scanner=? AND status='open' AND target LIKE ?`,
+		scanner, targetPrefix+"%",
+	)
+	if err != nil {
+		return fmt.Errorf("query stale findings by target: %w", err)
+	}
+	defer rows.Close()
+
+	keySet := make(map[string]bool, len(currentKeys))
+	for _, k := range currentKeys {
+		keySet[k] = true
+	}
+
+	now := time.Now()
+	var resolvedCount int
+	for rows.Next() {
+		var id, title, target string
+		if err := rows.Scan(&id, &title, &target); err != nil {
+			continue
+		}
+		key := title + "|" + target
+		if !keySet[key] {
+			_, err := s.db.Exec(
+				`UPDATE findings SET status='auto_resolved', fixed_at=?, updated_at=? WHERE id=?`,
+				now, now, id,
+			)
+			if err == nil {
+				resolvedCount++
+			}
+		}
+	}
+
+	if resolvedCount > 0 {
+		fmt.Printf("[Storage] 自动标记 %d 个 %s 发现项为已消失（站点: %s）\n", resolvedCount, scanner, targetPrefix)
+	}
+	return nil
+}
+
+// BatchResolveFindings 批量标记指定扫描器+标题模式的发现项为已解决
+// 用于清理误报：当规则更新后，批量将旧的误报告警标记为 auto_resolved
+// 当 scanner 为空字符串时，不限制扫描器（清理所有扫描器的误报）
+func (s *Storage) BatchResolveFindings(scanner string, titlePatterns []string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	resolvedCount := 0
+
+	for _, pattern := range titlePatterns {
+		var result sql.Result
+		var err error
+		if scanner == "" {
+			// 不限制扫描器，清理所有扫描器的误报
+			result, err = s.db.Exec(
+				`UPDATE findings SET status='auto_resolved', fixed_at=?, updated_at=?
+				 WHERE status='open' AND title LIKE ?`,
+				now, now, "%"+pattern+"%",
+			)
+		} else {
+			result, err = s.db.Exec(
+				`UPDATE findings SET status='auto_resolved', fixed_at=?, updated_at=?
+				 WHERE scanner=? AND status='open' AND title LIKE ?`,
+				now, now, scanner, "%"+pattern+"%",
+			)
+		}
+		if err != nil {
+			return resolvedCount, fmt.Errorf("batch resolve findings: %w", err)
+		}
+		affected, _ := result.RowsAffected()
+		resolvedCount += int(affected)
+	}
+
+	if resolvedCount > 0 {
+		if scanner == "" {
+			fmt.Printf("[Storage] 批量标记 %d 个发现项为已消失（误报清理，所有扫描器）\n", resolvedCount)
+		} else {
+			fmt.Printf("[Storage] 批量标记 %d 个 %s 发现项为已消失（误报清理）\n", resolvedCount, scanner)
+		}
+	}
+	return resolvedCount, nil
 }
 
 // CleanupOldFindings 清理过期的发现项

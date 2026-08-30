@@ -19,10 +19,92 @@
     </el-alert>
 
     <!-- ═══════════════════════════════════════════════════
-         第 1 行：健康评分（首屏视觉中心）
-         高度: ~200px，占满全宽
+         第 0.5 行：ServerGuard 作战日志（首屏视觉中心）
+         "ServerGuard 在过去 24 小时为你做了什么"
+         让用户一眼看到价值，不用翻页面
          ═══════════════════════════════════════════════════ -->
-    <el-card class="health-card" shadow="hover" @click="showDeductions = !showDeductions">
+    <el-card shadow="hover" class="battle-log-card">
+      <div class="battle-log-header">
+        <span class="battle-log-title">
+          <el-icon :color="autoActionSummary.total > 0 ? '#52c41a' : '#909399'"><Tools /></el-icon>
+          ServerGuard 24 小时作战日志
+        </span>
+        <el-tag v-if="autoActionSummary.total > 0" size="small" type="success">{{ autoActionSummary.total }} 次自动操作</el-tag>
+        <el-tag v-else size="small" type="info">一切正常</el-tag>
+      </div>
+      <div class="battle-log-body">
+        <template v-if="autoActionSummary.total > 0">
+          <div class="battle-log-items">
+            <div v-if="autoActionSummary.banIP > 0" class="battle-log-item battle-log-ban">
+              <el-icon color="#f56c6c"><Lock /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.banIP }}</div>
+                <div class="bl-label">个攻击 IP 被封禁</div>
+              </div>
+            </div>
+            <div v-if="autoActionSummary.cleanLog > 0" class="battle-log-item battle-log-clean">
+              <el-icon color="#1890ff"><Document /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.cleanLog }}</div>
+                <div class="bl-label">次日志自动清理</div>
+              </div>
+            </div>
+            <div v-if="autoActionSummary.cleanDisk > 0" class="battle-log-item battle-log-disk">
+              <el-icon color="#52c41a"><FolderOpened /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.cleanDisk }}</div>
+                <div class="bl-label">次磁盘空间回收</div>
+              </div>
+            </div>
+            <div v-if="autoActionSummary.renewCert > 0" class="battle-log-item battle-log-cert">
+              <el-icon color="#52c41a"><Key /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.renewCert }}</div>
+                <div class="bl-label">张证书自动续期</div>
+              </div>
+            </div>
+            <div v-if="autoActionSummary.restart > 0" class="battle-log-item battle-log-restart">
+              <el-icon color="#faad14"><RefreshRight /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.restart }}</div>
+                <div class="bl-label">次服务自动重启</div>
+              </div>
+            </div>
+            <div v-if="autoActionSummary.kill > 0" class="battle-log-item battle-log-kill">
+              <el-icon color="#f56c6c"><CloseBold /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.kill }}</div>
+                <div class="bl-label">个异常进程被终止</div>
+              </div>
+            </div>
+            <div v-if="autoActionSummary.reloadNginx > 0" class="battle-log-item battle-log-nginx">
+              <el-icon color="#1890ff"><Connection /></el-icon>
+              <div class="bl-content">
+                <div class="bl-number">{{ autoActionSummary.reloadNginx }}</div>
+                <div class="bl-label">次 Nginx 自动重载</div>
+              </div>
+            </div>
+          </div>
+          <div class="battle-log-footer">
+            <span v-if="autoActionSummary.successRate < 100" class="bl-rate">
+              操作成功率 <strong :style="{ color: autoActionSummary.successRate >= 80 ? '#52c41a' : '#f56c6c' }">{{ autoActionSummary.successRate != null ? Number(autoActionSummary.successRate).toFixed(2) : '--' }}%</strong>
+            </span>
+            <span class="bl-link" @click="$router.push('/logs')">
+              查看操作详情 <el-icon><ArrowRight /></el-icon>
+            </span>
+          </div>
+        </template>
+        <div v-else class="battle-log-empty">
+          <el-icon :size="32" color="#52c41a"><CircleCheck /></el-icon>
+          <span>过去 24 小时服务器一切正常，ServerGuard 持续守护中</span>
+        </div>
+      </div>
+    </el-card>
+
+    <!-- ═══════════════════════════════════════════════════
+         第 1 行：健康评分
+         ═══════════════════════════════════════════════════ -->
+    <el-card class="health-card" shadow="hover" style="margin-top: 16px" @click="showDeductions = !showDeductions">
       <!-- 骨架屏：首次加载 -->
       <el-skeleton v-if="!healthScore && !fetchError" :rows="0" animated>
         <template #template>
@@ -50,7 +132,7 @@
         <!-- 中间：分数 + 人话解释 -->
         <div class="health-summary">
           <div class="health-score-num" :style="{ color: scoreColor }">
-            {{ healthScore.total }}
+            {{ healthScore.total != null ? Number(healthScore.total).toFixed(2) : '--' }}
             <span class="health-score-unit">分</span>
           </div>
           <div class="health-trend">
@@ -72,7 +154,7 @@
               :show-text="false"
               style="flex: 1"
             />
-            <span class="sub-val" :style="{ color: subScoreColor(healthScore.performance) }">{{ healthScore.performance }}</span>
+            <span class="sub-val" :style="{ color: subScoreColor(healthScore.performance) }">{{ healthScore.performance != null ? Number(healthScore.performance).toFixed(2) : '--' }}</span>
           </div>
           <div class="sub-item">
             <span class="sub-label">可用性</span>
@@ -83,7 +165,7 @@
               :show-text="false"
               style="flex: 1"
             />
-            <span class="sub-val" :style="{ color: subScoreColor(healthScore.availability) }">{{ healthScore.availability }}</span>
+            <span class="sub-val" :style="{ color: subScoreColor(healthScore.availability) }">{{ healthScore.availability != null ? Number(healthScore.availability).toFixed(2) : '--' }}</span>
           </div>
           <div class="sub-item">
             <span class="sub-label">安全</span>
@@ -94,7 +176,7 @@
               :show-text="false"
               style="flex: 1"
             />
-            <span class="sub-val" :style="{ color: subScoreColor(healthScore.security) }">{{ healthScore.security }}</span>
+            <span class="sub-val" :style="{ color: subScoreColor(healthScore.security) }">{{ healthScore.security != null ? Number(healthScore.security).toFixed(2) : '--' }}</span>
           </div>
         </div>
       </div>
@@ -161,21 +243,21 @@
             :class="m.anomaly ? 'insight-bad' : 'insight-ok'"
           >
             <template v-if="m.ready">
-              {{ m.label }} {{ m.current.toFixed(0) }}{{ m.unit }} · 正常 {{ baselineRange(m) }}<template v-if="m.anomaly">（偏离 {{ m.sigmas.toFixed(1) }}σ）</template>
+              {{ m.label }} {{ Number(m.current || 0).toFixed(0) }}{{ m.unit }} · 正常 {{ baselineRange(m) }}<template v-if="m.anomaly">（偏离 {{ Number(m.sigmas || 0).toFixed(1) }}σ）</template>
             </template>
             <template v-else>
-              {{ m.label }} {{ m.current.toFixed(0) }}{{ m.unit }} · 基线学习中
+              {{ m.label }} {{ Number(m.current || 0).toFixed(0) }}{{ m.unit }} · 基线学习中
             </template>
           </span>
 
           <!-- OOM 内存趋势风险 -->
           <span v-if="memTrend?.risk" class="insight-item insight-bad">
-            内存增速 +{{ memTrend.slope_per_min.toFixed(1) }}%/min · 约 {{ Math.round(memTrend.minutes_left) }} 分钟后耗尽
+            内存增速 +{{ Number(memTrend.slope_per_min || 0).toFixed(1) }}%/min · 约 {{ Math.round(memTrend.minutes_left || 0) }} 分钟后耗尽
           </span>
 
           <!-- 变慢站点 -->
           <span v-for="s in slowSites" :key="s.id" class="insight-item insight-warn">
-            站点「{{ s.name }}」变慢 · {{ s.current_ms.toFixed(0) }}ms（常态 {{ s.mean_ms.toFixed(0) }}ms）
+            站点「{{ s.name }}」变慢 · {{ Number(s.current_ms || 0).toFixed(0) }}ms（常态 {{ Number(s.mean_ms || 0).toFixed(0) }}ms）
           </span>
 
           <!-- 全部正常 -->
@@ -211,7 +293,7 @@
               :key="cve.cve_id"
               class="security-update-item"
             >
-              <el-tag :type="cveTagType(cve.severity)" size="small">{{ cve.severity }}</el-tag>
+              <el-tag :type="cveTagType(cve.severity)" size="small">{{ updateSeverityLabel(cve.severity) }}</el-tag>
               <span class="cve-id">{{ cve.cve_id }}</span>
               <span class="cve-product">{{ cve.product }}</span>
               <span class="cve-desc">{{ truncateText(cve.description, 80) }}</span>
@@ -326,7 +408,18 @@
             </template>
           </el-skeleton>
           <div class="mini-chart-footer">
-            {{ diskPercent }}% · {{ diskPath || '无磁盘数据' }}<template v-if="diskForecastDays > 0"> · <span :style="{ color: diskForecastDays <= 7 ? '#f56c6c' : '#e6a23c' }">预计 {{ diskForecastDays }} 天后写满</span></template>
+            <el-tooltip v-if="(metrics?.disks || []).length > 1" :show-after="200" placement="top" effect="dark">
+              <template #content>
+                <div v-for="d in (metrics?.disks || [])" :key="d.mount_point" style="line-height: 1.8">
+                  {{ d.mount_point }}：{{ Math.round(d.used_percent) }}% · {{ formatBytes(d.used) }} / {{ formatBytes(d.total) }}
+                </div>
+              </template>
+              <span style="cursor: help; border-bottom: 1px dashed #c0c4cc">
+                {{ diskPercent }}% · {{ diskPath || '无磁盘数据' }} · {{ formatBytes(diskUsed) }} / {{ formatBytes(diskTotal) }}
+              </span>
+            </el-tooltip>
+            <span v-else>{{ diskPercent }}% · {{ diskPath || '无磁盘数据' }} · {{ formatBytes(diskUsed) }} / {{ formatBytes(diskTotal) }}</span>
+            <template v-if="diskForecastDays > 0"> · <span :style="{ color: diskForecastDays <= 7 ? '#f56c6c' : '#e6a23c' }">预计 {{ diskForecastDays }} 天后写满</span></template>
           </div>
         </el-card>
       </el-col>
@@ -351,7 +444,7 @@
             </template>
           </el-skeleton>
           <div class="mini-chart-footer">
-            ↑{{ netSentText }} · ↓{{ netRecvText }}
+            ↑{{ netSentText }} · ↓{{ netRecvText }} <span style="font-size:11px;color:#c0c4cc">/15s</span>
           </div>
         </el-card>
       </el-col>
@@ -457,18 +550,28 @@
               v-for="evt in recentEvents"
               :key="evt.id || evt.timestamp"
               class="event-item"
-              :class="{ 'event-unread': !evt.acknowledged }"
+              :class="{ 'event-unread': !evt.acknowledged, 'event-clickable': !!eventLink(evt) }"
+              @click="onEventClick(evt)"
             >
               <el-icon :style="{ color: eventIconColor(evt), fontSize: '18px' }">
                 <component :is="eventIconComponent(evt)" />
               </el-icon>
               <div class="event-body">
                 <div class="event-title-row">
-                  <span class="event-text">{{ eventShortText(evt) }}</span>
+                  <span class="event-text">{{ evt.title || evt.message || '' }}</span>
                   <el-tag v-if="evt.processed" type="success" size="small" effect="plain">已处理</el-tag>
-                  <el-tag v-else-if="evt.level === 'critical' || evt.level === 'error'" type="danger" size="small" effect="plain">待处理</el-tag>
+                  <el-tag v-else-if="evt.source === 'agent'" type="primary" size="small" effect="plain">自动修复</el-tag>
+                  <el-tag v-else-if="evt.level === 'critical' || evt.level === 'error' || evt.level === 'fatal'" type="danger" size="small" effect="plain">待处理</el-tag>
                 </div>
-                <div class="event-time">{{ formatTime(evt.timestamp) }}</div>
+                <!-- 完整消息内容（如果和标题不同） -->
+                <div v-if="evt.message && evt.message !== evt.title" class="event-message">{{ evt.message }}</div>
+                <div class="event-time-row">
+                  <span class="event-time">{{ formatTime(evt.timestamp) }}</span>
+                  <el-link v-if="eventLink(evt)" type="primary" underline="never" size="small" class="event-link" @click.stop="onEventClick(evt)">
+                    {{ eventLinkLabel(evt) }}
+                    <el-icon style="font-size: 12px"><ArrowRight /></el-icon>
+                  </el-link>
+                </div>
               </div>
             </div>
           </div>
@@ -508,11 +611,11 @@
             </el-table-column>
             <el-table-column label="CPU%" width="80" align="right">
               <template #default="{ row }">
-                <span :style="{ color: row.cpu_percent > 50 ? '#f56c6c' : row.cpu_percent > 20 ? '#e6a23c' : '#67c23a', fontWeight: 600 }">{{ row.cpu_percent.toFixed(1) }}%</span>
+                <span :style="{ color: row.cpu_percent > 50 ? '#f56c6c' : row.cpu_percent > 20 ? '#e6a23c' : '#67c23a', fontWeight: 600 }">{{ Number(row.cpu_percent || 0).toFixed(1) }}%</span>
               </template>
             </el-table-column>
             <el-table-column label="内存" width="80" align="right">
-              <template #default="{ row }">{{ row.mem_mb.toFixed(0) }}MB</template>
+              <template #default="{ row }">{{ Number(row.mem_mb || 0).toFixed(0) }}MB</template>
             </el-table-column>
           </el-table>
           <template #empty>
@@ -540,11 +643,11 @@
             </el-table-column>
             <el-table-column label="内存%" width="80" align="right">
               <template #default="{ row }">
-                <span :style="{ color: row.mem_percent > 30 ? '#f56c6c' : row.mem_percent > 10 ? '#e6a23c' : '#67c23a', fontWeight: 600 }">{{ row.mem_percent.toFixed(1) }}%</span>
+                <span :style="{ color: row.mem_percent > 30 ? '#f56c6c' : row.mem_percent > 10 ? '#e6a23c' : '#67c23a', fontWeight: 600 }">{{ Number(row.mem_percent || 0).toFixed(1) }}%</span>
               </template>
             </el-table-column>
             <el-table-column label="RSS" width="80" align="right">
-              <template #default="{ row }">{{ row.mem_mb.toFixed(0) }}MB</template>
+              <template #default="{ row }">{{ Number(row.mem_mb || 0).toFixed(0) }}MB</template>
             </el-table-column>
           </el-table>
           <template #empty>
@@ -568,7 +671,7 @@
               <el-tag :type="s.up ? 'success' : 'danger'" size="small">
                 {{ s.up ? '正常' : '不可用' }}
               </el-tag>
-              <span v-if="s.up" class="site-latency">{{ (s.latency / 1000000).toFixed(0) }}ms</span>
+              <span v-if="s.up" class="site-latency">{{ Number((s.latency || 0) / 1000000).toFixed(0) }}ms</span>
               <span v-else class="site-latency error">{{ s.last_error || '连接失败' }}</span>
             </div>
           </div>
@@ -601,6 +704,13 @@ import {
   ArrowRight,
   MagicStick,
   Lock,
+  Document,
+  RefreshRight,
+  CloseBold,
+  FolderOpened,
+  Key,
+  Connection,
+  // Shield not available in this version, using Tools instead
 } from '@element-plus/icons-vue'
 import { useDark } from '@/composables/useDark'
 
@@ -642,6 +752,10 @@ const memHistory = ref<{ time: string; value: number; baseline: number }[]>([])
 const diskHistory = ref<{ time: string; value: number; baseline: number }[]>([])
 const netHistory = ref<{ time: string; sent: number; recv: number; baseline: number }[]>([])
 
+// 上次网络 IO 采样值（累计字节），用于计算增量速率
+let prevNetSent = 0
+let prevNetRecv = 0
+
 let timer: ReturnType<typeof setInterval> | null = null
 let topProcTimer: ReturnType<typeof setInterval> | null = null
 
@@ -656,12 +770,28 @@ const memUsed = computed(() => ((metrics.value?.mem_used || 0) / 1024 / 1024 / 1
 const memTotal = computed(() => ((metrics.value?.mem_total || 0) / 1024 / 1024 / 1024).toFixed(1) + ' GB')
 const diskPercent = computed(() => {
   const disks = metrics.value?.disks || []
-  return disks.length > 0 ? Math.round(disks[0].used_percent) : 0
+  if (disks.length === 0) return 0
+  // 取所有分区中最大的使用率
+  return Math.round(Math.max(...disks.map((d: any) => d.used_percent || 0)))
 })
 const diskPath = computed(() => {
   const disks = metrics.value?.disks || []
-  return disks.length > 0 ? disks[0].mount_point : ''
+  if (disks.length === 0) return ''
+  // 取使用率最高的分区
+  const sorted = [...disks].sort((a: any, b: any) => (b.used_percent || 0) - (a.used_percent || 0))
+  const top = sorted[0]
+  if (disks.length === 1) return top.mount_point
+  return `${top.mount_point} 等 ${disks.length} 个分区`
 })
+// 磁盘已用量和总量：跟随显示使用率最高的那个分区
+const diskTop = computed(() => {
+  const disks = metrics.value?.disks || []
+  if (disks.length === 0) return null
+  const sorted = [...disks].sort((a: any, b: any) => (b.used_percent || 0) - (a.used_percent || 0))
+  return sorted[0]
+})
+const diskUsed = computed(() => diskTop.value?.used || 0)
+const diskTotal = computed(() => diskTop.value?.total || 0)
 // 磁盘写满预测：优先匹配当前挂载点，其次取最紧急的一项
 const diskForecastDays = computed(() => {
   const forecasts: any[] = metrics.value?.disk_forecast || []
@@ -681,8 +811,10 @@ const insightsLearning = computed(() => insights.value?.learning === true)
 // 基线正常范围文本：mean±2σ
 function baselineRange(m: any): string {
   if (!m.ready) return ''
-  const lo = Math.max(0, m.mean - 2 * m.stddev)
-  const hi = Math.min(100, m.mean + 2 * m.stddev)
+  const mean = Number(m.mean || 0)
+  const stddev = Number(m.stddev || 0)
+  const lo = Math.max(0, mean - 2 * stddev)
+  const hi = Math.min(100, mean + 2 * stddev)
   return `${lo.toFixed(0)}~${hi.toFixed(0)}${m.unit}`
 }
 
@@ -695,8 +827,17 @@ const insightsAllClear = computed(() => {
   const diskBad = diskForecastDays.value > 0 && diskForecastDays.value <= 7
   return !metricBad && !trendBad && !sitesBad && !diskBad
 })
-const netSent = computed(() => metrics.value?.net_bytes_sent || 0)
-const netRecv = computed(() => metrics.value?.net_bytes_recv || 0)
+// 网络流量：本周期增量（两次采样之间的差值），显示为速率而非开机累计值
+const netSent = computed(() => {
+  const cur = metrics.value?.net_bytes_sent || 0
+  const delta = prevNetSent > 0 ? Math.max(0, cur - prevNetSent) : 0
+  return delta
+})
+const netRecv = computed(() => {
+  const cur = metrics.value?.net_bytes_recv || 0
+  const delta = prevNetRecv > 0 ? Math.max(0, cur - prevNetRecv) : 0
+  return delta
+})
 const netSentText = computed(() => formatBytes(netSent.value))
 const netRecvText = computed(() => formatBytes(netRecv.value))
 
@@ -741,6 +882,41 @@ const healthExplanation = computed(() => {
 // 计算属性：守护状态
 // ═══════════════════════════════════════════════════
 const guardList = computed(() => guards.value.slice(0, 9))
+
+// ═══════════════════════════════════════════════════
+// 计算属性：24h 自动处理摘要
+// 从 safety.recent_actions 聚合统计，让用户看到 ServerGuard 自动做了什么
+// ═══════════════════════════════════════════════════
+const autoActionSummary = computed(() => {
+  const actions = safety.value?.recent_actions || []
+  const summary = {
+    total: actions.length,
+    cleanLog: 0,
+    restart: 0,
+    kill: 0,
+    banIP: 0,
+    cleanDisk: 0,
+    renewCert: 0,
+    reloadNginx: 0,
+    successCount: 0,
+    successRate: 100,
+  }
+  for (const a of actions) {
+    const type = a.action?.type || a.action_type || ''
+    switch (type) {
+      case 'clean_log': case 'rotate_log': summary.cleanLog++; break
+      case 'restart': summary.restart++; break
+      case 'kill': case 'sigterm': case 'sigkill': summary.kill++; break
+      case 'ban_ip': summary.banIP++; break
+      case 'clean_disk': summary.cleanDisk++; break
+      case 'renew_cert': summary.renewCert++; break
+      case 'reload_nginx': summary.reloadNginx++; break
+    }
+    if (a.success) summary.successCount++
+  }
+  summary.successRate = summary.total > 0 ? Math.round((summary.successCount / summary.total) * 100) : 100
+  return summary
+})
 
 function guardStatus(g: any): string {
   if (!g.enabled) return 'paused'
@@ -804,7 +980,7 @@ const recentEvents = computed(() => {
   const actionEvents = (safety.value?.recent_actions || []).slice(0, 4).map((a: any) => ({
     id: a.id || a.timestamp,
     level: a.success ? 'info' : 'error',
-    title: actionLabel(a.action?.type) + ' ' + (a.action?.params?.name || a.target || ''),
+    title: '🔁 ' + actionLabel(a.action?.type) + ' ' + (a.action?.params?.name || a.target || ''),
     source: 'agent',
     timestamp: a.timestamp,
     processed: a.success,
@@ -841,6 +1017,40 @@ function eventShortText(evt: any): string {
   // 限制 20 个中文字符
   if (text.length > 20) text = text.slice(0, 20) + '…'
   return text
+}
+
+// 根据 event source 返回跳转路径
+function eventLink(evt: any): string {
+  const source = evt.source || ''
+  if (source === 'attackwarn') return '/attacks'
+  if (source === 'serversecurity' || source === 'vulnscan' || source === 'websecurity') return '/findings'
+  if (source === 'cert') return '/certs'
+  if (source === 'correlation') return '/incidents'
+  if (source === 'forecast') return '/dashboard'
+  if (source === 'upgrade') return '/settings'
+  if (source === 'storage') return '/dashboard'
+  if (source === 'netquality') return '/monitoring'
+  if (source === 'baota') return '/baota'
+  return ''
+}
+
+// 跳转链接文案
+function eventLinkLabel(evt: any): string {
+  const source = evt.source || ''
+  if (source === 'attackwarn') return '查看攻击详情'
+  if (source === 'serversecurity' || source === 'vulnscan' || source === 'websecurity') return '查看安全发现'
+  if (source === 'cert') return '查看证书'
+  if (source === 'correlation') return '查看故障事件'
+  if (source === 'upgrade') return '去升级'
+  return '查看详情'
+}
+
+// 点击事件项跳转
+function onEventClick(evt: any) {
+  const link = eventLink(evt)
+  if (link) {
+    router.push(link)
+  }
 }
 
 async function ackAllEvents() {
@@ -908,8 +1118,8 @@ function buildMiniLineOption(
   const times = history.map((h) => h.time)
   const values = history.map((h) => h.value)
   const baselines = history.map((h) => h.baseline)
-  const lastVal = values[values.length - 1]
-  const baseline = baselines[baselines.length - 1]
+  const lastVal = Number(values[values.length - 1] || 0)
+  const baseline = Number(baselines[baselines.length - 1] || 0)
   const diff = lastVal - baseline
   const diffText = diff > 5 ? `比正常时段高 ${diff.toFixed(0)}${unit}` : diff < -5 ? `比正常时段低 ${Math.abs(diff).toFixed(0)}${unit}` : '处于正常范围'
 
@@ -919,8 +1129,9 @@ function buildMiniLineOption(
       trigger: 'axis',
       formatter: (params: any) => {
         const p = params[0]
+        if (!p) return ''
         const time = p.axisValueLabel || ''
-        const val = p.value
+        const val = typeof p.value === 'number' ? p.value.toFixed(2) : (p.value || '--')
         return `${time}<br/>${label} ${val}${unit}<br/>${diffText}`
       },
       confine: true,
@@ -988,8 +1199,8 @@ const netChartOption = computed(() => {
       trigger: 'axis',
       formatter: (params: any) => {
         const time = params[0]?.axisValueLabel || ''
-        const sVal = params[0]?.value || 0
-        const rVal = params[1]?.value || 0
+        const sVal = (params[0]?.value || 0) * 1024  // KB → bytes for formatBytes
+        const rVal = (params[1]?.value || 0) * 1024
         return `${time}<br/>↑ 发送 ${formatBytes(sVal)}<br/>↓ 接收 ${formatBytes(rVal)}`
       },
       confine: true,
@@ -1054,10 +1265,34 @@ function navigateToFix(d: any) {
 function actionLabel(type: string | undefined): string {
   const labels: Record<string, string> = {
     kill: '关闭进程', sigterm: '关闭进程', sigkill: '强制关闭',
-    restart: '重启服务', clean_log: '清理日志', ban_ip: '封禁IP',
-    renew_cert: '续期证书', reload_nginx: '重载Nginx', clean_disk: '清理磁盘', alert: '发送告警',
+    nice: '调整优先级', restart: '重启服务', clean_log: '清理日志',
+    rotate_log: '日志轮转', ban_ip: '封禁IP', unban_ip: '解封IP',
+    renew_cert: '续期证书', cert_renew: '证书续期', cert_scan: '证书扫描',
+    reload_nginx: '重载Nginx', clean_disk: '清理磁盘', run_script: '执行脚本',
+    alert: '发送告警', snapshot: '创建快照',
+    cve_alert: 'CVE漏洞告警', cve_feed_check: 'CVE漏洞检测',
+    security_update: '安全补丁告警', security_update_check: '安全补丁检测',
+    ghost_scan: '幽灵文件扫描',
+    emergency_stop: '紧急停止', emergency_resume: '恢复运行', emergency_rollback: '紧急回滚',
+    fix_finding: '修复安全发现', auto_fix_finding: '自动修复',
+    confirm_finding: '确认安全发现', mark_false_positive: '标记误报',
+    resolve_alert: '解决告警',
+    delete_large_file: '删除大文件', batch_delete_large_file: '批量删除大文件',
+    config_change: '修改配置', save_settings: '保存设置',
+    add_rule: '添加规则', update_rule: '更新规则', toggle_rule: '切换规则', delete_rule: '删除规则',
+    add_guard: '添加守护', remove_guard: '移除守护',
+    add_probe_site: '添加监控站点', delete_probe_site: '删除监控站点',
+    scan_websecurity: '网站安全扫描', scan_vulnscan: '漏洞扫描',
+    scan_serversecurity: '服务器安全扫描', scan_attackwarn: '攻击预警扫描',
+    create_maintenance_window: '创建维护窗口', delete_maintenance_window: '删除维护窗口',
+    incident_ack: '确认事件',
+    create_user: '创建用户', update_user: '更新用户', reset_password: '重置密码', delete_user: '删除用户',
+    killed: '已终止', suggested: '建议操作',
   }
-  return labels[type || ''] || type || '-'
+  if (!type) return '-'
+  if (type.startsWith('agent_command:')) return '远程命令: ' + type.substring('agent_command:'.length)
+  if (type.startsWith('import:')) return '导入: ' + type.substring('import:'.length)
+  return labels[type] || type || '-'
 }
 
 function formatTime(ts: string): string {
@@ -1124,9 +1359,13 @@ async function fetchData() {
     memHistory.value.push({ time: now, value: memPercent.value, baseline: memBaseline || 40 })
     diskHistory.value.push({ time: now, value: diskPercent.value, baseline: diskBaseline || 50 })
 
-    const netSentVal = (netSent.value / 1024).toFixed(0) as unknown as number
-    const netRecvVal = (netRecv.value / 1024).toFixed(0) as unknown as number
+    const netSentVal = Number((netSent.value / 1024).toFixed(0))
+    const netRecvVal = Number((netRecv.value / 1024).toFixed(0))
     netHistory.value.push({ time: now, sent: netSentVal, recv: netRecvVal, baseline: 0 })
+
+    // 更新上次采样值，供下个周期计算增量
+    prevNetSent = metrics.value?.net_bytes_sent || 0
+    prevNetRecv = metrics.value?.net_bytes_recv || 0
 
     // 限制历史长度
     if (cpuHistory.value.length > MAX_HISTORY) cpuHistory.value.shift()
@@ -1276,6 +1515,117 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* ═══ 作战日志卡片 ═══ */
+.battle-log-card {
+  border-left: 4px solid #52c41a;
+}
+.battle-log-card :deep(.el-card__body) {
+  padding: 16px 20px;
+}
+.battle-log-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.battle-log-title {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--sg-text-1, #303133);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.battle-log-body {
+  min-height: 40px;
+}
+.battle-log-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.battle-log-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--sg-bg-2, #f5f7fa);
+  min-width: 120px;
+}
+.battle-log-ban {
+  background: linear-gradient(135deg, #fff1f0 0%, #ffe1e1 100%);
+}
+.battle-log-clean {
+  background: linear-gradient(135deg, #e6f7ff 0%, #d4edda 100%);
+}
+.battle-log-disk {
+  background: linear-gradient(135deg, #f6ffed 0%, #e8f5e9 100%);
+}
+.battle-log-cert {
+  background: linear-gradient(135deg, #f6ffed 0%, #e3f2fd 100%);
+}
+.battle-log-restart {
+  background: linear-gradient(135deg, #fffbe6 0%, #fff7e6 100%);
+}
+.battle-log-kill {
+  background: linear-gradient(135deg, #fff1f0 0%, #ffe8e8 100%);
+}
+.battle-log-nginx {
+  background: linear-gradient(135deg, #e6f7ff 0%, #e3f2fd 100%);
+}
+.bl-content {
+  display: flex;
+  flex-direction: column;
+}
+.bl-number {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--sg-text-1, #303133);
+  line-height: 1.2;
+}
+.bl-label {
+  font-size: 12px;
+  color: var(--sg-text-2, #606266);
+}
+.battle-log-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--sg-border, #ebeef5);
+}
+.bl-rate {
+  font-size: 13px;
+  color: var(--sg-text-2, #606266);
+}
+.bl-rate strong {
+  font-size: 15px;
+  font-weight: 700;
+}
+.bl-link {
+  color: var(--sg-primary, #409eff);
+  cursor: pointer;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.bl-link:hover {
+  opacity: 0.8;
+}
+.battle-log-empty {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+}
+.battle-log-empty span {
+  font-size: 14px;
+  color: var(--sg-text-2, #606266);
+}
+
 /* ═══ 智能洞察横条 ═══ */
 .insights-card :deep(.el-card__body) {
   padding: 10px 16px;
@@ -1603,6 +1953,30 @@ onUnmounted(() => {
 }
 .event-item.event-unread:hover {
   background: var(--sg-unread-hover-bg);
+}
+.event-item.event-clickable {
+  cursor: pointer;
+}
+.event-message {
+  font-size: 12px;
+  color: var(--sg-text-3);
+  margin-top: 2px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.event-time-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 2px;
+}
+.event-link {
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 .event-body {
   flex: 1;

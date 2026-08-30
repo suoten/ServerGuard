@@ -104,13 +104,85 @@ func TestStorage_SaveMetricsBatch(t *testing.T) {
 
 func TestStorage_GetMetricsEmpty(t *testing.T) {
 	s := newTestStorage(t)
-
 	metrics, err := s.GetMetrics("nonexistent", "metric", time.Now().Add(-1*time.Hour), 10)
 	if err != nil {
 		t.Fatalf("GetMetrics failed: %v", err)
 	}
 	if len(metrics) != 0 {
 		t.Errorf("expected 0 metrics, got %d", len(metrics))
+	}
+}
+
+// 回归测试：空 type/name 表示通配（不过滤）。
+// 面板的 /api/servers/:id/metrics 与指标导出都用 GetMetrics("", "", ...) 调用，
+// 原实现把它编译成 WHERE type='' AND name=''，永远返回空列表。
+func TestStorage_GetMetricsWildcard(t *testing.T) {
+	s := newTestStorage(t)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	_ = s.SaveMetric(types.Metric{Type: types.MetricType("cpu"), Name: "cpu_percent", Value: 11, Timestamp: now})
+	_ = s.SaveMetric(types.Metric{Type: types.MetricType("mem"), Name: "mem_percent", Value: 22, Timestamp: now})
+
+	metrics, err := s.GetMetrics("", "", now.Add(-1*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("wildcard GetMetrics failed: %v", err)
+	}
+	if len(metrics) != 2 {
+		t.Fatalf("expected 2 metrics with wildcard filters, got %d", len(metrics))
+	}
+
+	// 只按 name 过滤、type 留空也应命中
+	metrics, err = s.GetMetrics("", "cpu_percent", now.Add(-1*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("half-wildcard GetMetrics failed: %v", err)
+	}
+	if len(metrics) != 1 || metrics[0].Name != "cpu_percent" {
+		t.Fatalf("expected only cpu_percent, got %d metrics", len(metrics))
+	}
+}
+
+// 回归测试：降采样把 raw 聚合进 metrics_1m 并删除后，GetMetrics / 基线统计
+// 必须仍能读到历史数据（面板曲线和基线异常检测依赖这一点）。
+func TestStorage_GetMetricsReadsAggregatedHistory(t *testing.T) {
+	s := newTestStorage(t)
+	d := NewDownsampler(s)
+
+	old := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Minute)
+	if err := s.SaveMetric(types.Metric{Type: types.MetricType("cpu"), Name: "cpu_percent", Value: 66.5, Timestamp: old}); err != nil {
+		t.Fatalf("SaveMetric: %v", err)
+	}
+
+	// raw→1m 聚合并删除原始行
+	if err := d.RunHourlyDownsample(); err != nil {
+		t.Fatalf("RunHourlyDownsample: %v", err)
+	}
+
+	// 通配查询应能从聚合表读到该点
+	metrics, err := s.GetMetrics("", "", old.Add(-time.Minute), 10)
+	if err != nil {
+		t.Fatalf("GetMetrics after downsample: %v", err)
+	}
+	found := false
+	for _, m := range metrics {
+		if m.Name == "cpu_percent" && m.Value == 66.5 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("aggregated (metrics_1m) history should be visible via GetMetrics")
+	}
+
+	// 基线统计也应覆盖聚合数据
+	buckets, err := s.GetMetricBaselineStats("cpu_percent", old.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetMetricBaselineStats: %v", err)
+	}
+	total := 0
+	for _, b := range buckets {
+		total += b.Count
+	}
+	if total == 0 {
+		t.Fatal("baseline stats should include aggregated samples")
 	}
 }
 

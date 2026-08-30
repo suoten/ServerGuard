@@ -36,8 +36,10 @@ func (c *DomainExpiryChecker) CheckDomainExpiry(domain string) (int, error) {
 		return 0, fmt.Errorf("whois 命令未安装。建议安装: apt install whois / yum install whois")
 	}
 
-	// Run whois command
-	output, err := exec.Command("whois", domain).Output()
+	// Run whois command（15s 超时兜底：部分 TLD 的 whois 服务器响应极慢甚至挂起）
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "whois", domain).Output()
 	if err != nil {
 		return 0, fmt.Errorf("whois 查询失败: %v", err)
 	}

@@ -3,6 +3,7 @@ package apm
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -69,6 +70,10 @@ var defaultSlowLogPaths = map[string][]string{
 //       SET timestamp=...;
 //       SELECT * FROM users WHERE name = 'test';
 var slowQueryTimeRegex = regexp.MustCompile(`# Query_time:\s*([\d.]+)\s+Lock_time:\s*([\d.]+)\s+Rows_sent:\s*(\d+)\s+Rows_examined:\s*(\d+)`)
+
+// pgSlowDurationRegex PostgreSQL 慢查询日志行：
+// 2026-08-12 14:32:01 UTC [1234] LOG:  duration: 2500.123 ms  statement: SELECT ...
+var pgSlowDurationRegex = regexp.MustCompile(`duration:\s*([\d.]+)\s*ms\s*statement:\s*(.+)`)
 
 // NewSlowQueryAnalyzer 创建慢查询分析器
 func NewSlowQueryAnalyzer(store *storage.Storage) *SlowQueryAnalyzer {
@@ -142,9 +147,28 @@ func findFirstExisting(paths []string) string {
 	return ""
 }
 
-// parseMySQLSlowLog 解析 MySQL 慢查询日志
-func parseMySQLSlowLog(path string) []rawSlowQuery {
+// slowLogTailMaxBytes 慢查询日志尾部读取的最大字节预算。
+// MySQL slow.log 可能涨到数 GB，从头全量扫描会在 1C1G 服务器上造成严重 IO/CPU 毛刺；
+// 分析"最近的慢查询"只需读取末尾窗口。
+const slowLogTailMaxBytes = 8 * 1024 * 1024 // 8MB
+
+// openTail 打开文件并定位到末尾预算窗口处（供两个解析器复用）
+func openTail(path string) (*os.File, error) {
 	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if stat, err := f.Stat(); err == nil && stat.Size() > slowLogTailMaxBytes {
+		if _, err := f.Seek(-slowLogTailMaxBytes, io.SeekEnd); err != nil {
+			_, _ = f.Seek(0, io.SeekStart)
+		}
+	}
+	return f, nil
+}
+
+// parseMySQLSlowLog 解析 MySQL 慢查询日志（尾部有界读取，最多回看 8MB）
+func parseMySQLSlowLog(path string) []rawSlowQuery {
+	f, err := openTail(path)
 	if err != nil {
 		return nil
 	}
@@ -208,9 +232,9 @@ func parseMySQLSlowLog(path string) []rawSlowQuery {
 	return queries
 }
 
-// parsePGSlowLog 解析 PostgreSQL 慢查询日志（简化版）
+// parsePGSlowLog 解析 PostgreSQL 慢查询日志（简化版，尾部有界读取）
 func parsePGSlowLog(path string) []rawSlowQuery {
-	f, err := os.Open(path)
+	f, err := openTail(path)
 	if err != nil {
 		return nil
 	}
@@ -221,11 +245,9 @@ func parsePGSlowLog(path string) []rawSlowQuery {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	// PostgreSQL 日志格式: 2026-08-12 14:32:01 UTC [1234] LOG:  duration: 2500.123 ms  statement: SELECT ...
-	durationRegex := regexp.MustCompile(`duration:\s*([\d.]+)\s*ms\s*statement:\s*(.+)`)
-
 	for scanner.Scan() {
 		line := scanner.Text()
-		if m := durationRegex.FindStringSubmatch(line); m != nil {
+		if m := pgSlowDurationRegex.FindStringSubmatch(line); m != nil {
 			var qt float64
 			fmt.Sscanf(m[1], "%f", &qt)
 			query := strings.TrimSpace(m[2])

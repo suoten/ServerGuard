@@ -91,15 +91,52 @@ func (v *VulnScanGuard) Scan(ctx context.Context, webRoots []string) ([]types.Sc
 	return allFindings, nil
 }
 
+// versionProbe 组件版本探测项。
+type versionProbe struct {
+	name string
+	cmd  string
+	args []string
+}
+
+// btComponentGlobs 宝塔面板组件的常见安装位置。
+// 宝塔把所有组件装在 /www/server/* 下且不加入 PATH，
+// 此前仅探测 PATH 与系统目录 → 宝塔服务器上 X 模块漏洞扫描恒为 0。
+var btComponentGlobs = []struct {
+	name  string
+	globs []string
+	args  []string
+}{
+	{"nginx", []string{"/www/server/nginx/sbin/nginx"}, []string{"-v"}},
+	{"apache", []string{"/www/server/apache/bin/httpd"}, []string{"-v"}},
+	{"php", []string{"/www/server/php/*/bin/php"}, []string{"-v"}}, // 多版本共存，逐个探测
+	{"mysql", []string{"/www/server/mysql/bin/mysql", "/www/server/mysql/usr/bin/mysql"}, []string{"--version"}},
+	{"redis", []string{"/www/server/redis/src/redis-server"}, []string{"--version"}},
+}
+
+// btDiscoveredComponents 从宝塔安装目录发现组件二进制（存在才返回）。
+func btDiscoveredComponents() []versionProbe {
+	var probes []versionProbe
+	for _, c := range btComponentGlobs {
+		for _, pattern := range c.globs {
+			matches, err := filepath.Glob(pattern)
+			if err != nil {
+				continue
+			}
+			for _, m := range matches {
+				if st, err := os.Stat(m); err == nil && !st.IsDir() && st.Mode()&0111 != 0 {
+					probes = append(probes, versionProbe{name: c.name, cmd: m, args: c.args})
+				}
+			}
+		}
+	}
+	return probes
+}
+
 // ScanComponents X1: 软件组件漏洞扫描
 func (v *VulnScanGuard) ScanComponents(ctx context.Context) ([]types.ScanFinding, error) {
 	rb := scannercommon.NewReportBuilder("vulnscan", "system-components")
 
-	components := []struct {
-		name string
-		cmd  string
-		args []string
-	}{
+	components := []versionProbe{
 		{"nginx", "nginx", []string{"-v"}},
 		{"apache", "apachectl", []string{"-v"}},
 		{"php", "php", []string{"-v"}},
@@ -111,6 +148,11 @@ func (v *VulnScanGuard) ScanComponents(ctx context.Context) ([]types.ScanFinding
 		{"python", "python3", []string{"--version"}},
 		{"docker", "docker", []string{"--version"}},
 	}
+	// 追加从宝塔目录发现的组件（与系统组件可能重复，按 产品+版本 去重）
+	components = append(components, btDiscoveredComponents()...)
+
+	// 同一产品同一版本只报告一次（系统 nginx 与宝塔 nginx 版本相同时避免重复）
+	seenProductVersion := make(map[string]map[string]bool)
 
 	for _, comp := range components {
 		rawVersion, err := getCommandVersion(ctx, comp.cmd, comp.args)
@@ -123,6 +165,14 @@ func (v *VulnScanGuard) ScanComponents(ctx context.Context) ([]types.ScanFinding
 		if cleanVersion == "" {
 			continue
 		}
+
+		if seenProductVersion[comp.name] == nil {
+			seenProductVersion[comp.name] = make(map[string]bool)
+		}
+		if seenProductVersion[comp.name][cleanVersion] {
+			continue
+		}
+		seenProductVersion[comp.name][cleanVersion] = true
 
 		for _, cve := range v.cveDatabase.Entries {
 			if !strings.EqualFold(cve.Product, comp.name) {
@@ -669,6 +719,7 @@ func getKnownVulnPackages() map[string][]vulnPackageInfo {
 }
 
 // ScanCMS X2: CMS/框架漏洞扫描
+// 只在检测到已知有漏洞的旧版本时才报告，检测到 CMS 本身不报告
 func (v *VulnScanGuard) ScanCMS(ctx context.Context, webRoots []string) ([]types.ScanFinding, error) {
 	rb := scannercommon.NewReportBuilder("vulnscan", "cms-frameworks")
 
@@ -677,15 +728,13 @@ func (v *VulnScanGuard) ScanCMS(ctx context.Context, webRoots []string) ([]types
 		signature    string
 		versionFile  string
 		versionRegex string
+		minSafeVer   string // 低于此版本才报告漏洞
 	}{
-		{"wordpress", "wp-includes/version.php", "wp-includes/version.php", `\$wp_version\s*=\s*'([^']+)'`},
-		{"thinkphp", "thinkphp/base.php", "thinkphp/base.php", `THINK_VERSION\s*=\s*'([^']+)'`},
-		{"laravel", "vendor/laravel/framework/src/Illuminate/Foundation/Application.php", "vendor/laravel/framework/src/Illuminate/Foundation/Application.php", `const VERSION\s*=\s*'([^']+)'`},
-		{"dedecms", "data/common.inc.php", "data/common.inc.php", ""},
-		{"discuz", "source/class/discuz/discuz_application.php", "source/class/discuz/discuz_application.php", ""},
-		{"typecho", "var/Typecho/Common.php", "var/Typecho/Common.php", `VERSION\s*=\s*'([^']+)'`},
-		{"drupal", "includes/bootstrap.inc", "includes/bootstrap.inc", `define\('DRUPAL_VERSION',\s*'([^']+)'\)`},
-		{"joomla", "libraries/cms/version/version.php", "libraries/cms/version/version.php", `RELEASE\s*=\s*'([^']+)'`},
+		{"wordpress", "wp-includes/version.php", "wp-includes/version.php", `\$wp_version\s*=\s*'([^']+)'`, "6.0.0"},
+		{"thinkphp", "thinkphp/base.php", "thinkphp/base.php", `THINK_VERSION\s*=\s*'([^']+)'`, "5.1.0"},
+		{"laravel", "vendor/laravel/framework/src/Illuminate/Foundation/Application.php", "vendor/laravel/framework/src/Illuminate/Foundation/Application.php", `const VERSION\s*=\s*'([^']+)'`, "9.0.0"},
+		{"drupal", "includes/bootstrap.inc", "includes/bootstrap.inc", `define\('DRUPAL_VERSION',\s*'([^']+)'\)`, "9.4.0"},
+		{"joomla", "libraries/cms/version/version.php", "libraries/cms/version/version.php", `RELEASE\s*=\s*'([^']+)'`, "4.0.0"},
 	}
 
 	for _, root := range webRoots {
@@ -706,15 +755,19 @@ func (v *VulnScanGuard) ScanCMS(ctx context.Context, webRoots []string) ([]types
 				}
 			}
 
-			rb.AddFinding(
-				types.SeverityMedium,
-				fmt.Sprintf("检测到 CMS: %s %s", cms.name, version),
-				fmt.Sprintf("在 %s 检测到 %s CMS，版本 %s", root, cms.name, version),
-				root,
-				fmt.Sprintf(`{"cms":"%s","version":"%s","path":"%s"}`, cms.name, version, root),
-				"检查是否有已知漏洞，及时升级到最新版本",
-				"升级 CMS 可能导致主题/插件不兼容，建议先备份",
-			)
+			// 只在版本低于安全版本时才报告漏洞
+			if version != "unknown" && cms.minSafeVer != "" && isVersionLower(version, cms.minSafeVer) {
+				rb.AddFinding(
+					types.SeverityHigh,
+					fmt.Sprintf("%s 旧版本漏洞: %s (当前 %s, 安全版本 %s+)", cms.name, cms.name, version, cms.minSafeVer),
+					fmt.Sprintf("在 %s 检测到 %s CMS，版本 %s 低于安全版本 %s，存在已知漏洞", root, cms.name, version, cms.minSafeVer),
+					root,
+					fmt.Sprintf(`{"cms":"%s","version":"%s","min_safe":"%s","path":"%s"}`, cms.name, version, cms.minSafeVer, root),
+					fmt.Sprintf("升级 %s 到 %s 或更高版本", cms.name, cms.minSafeVer),
+					"升级 CMS 可能导致主题/插件不兼容，建议先备份",
+				)
+			}
+			// 如果版本正常或无法检测，不报告（避免信息噪入）
 		}
 	}
 
@@ -722,41 +775,37 @@ func (v *VulnScanGuard) ScanCMS(ctx context.Context, webRoots []string) ([]types
 }
 
 // ScanDependencies X3: 依赖漏洞扫描
+// 解析 composer.lock / package-lock.json / requirements.txt / pom.xml / go.mod，
+// 匹配本地已知漏洞数据库 + 外部威胁情报（可选），报告版本低于修复版本的依赖。
 func (v *VulnScanGuard) ScanDependencies(ctx context.Context, webRoots []string) ([]types.ScanFinding, error) {
 	rb := scannercommon.NewReportBuilder("vulnscan", "dependencies")
 
-	depFiles := []struct {
-		name string
-		file string
-	}{
-		{"composer.lock", "composer.lock"},
-		{"package-lock.json", "package-lock.json"},
-		{"requirements.txt", "requirements.txt"},
-		{"Pipfile.lock", "Pipfile.lock"},
-		{"go.mod", "go.mod"},
-		{"pom.xml", "pom.xml"},
+	depScanner := NewDependencyScanner()
+	if v.intel != nil {
+		depScanner.SetIntelChecker(v.intel)
 	}
 
 	for _, root := range webRoots {
-		for _, dep := range depFiles {
-			depPath := filepath.Join(root, dep.file)
-			if _, err := os.Stat(depPath); err != nil {
-				continue
-			}
-
-			data, err := os.ReadFile(depPath)
-			if err != nil {
-				continue
-			}
-
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		vulns, err := depScanner.ScanDir(root)
+		if err != nil {
+			continue
+		}
+		for _, vuln := range vulns {
+			severity := parseSeverity(vuln.Severity)
 			rb.AddFinding(
-				types.SeverityLow,
-				fmt.Sprintf("检测到依赖文件: %s", dep.name),
-				fmt.Sprintf("在 %s 检测到 %s，建议使用 npm audit / composer audit / safety check 检查依赖漏洞", root, dep.name),
-				depPath,
-				fmt.Sprintf(`{"file":"%s","size":%d}`, dep.name, len(data)),
-				fmt.Sprintf("运行依赖审计工具检查已知漏洞: %s", dep.name),
-				"升级依赖可能破坏业务功能，建议先在测试环境验证",
+				severity,
+				fmt.Sprintf("依赖漏洞: %s %s (%s)", vuln.PackageName, vuln.InstalledVersion, vuln.VulnerabilityID),
+				fmt.Sprintf("在 %s 检测到依赖 %s %s 存在漏洞 %s: %s\n当前版本: %s\n修复版本: %s+",
+					root, vuln.PackageName, vuln.InstalledVersion, vuln.VulnerabilityID, vuln.Description,
+					vuln.InstalledVersion, vuln.FixedVersion),
+				vuln.PackageName,
+				fmt.Sprintf(`{"package":"%s","current_version":"%s","cve":"%s","severity":"%s","fixed_version":"%s"}`,
+					vuln.PackageName, vuln.InstalledVersion, vuln.VulnerabilityID, vuln.Severity, vuln.FixedVersion),
+				fmt.Sprintf("升级 %s 到 %s 或更高版本", vuln.PackageName, vuln.FixedVersion),
+				"升级依赖可能导致 API 不兼容，建议在测试环境验证后再升级",
 			)
 		}
 	}
@@ -932,7 +981,6 @@ func (v *VulnScanGuard) checkKernelParams(rb *scannercommon.ReportBuilder) {
 		description string
 	}{
 		{"net.ipv4.tcp_syncookies", "/proc/sys/net/ipv4/tcp_syncookies", "1", "SYN Flood 保护"},
-		{"net.ipv4.ip_forward", "/proc/sys/net/ipv4/ip_forward", "0", "IP 转发"},
 		{"net.ipv4.conf.all.accept_redirects", "/proc/sys/net/ipv4/conf/all/accept_redirects", "0", "ICMP 重定向"},
 	}
 

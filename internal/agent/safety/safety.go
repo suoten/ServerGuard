@@ -62,6 +62,11 @@ type SafetyManager struct {
 
 	// 维护窗口判定回调（由 API 层注入，见 maintenance.go）
 	maintenanceProvider MaintenanceProvider
+
+	// V4.0 — 远程暂停（双向通知回复 "暂停" 后置 true）
+	remotePaused       bool
+	remotePausedReason string
+	remotePausedAt     time.Time
 }
 
 type killRecord struct {
@@ -188,7 +193,7 @@ func (sm *SafetyManager) GetMode() types.AgentMode {
 // ShouldPauseActions returns true if the agent should pause all automatic actions.
 func (sm *SafetyManager) ShouldPauseActions() bool {
 	sm.mu.RLock()
-	paused := sm.mode == types.ModeMinimal || sm.mode == types.ModeSurvival || sm.emergencyStop
+	paused := sm.mode == types.ModeMinimal || sm.mode == types.ModeSurvival || sm.emergencyStop || sm.remotePaused
 	p := sm.maintenanceProvider
 	sm.mu.RUnlock()
 	if paused {
@@ -204,7 +209,7 @@ func (sm *SafetyManager) ShouldPauseActions() bool {
 // ShouldPauseDangerousActions returns true if kill/restart should be paused.
 func (sm *SafetyManager) ShouldPauseDangerousActions() bool {
 	sm.mu.RLock()
-	paused := sm.mode == types.ModeThrottled || sm.mode == types.ModeMinimal || sm.mode == types.ModeSurvival || sm.emergencyStop
+	paused := sm.mode == types.ModeThrottled || sm.mode == types.ModeMinimal || sm.mode == types.ModeSurvival || sm.emergencyStop || sm.remotePaused
 	p := sm.maintenanceProvider
 	sm.mu.RUnlock()
 	if paused {
@@ -394,18 +399,15 @@ func (sm *SafetyManager) RecordKill(pid int32, name string, success bool) {
 	}
 
 	// Start cascade observation
+	// 向宝塔学习：用 time.AfterFunc 代替 go+Sleep，减少 goroutine 创建
 	sm.cascadeObserving = true
 	sm.lastActionTarget = name
 	sm.lastActionTime = now
-	go sm.cascadeObservationTimer()
-}
-
-// cascadeObservationTimer clears the cascade observation flag after the observation window.
-func (sm *SafetyManager) cascadeObservationTimer() {
-	time.Sleep(sm.cfg.ObservationWindow.Duration())
-	sm.mu.Lock()
-	sm.cascadeObserving = false
-	sm.mu.Unlock()
+	time.AfterFunc(sm.cfg.ObservationWindow.Duration(), func() {
+		sm.mu.Lock()
+		sm.cascadeObserving = false
+		sm.mu.Unlock()
+	})
 }
 
 // --- Layer 4: Cascade Protection ---
@@ -462,7 +464,7 @@ func (sm *SafetyManager) CanTriggerRule(ruleID string, cooldown time.Duration, m
 	now := time.Now()
 	history := sm.triggerHistory[ruleID]
 
-	// Filter to last hour
+	// Filter to last hour（写回裁剪结果，防止历史无限增长）
 	oneHourAgo := now.Add(-1 * time.Hour)
 	var recent []time.Time
 	for _, t := range history {
@@ -470,6 +472,7 @@ func (sm *SafetyManager) CanTriggerRule(ruleID string, cooldown time.Duration, m
 			recent = append(recent, t)
 		}
 	}
+	sm.triggerHistory[ruleID] = recent
 
 	// Check max_triggers
 	if maxTriggers > 0 && len(recent) >= maxTriggers {
@@ -492,7 +495,16 @@ func (sm *SafetyManager) RecordTrigger(ruleID string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	sm.triggerHistory[ruleID] = append(sm.triggerHistory[ruleID], time.Now())
+	// 只保留最近 1 小时（与 CanTriggerRule 的判定窗口一致），防止长期运行内存增长
+	oneHourAgo := time.Now().Add(-1 * time.Hour)
+	history := sm.triggerHistory[ruleID]
+	var recent []time.Time
+	for _, t := range history {
+		if t.After(oneHourAgo) {
+			recent = append(recent, t)
+		}
+	}
+	sm.triggerHistory[ruleID] = append(recent, time.Now())
 }
 
 // --- Resource Floor ---
@@ -687,11 +699,21 @@ func (sm *SafetyManager) CheckAutoEmergencyStop() bool {
 
 	// Condition 3: System got worse within 5 min after a Kill
 	// (CPU higher or more services abnormal after Kill)
+	// 只比较最近 10 分钟内的快照：此前快照从不过期，一旦出现过一次
+	// "Kill 后变差"，此后每次调用都会重新触发紧急停止（且无自动恢复），
+	// 造成扫描/修复永久静默停摆。
+	const killCompareWindow = 10 * time.Minute
 	if len(sm.preKillSysState) > 0 && len(sm.postKillSysState) > 0 {
 		for i := range sm.preKillSysState {
-			if i < len(sm.postKillSysState) {
-				pre := sm.preKillSysState[i]
-				post := sm.postKillSysState[i]
+			pre := sm.preKillSysState[i]
+			if now.Sub(pre.Timestamp) > killCompareWindow {
+				continue // 过期快照不再参与判定
+			}
+			for j := range sm.postKillSysState {
+				post := sm.postKillSysState[j]
+				if post.Timestamp.Before(pre.Timestamp) || post.Timestamp.Sub(pre.Timestamp) > killCompareWindow {
+					continue
+				}
 				if post.CPUPercent > pre.CPUPercent*1.2 || post.AbnormalServices > pre.AbnormalServices {
 					sm.emergencyStop = true
 					sm.emergencyStopReason = "auto: system got worse after Kill"

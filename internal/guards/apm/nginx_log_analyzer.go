@@ -5,6 +5,7 @@ package apm
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -485,13 +486,24 @@ func extractRequestTime(line string) float64 {
 	return val
 }
 
-// readLastNLines 读取文件最后 N 行
+// readLastNLinessTailMaxBytes 尾部读取的最大字节预算。
+// 原实现从文件头逐行扫到末尾——GB 级 access.log 会造成巨大的磁盘 IO 毛刺，
+// 在 1C1G 服务器上会明显拖慢业务。只读末尾窗口即可满足"最近 N 行"的语义。
+const readLastNLinesTailMaxBytes = 8 * 1024 * 1024 // 8MB
+
+// readLastNLines 读取文件最后 N 行（尾部有界读取，最多回看 8MB）
 func readLastNLines(path string, n int) []string {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
+
+	if stat, err := f.Stat(); err == nil && stat.Size() > readLastNLinesTailMaxBytes {
+		if _, err := f.Seek(-readLastNLinesTailMaxBytes, io.SeekEnd); err != nil {
+			_, _ = f.Seek(0, io.SeekStart)
+		}
+	}
 
 	var lines []string
 	scanner := bufio.NewScanner(f)

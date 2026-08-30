@@ -111,19 +111,92 @@ func (g *ResourceGuard) Check(ctx context.Context, sysInfo *types.SystemInfo, pr
 		g.checkZombies(sysInfo)
 	}()
 
+	// A6: Process explosion detection (fork bomb / runaway process multiplication)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		g.checkProcessExplosion(procs)
+	}()
+
 	wg.Wait()
 }
 
 // checkCPU checks for processes with high CPU usage.
 // 使用 CPUTriggerTracker 实现误杀防护：连续3次触发才Kill。
+// 修复说明：原实现拿到 toKill 列表后只发布"执行Kill"的告警，
+// 从未真正终止进程——README 承诺的"降权→SIGTERM→SIGKILL"自动处置实际不生效。
+// 现在按 killLargestProcess 同款安全链执行：
+// 安全总闸 → 硬白名单 → 本地关键进程表 → 宝塔深度保护 → CheckKillPermission（预算/熔断）。
 func (g *ResourceGuard) checkCPU(procs []types.ProcessInfo) {
 	toKill := g.cpuTracker.CheckCPUWithProtection(nil, procs, g.cpuThreshold)
+	if len(toKill) == 0 {
+		// 无触发时顺带清理过期状态，防止 states map 随 PID 回收无限增长
+		g.cpuTracker.Cleanup()
+		return
+	}
+	procByName := make(map[int32]types.ProcessInfo, len(procs))
+	for _, p := range procs {
+		procByName[p.PID] = p
+	}
 	for _, pid := range toKill {
+		p, ok := procByName[pid]
+		if !ok {
+			continue
+		}
+		g.terminateRunawayProcess(p)
+	}
+}
+
+// terminateRunawayProcess 终止 CPU 失控进程，完整走一遍安全检查链。
+// 返回是否执行了终止动作。
+func (g *ResourceGuard) terminateRunawayProcess(p types.ProcessInfo) bool {
+	if g.safety == nil {
+		return false
+	}
+	// 危险动作总闸：降频/最小/生存/紧急停止/维护窗口期间不动手
+	if g.safety.ShouldPauseDangerousActions() {
 		g.eventBus.PublishAlert(types.AlertError, "resource",
-			fmt.Sprintf("CPU超限Kill: PID %d", pid),
-			fmt.Sprintf("进程 PID %d 连续 %d 次CPU超限，执行Kill", pid, cpuTriggerThreshold),
+			fmt.Sprintf("CPU超限待人工处理: %s (PID %d)", p.Name, p.PID),
+			fmt.Sprintf("进程 %s (PID %d) 连续 CPU 超限，但当前处于受限模式，未自动终止。请手动检查", p.Name, p.PID),
+			"cpu-protect-002")
+		return false
+	}
+	// 硬白名单 + 本地关键进程表（双保险）
+	if g.safety.IsWhitelisted(p.Name) || isSystemCritical(p.Name) {
+		return false
+	}
+	// 宝塔深度保护：python 等泛化进程名需读 /proc 精确归属
+	if procInfo := safety.ReadProcInfo(p.PID); procInfo != nil && safety.IsBaotaProtectedProcess(procInfo) {
+		return false
+	}
+	// 预算 / 熔断 / 模式终检（内部会再次校验紧急停止与 Kill 预算）
+	if err := g.safety.CheckKillPermission(p.Name, p.PID); err != nil {
+		g.eventBus.PublishAlert(types.AlertWarning, "resource",
+			fmt.Sprintf("CPU超限Kill被安全策略拦截: %s (PID %d)", p.Name, p.PID),
+			fmt.Sprintf("进程连续 CPU 超限，但被安全策略拦截：%v。请手动确认后处理", err),
+			"cpu-protect-002")
+		return false
+	}
+
+	proc := process.Process{Pid: p.PID}
+	killErr := proc.Terminate()
+	success := killErr == nil
+	g.safety.RecordKill(p.PID, p.Name, success)
+
+	if success {
+		g.eventBus.PublishAlert(types.AlertError, "resource",
+			fmt.Sprintf("CPU超限Kill: %s (PID %d)", p.Name, p.PID),
+			fmt.Sprintf("进程 %s (PID %d) 连续 %d 次 CPU 超限（当前 %.1f%%），已自动终止以保护系统。如为误杀请将其加入白名单",
+				p.Name, p.PID, cpuTriggerThreshold, p.CPUPercent),
+			"cpu-protect-002")
+	} else {
+		g.eventBus.PublishAlert(types.AlertWarning, "resource",
+			fmt.Sprintf("CPU超限Kill失败: %s (PID %d)", p.Name, p.PID),
+			fmt.Sprintf("终止进程失败: %v", killErr),
 			"cpu-protect-002")
 	}
+	g.cpuTracker.Reset(p.PID)
+	return success
 }
 
 // checkMemoryLeaks detects memory leak patterns.
@@ -151,6 +224,12 @@ func (g *ResourceGuard) checkMemoryLeaks(procs []types.ProcessInfo) {
 			if s.timestamp.After(oneHourAgo) {
 				recent = append(recent, s)
 			}
+		}
+		if len(recent) == 0 {
+			// 该 PID 一小时内已无有效样本——删除条目本身。
+			// 原实现只裁剪样本不删 key，PID 不断回收导致 memHistory 无限增长。
+			delete(g.memHistory, p.PID)
+			continue
 		}
 		g.memHistory[p.PID] = recent
 
@@ -743,4 +822,141 @@ func (g *ResourceGuard) SetDiskThresholds(warning, critical, emergency float64) 
 	g.diskWarning = warning
 	g.diskCritical = critical
 	g.diskEmergency = emergency
+}
+
+// ============================================================
+// A6: 进程爆炸检测（Process Explosion / Fork Bomb）
+// 检测同一程序产生大量进程实例的场景：
+//   - Python 脚本无限循环 fork/subprocess
+//   - 程序不断重启产生大量僵尸子进程
+//   - 恶意 fork bomb
+// 当同一进程名/命令行出现超过阈值时，自动终止多余的进程实例
+// ============================================================
+
+// procExplosionThreshold 同一程序允许的最大并发进程数
+const procExplosionThreshold = 30
+
+// procExplosionKillCount 检测到进程爆炸时，保留多少个进程不杀（保留最早启动的）
+const procExplosionKeepAlive = 3
+
+// checkProcessExplosion 检测进程爆炸：同一程序产生大量进程实例
+func (g *ResourceGuard) checkProcessExplosion(procs []types.ProcessInfo) {
+	// 按进程名+命令行分组统计
+	type procGroup struct {
+		name    string
+		cmdline string
+		pids    []types.ProcessInfo
+	}
+	groups := make(map[string]*procGroup)
+	for _, p := range procs {
+		if p.IsSystem {
+			continue
+		}
+		// 跳过系统关键进程
+		if isSystemCritical(p.Name) {
+			continue
+		}
+		// 跳过宝塔保护进程
+		if procInfo := safety.ReadProcInfo(p.PID); procInfo != nil && safety.IsBaotaProtectedProcess(procInfo) {
+			continue
+		}
+		// 用命令行的前 200 字符作为分组键（区分不同脚本）
+		cmdKey := p.Cmdline
+		if len(cmdKey) > 200 {
+			cmdKey = cmdKey[:200]
+		}
+		// 如果命令行为空，用进程名
+		if cmdKey == "" {
+			cmdKey = p.Name
+		}
+		key := p.Name + "|" + cmdKey
+		if g, ok := groups[key]; ok {
+			g.pids = append(g.pids, p)
+		} else {
+			groups[key] = &procGroup{name: p.Name, cmdline: cmdKey, pids: []types.ProcessInfo{p}}
+		}
+	}
+
+	for _, grp := range groups {
+		if len(grp.pids) <= procExplosionThreshold {
+			continue
+		}
+
+		// 进程爆炸检测到：同一程序超过阈值的进程实例
+		excess := len(grp.pids) - procExplosionKeepAlive
+		g.eventBus.PublishAlert(types.AlertCritical, "resource",
+			fmt.Sprintf("进程爆炸: %s (%d 个实例)", grp.name, len(grp.pids)),
+			fmt.Sprintf("程序 %s 当前运行 %d 个进程实例，远超正常水平（阈值 %d）。\n"+
+				"这可能导致系统资源耗尽、数据库连接池占满等严重问题。\n"+
+				"命令行: %s\n"+
+				"正在自动终止 %d 个多余进程（保留 %d 个最早启动的）...",
+				grp.name, len(grp.pids), procExplosionThreshold,
+				truncateStr(grp.cmdline, 100), excess, procExplosionKeepAlive),
+			"proc-explosion-001")
+
+		// 按 CreateTime 排序，保留最早启动的 procExplosionKeepAlive 个
+		sortedProcs := make([]types.ProcessInfo, len(grp.pids))
+		copy(sortedProcs, grp.pids)
+		// 简单插入排序（按启动时间升序）
+		for i := 1; i < len(sortedProcs); i++ {
+			for j := i; j > 0; j-- {
+				if sortedProcs[j].CreateTime.Before(sortedProcs[j-1].CreateTime) {
+					sortedProcs[j], sortedProcs[j-1] = sortedProcs[j-1], sortedProcs[j]
+				}
+			}
+		}
+		// 终止多余的进程（从第 procExplosionKeepAlive 个开始）
+		killed := 0
+		failed := 0
+		for i := procExplosionKeepAlive; i < len(sortedProcs); i++ {
+			p := sortedProcs[i]
+			// 再次检查安全策略（可能在检测期间状态变化）
+			if g.safety != nil {
+				if g.safety.ShouldPauseDangerousActions() {
+					break
+				}
+				if g.safety.IsWhitelisted(p.Name) || isSystemCritical(p.Name) {
+					continue
+				}
+				if procInfo := safety.ReadProcInfo(p.PID); procInfo != nil && safety.IsBaotaProtectedProcess(procInfo) {
+					continue
+				}
+				if err := g.safety.CheckKillPermission(p.Name, p.PID); err != nil {
+					continue
+				}
+			}
+			// 先 SIGTERM，给进程优雅退出的机会
+			proc := process.Process{Pid: p.PID}
+			err := proc.Terminate()
+			if err == nil {
+				killed++
+				if g.safety != nil {
+					g.safety.RecordKill(p.PID, p.Name, true)
+				}
+			} else {
+				failed++
+				if g.safety != nil {
+					g.safety.RecordKill(p.PID, p.Name, false)
+				}
+			}
+		}
+
+		if killed > 0 {
+			g.eventBus.PublishAlert(types.AlertError, "resource",
+				fmt.Sprintf("进程爆炸已处置: %s", grp.name),
+				fmt.Sprintf("程序 %s 的 %d 个多余进程实例已终止（成功 %d，失败 %d）。\n"+
+					"保留了 %d 个最早启动的进程。\n"+
+					"建议检查程序是否存在循环 fork/subprocess 的 Bug，或配置进程数限制（如 supervisord numprocs）。",
+					grp.name, excess, killed, failed, procExplosionKeepAlive),
+				"proc-explosion-002")
+		}
+	}
+}
+
+// truncateStr 截断字符串到指定长度
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

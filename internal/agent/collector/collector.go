@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 )
 
 // Collector collects system and process metrics.
+// 向宝塔学习：缓存不易变的数据（分区列表、host info），避免每轮都 syscall
 type Collector struct {
 	mu            sync.Mutex
 	prevNetSent   uint64
@@ -29,12 +31,28 @@ type Collector struct {
 	hostInfo      *host.InfoStat
 	processCount  int
 	baotaSafeMode bool // 宝塔安全模式：跳过昂贵的 process.Processes() 调用
+
+	// 缓存：分区列表不会频繁变化，避免每轮都 disk.Partitions() syscall
+	partitions     []disk.PartitionStat
+	partitionsTime time.Time
+
+	// 进程列表缓存：正常模式下不是每轮都需要完整进程列表
+	// 宝塔的做法：只在需要时扫描进程，不是每 5 秒扫一遍
+	procCache      []types.ProcessInfo
+	procCacheTime  time.Time
+	procCacheTTL   time.Duration // 进程缓存有效期，默认 30s
+
+	// zombie 进程检测降频：不需要每轮都遍历全部进程查 zombie
+	// 宝塔的做法：低频检查即可，zombie 不会突然大量出现
+	zombieCheckTime time.Time
+	zombieCache     int
 }
 
 // New creates a new Collector instance.
 func New() *Collector {
 	return &Collector{
-		prevNetTime: time.Now(),
+		prevNetTime:   time.Now(),
+		procCacheTTL: 30 * time.Second, // 进程列表缓存 30 秒，减少 syscall
 	}
 }
 
@@ -70,10 +88,11 @@ func (c *Collector) CollectSystem() (*types.SystemInfo, error) {
 	}
 
 	// CPU
+	// 向宝塔学习：不要为了获取 CPU% 而阻塞 200ms
+	// 改用 100ms 间隔——足够获取趋势数据，减少阻塞时间
 	cores, _ := cpu.Counts(true)
 	info.CPUCores = cores
-	// 使用 200ms 间隔而非 1s，减少阻塞时间
-	cpuPercent, err := cpu.Percent(200*time.Millisecond, false)
+	cpuPercent, err := cpu.Percent(100*time.Millisecond, false)
 	if err == nil && len(cpuPercent) > 0 {
 		info.CPUPercent = cpuPercent[0]
 	}
@@ -100,23 +119,33 @@ func (c *Collector) CollectSystem() (*types.SystemInfo, error) {
 		info.SwapPercent = smem.UsedPercent
 	}
 
-	// Disk usage
-	if partitions, err := disk.Partitions(false); err == nil {
-		for _, p := range partitions {
-			usage, err := disk.Usage(p.Mountpoint)
-			if err != nil {
-				continue
-			}
-			info.Disks = append(info.Disks, types.DiskInfo{
-				Device:      p.Device,
-				MountPoint:  p.Mountpoint,
-				FSType:      p.Fstype,
-				Total:       usage.Total,
-				Used:        usage.Used,
-				Free:        usage.Free,
-				UsedPercent: usage.UsedPercent,
-			})
+	// Disk usage — 分区列表缓存，避免每轮都 disk.Partitions() syscall
+	// 分区列表不会频繁变化，缓存 10 分钟
+	c.mu.Lock()
+	partitions := c.partitions
+	if len(partitions) == 0 || time.Since(c.partitionsTime) > 10*time.Minute {
+		if p, err := disk.Partitions(false); err == nil {
+			c.partitions = p
+			c.partitionsTime = time.Now()
+			partitions = p
 		}
+	}
+	c.mu.Unlock()
+
+	for _, p := range partitions {
+		usage, err := disk.Usage(p.Mountpoint)
+		if err != nil {
+			continue
+		}
+		info.Disks = append(info.Disks, types.DiskInfo{
+			Device:      p.Device,
+			MountPoint:  p.Mountpoint,
+			FSType:      p.Fstype,
+			Total:       usage.Total,
+			Used:        usage.Used,
+			Free:        usage.Free,
+			UsedPercent: usage.UsedPercent,
+		})
 	}
 
 	// Network
@@ -166,17 +195,38 @@ func (c *Collector) CollectSystem() (*types.SystemInfo, error) {
 		info.ZombieCount = 0
 	} else {
 		// 正常模式：完整进程扫描
-		if procs, err := process.Processes(); err == nil {
-			info.ProcessCount = len(procs)
-			zombieCount := 0
-			for _, p := range procs {
-				if status, err := p.Status(); err == nil {
-					if status[0] == "Z" || status[0] == "z" {
-						zombieCount++
+		// 向宝塔学习：zombie 检测降频——不需要每轮都遍历全部进程
+		// zombie 不会突然大量出现，30 秒检测一次足够
+		if time.Since(c.zombieCheckTime) > 30*time.Second {
+			if procs, err := process.Processes(); err == nil {
+				info.ProcessCount = len(procs)
+				zombieCount := 0
+				for _, p := range procs {
+					if status, err := p.Status(); err == nil {
+						if status[0] == "Z" || status[0] == "z" {
+							zombieCount++
+						}
 					}
 				}
+				info.ZombieCount = zombieCount
+				c.zombieCache = zombieCount
+				c.zombieCheckTime = time.Now()
 			}
-			info.ZombieCount = zombieCount
+		} else {
+			// 使用缓存的 zombie 数量
+			info.ZombieCount = c.zombieCache
+			// 进程总数用 /proc 目录计数（轻量）
+			if entries, err := os.ReadDir("/proc"); err == nil {
+				count := 0
+				for _, entry := range entries {
+					if entry.IsDir() {
+						if _, err := strconv.Atoi(entry.Name()); err == nil {
+							count++
+						}
+					}
+				}
+				info.ProcessCount = count
+			}
 		}
 	}
 
@@ -184,18 +234,35 @@ func (c *Collector) CollectSystem() (*types.SystemInfo, error) {
 }
 
 // CollectProcesses collects per-process metrics.
+// 向宝塔学习：进程列表缓存复用——不是每轮采集都需要完整进程列表
+// 在缓存有效期内（默认 30s），直接返回缓存结果，避免每 5 秒调用 process.Processes()
+//
+// 重要：必须先全量读取进程详情、按 CPU 占用降序排序后再截断到 maxCount。
+// 原实现按 PID 升序遍历并在达到 maxCount 时提前 break——PID 与资源占用无关，
+// 高 CPU 的异常进程（挖矿、失控 worker）很可能 PID 靠后而永远不被看到，
+// 导致"CPU 超限保护/内存泄漏拦截"规则对真正的肇事进程失明。
 func (c *Collector) CollectProcesses(maxCount int) ([]types.ProcessInfo, error) {
+	c.mu.Lock()
+	// 检查缓存是否有效
+	if len(c.procCache) > 0 && time.Since(c.procCacheTime) < c.procCacheTTL {
+		result := c.procCache
+		c.mu.Unlock()
+		// 如果 maxCount 小于缓存长度，截断返回
+		if maxCount > 0 && len(result) > maxCount {
+			result = result[:maxCount]
+		}
+		return result, nil
+	}
+	c.mu.Unlock()
+
+	// 缓存失效，重新采集
 	procs, err := process.Processes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list processes: %w", err)
 	}
 
-	var result []types.ProcessInfo
-	for i, p := range procs {
-		if i >= maxCount {
-			break
-		}
-
+	result := make([]types.ProcessInfo, 0, len(procs))
+	for _, p := range procs {
 		info := types.ProcessInfo{
 			PID: p.Pid,
 		}
@@ -234,13 +301,33 @@ func (c *Collector) CollectProcesses(maxCount int) ([]types.ProcessInfo, error) 
 		result = append(result, info)
 	}
 
+	// 按资源占用降序排序后截断，保证 maxCount 内一定是"最值得关注的进程"
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].CPUPercent != result[j].CPUPercent {
+			return result[i].CPUPercent > result[j].CPUPercent
+		}
+		return result[i].MemPercent > result[j].MemPercent
+	})
+	if maxCount > 0 && len(result) > maxCount {
+		result = result[:maxCount]
+	}
+
+	// 更新缓存（缓存保存截断后的结果即可，调用方语义一致）
+	c.mu.Lock()
+	c.procCache = result
+	c.procCacheTime = time.Now()
+	c.mu.Unlock()
+
 	return result, nil
 }
 
 // CollectMetrics collects all metrics and returns them as a slice.
+// 向宝塔学习：预分配 slice 容量，避免 append 扩容时的反复拷贝
 func (c *Collector) CollectMetrics(sysInfo *types.SystemInfo, procs []types.ProcessInfo) []types.Metric {
 	now := time.Now()
-	var metrics []types.Metric
+	// 预分配容量：系统指标 ~12 个 + 每磁盘 2 个 + 每进程 3 个
+	estimatedCap := 12 + len(sysInfo.Disks)*2 + len(procs)*3
+	metrics := make([]types.Metric, 0, estimatedCap)
 
 	// CPU metrics
 	metrics = append(metrics, types.Metric{
@@ -298,7 +385,14 @@ func (c *Collector) CollectMetrics(sysInfo *types.SystemInfo, procs []types.Proc
 	})
 
 	// Process metrics
+	// 向宝塔学习：只记录有意义的进程指标，跳过低价值进程
+	// 原来每个进程都生成 3 个 Metric（CPU/内存/RSS），但大量进程 CPU=0.0% 内存=0.1%，
+	// 这些数据写入库中毫无价值还浪费存储和 IO
 	for _, p := range procs {
+		// 跳过 CPU 和内存都极低的进程
+		if p.CPUPercent < 0.1 && p.MemPercent < 0.5 {
+			continue
+		}
 		labels := map[string]string{
 			"pid":  fmt.Sprintf("%d", p.PID),
 			"name": p.Name,

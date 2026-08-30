@@ -78,6 +78,11 @@ func (e *Executor) ExecuteAction(ctx context.Context, rule *types.Rule, action t
 	snapshot := e.createSnapshot(action, target)
 
 	// Execute the action with timeout
+	// 防御：自定义规则可能漏配 Timeout——context.WithTimeout(ctx, 0) 会立即过期，
+	// 所有动作都会以"context deadline exceeded"莫名失败
+	if action.Timeout <= 0 {
+		action.Timeout = 60 * time.Second
+	}
 	actionCtx, cancel := context.WithTimeout(ctx, action.Timeout)
 	defer cancel()
 

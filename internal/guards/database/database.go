@@ -373,6 +373,8 @@ func (g *DatabaseGuard) checkMySQLDeep(ctx context.Context, inst DBInstance) {
 }
 
 // checkMySQLConnections checks current vs max connections.
+// 当连接数超过阈值时，按 Host 分组统计，找出占用连接最多的来源，
+// 便于定位是哪个程序/进程在耗尽连接池。
 func (g *DatabaseGuard) checkMySQLConnections(ctx context.Context, db *sql.DB, inst DBInstance) {
 	var maxConn int
 	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'max_connections'").Scan(&maxConn)
@@ -402,18 +404,75 @@ func (g *DatabaseGuard) checkMySQLConnections(ctx context.Context, db *sql.DB, i
 		if pct > 90 {
 			level = types.AlertCritical
 		}
+
+		// 按来源 Host 分组统计连接数，找出连接消耗大户
+		hostStats := g.getMySQLConnectionByHost(ctx, db)
+
+		detail := fmt.Sprintf("MySQL %s 连接数 %d/%d (%.1f%%)\n", inst.Name, current, maxConn, pct)
+
+		if len(hostStats) > 0 {
+			detail += "\n连接来源统计（按连接数降序）:\n"
+			shown := 0
+			for _, hs := range hostStats {
+				if shown >= 5 {
+					detail += fmt.Sprintf("  ...等共 %d 个来源\n", len(hostStats))
+					break
+				}
+				detail += fmt.Sprintf("  %s: %d 个连接\n", hs.host, hs.count)
+				shown++
+			}
+			// 如果单个来源占用超过 50% 的连接，给出强提示
+			topHost := hostStats[0]
+			if topHost.count > current/2 {
+				detail += fmt.Sprintf("\n⚠️ 来源 %s 占用了 %d/%d 连接（%.0f%%），疑似进程失控\n",
+					topHost.host, topHost.count, current, float64(topHost.count)/float64(current)*100)
+				detail += "建议执行: ps aux | grep <对应程序> 查看进程数，考虑 kill 或重启\n"
+			}
+		}
+
+		detail += "\n排查建议:\n" +
+			"  1. 查看活跃连接: SHOW PROCESSLIST;\n" +
+			"  2. 查看Sleep连接: SELECT * FROM information_schema.processlist WHERE Command='Sleep' AND Time > 60;\n" +
+			"  3. 检查应用连接池配置 (maxPoolSize, idleTimeout)\n" +
+			"  4. 如需调高: SET GLOBAL max_connections = 500;  (临时)\n" +
+			"     永久: 修改 my.cnf 的 max_connections"
+
 		g.eventBus.PublishAlert(level, "database",
 			fmt.Sprintf("MySQL连接数过高: %s", inst.Name),
-			fmt.Sprintf("MySQL %s 连接数 %d/%d (%.1f%%)\n\n"+
-				"排查建议:\n"+
-				"  1. 查看活跃连接: SHOW PROCESSLIST;\n"+
-				"  2. 查看Sleep连接: SELECT * FROM information_schema.processlist WHERE Command='Sleep' AND Time > 60;\n"+
-				"  3. 检查应用连接池配置 (maxPoolSize, idleTimeout)\n"+
-				"  4. 如需调高: SET GLOBAL max_connections = 500;  (临时)\n"+
-				"     永久: 修改 my.cnf 的 max_connections",
-				inst.Name, current, maxConn, pct),
+			detail,
 			"db-mysql-conn-001")
 	}
+}
+
+// hostConnStat 按 Host 分组的连接统计
+type hostConnStat struct {
+	host  string
+	count int
+}
+
+// getMySQLConnectionByHost 查询 SHOW PROCESSLIST 按 Host 分组统计连接数
+func (g *DatabaseGuard) getMySQLConnectionByHost(ctx context.Context, db *sql.DB) []hostConnStat {
+	rows, err := db.QueryContext(ctx, `
+		SELECT SUBSTRING_INDEX(HOST, ':', 1) AS source_host, COUNT(*) AS cnt
+		FROM information_schema.processlist
+		GROUP BY source_host
+		ORDER BY cnt DESC
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var stats []hostConnStat
+	for rows.Next() {
+		var host string
+		var count int
+		if err := rows.Scan(&host, &count); err != nil {
+			continue
+		}
+		stats = append(stats, hostConnStat{host: host, count: count})
+	}
+	return stats
 }
 
 // checkMySQLSlowQueries checks for slow queries running right now.

@@ -586,9 +586,9 @@ func (g *CertGuard) RenewCertificate(ctx context.Context, domain string) error {
 			g.recordAction("renew_cert", domain, fmt.Sprintf("手动续期成功(ACME): %s", domain), true, "")
 			return nil
 		} else {
-			g.recordAudit("renew_cert", domain, fmt.Sprintf("手动续期失败: %v", err), "failed", "宝塔API和ACME均失败")
+			g.recordAudit("renew_cert", domain, fmt.Sprintf("手动续期失败: %v", err), "failed", "宝塔API和ACME均失败（已尝试自动安装acme.sh）")
 			g.recordAction("renew_cert", domain, fmt.Sprintf("手动续期失败: %s", domain), false, err.Error())
-			return fmt.Errorf("宝塔API和ACME续期均失败，请通过宝塔面板手动续期 %s（宝塔→网站→SSL→重新申请）", domain)
+			return fmt.Errorf("宝塔API和ACME续期均失败（已尝试自动安装acme.sh），请检查: 1.80/443端口是否开放 2.域名是否解析到本机 3.网络是否通畅（域名: %s）", domain)
 		}
 	}
 
@@ -674,12 +674,12 @@ func (g *CertGuard) attemptRenewal(ctx context.Context, cert types.CertInfo) {
 			g.clearRenewalFailure(cert.Domain)
 			return
 		}
-		// ACME 也失败了
+		// ACME 也失败了（此时 acme.sh 已尝试自动安装，但仍失败）
 		g.eventBus.PublishAlert(types.AlertCritical, "cert",
-			fmt.Sprintf("[安全保护模式] 证书续期需手动处理: %s", cert.Domain),
-			fmt.Sprintf("证书 %s 剩余 %d 天。宝塔API续期失败（可能API未开启），ACME续期也失败: %v。\n请通过宝塔面板→站点→SSL手动续期，或开启宝塔API。", cert.Domain, cert.DaysUntilExpiry, acmeErr),
+			fmt.Sprintf("证书续期失败: %s", cert.Domain),
+			fmt.Sprintf("证书 %s 剩余 %d 天。宝塔API续期失败，ACME续期也失败（已尝试自动安装 acme.sh）: %v\n可能原因: 1. 80/443端口未开放 2. 域名解析未指向本机 3. 网络不通\n手动续期方法: 登录宝塔面板→网站→SSL→重新申请", cert.Domain, cert.DaysUntilExpiry, acmeErr),
 			"cert-renew-001")
-		g.recordAudit("renew_cert", cert.Domain, fmt.Sprintf("续期全部失败（剩余 %d 天）: %v", cert.DaysUntilExpiry, acmeErr), "failed", "宝塔API和ACME均失败，需手动处理")
+		g.recordAudit("renew_cert", cert.Domain, fmt.Sprintf("续期全部失败（剩余 %d 天）: %v", cert.DaysUntilExpiry, acmeErr), "failed", "宝塔API和ACME均失败（已尝试自动安装acme.sh）")
 		g.recordAction("renew_cert", cert.Domain, fmt.Sprintf("续期失败: %s", cert.Domain), false, acmeErr.Error())
 		return
 	}
@@ -706,7 +706,7 @@ func (g *CertGuard) attemptRenewal(ctx context.Context, cert types.CertInfo) {
 	// Path 3: Full alert with manual instructions + 入失败队列
 	g.eventBus.PublishAlert(types.AlertCritical, "cert",
 		fmt.Sprintf("续期失败: %s", cert.Domain),
-		fmt.Sprintf("证书 %s 自动续期失败！请手动续期。ACME错误: %v。手动续期: 1.登录宝塔→站点→SSL→重新申请 2.或使用: acme.sh --issue -d %s --nginx", cert.Domain, err, cert.Domain),
+		fmt.Sprintf("证书 %s 自动续期失败！已尝试自动安装 acme.sh。ACME错误: %v\n可能原因: 1. 80/443端口未开放 2. 域名解析未指向本机 3. 网络不通\n手动续期: 登录宝塔→网站→SSL→重新申请", cert.Domain, err),
 		"cert-renew-001")
 	g.recordAudit("renew_cert", cert.Domain, fmt.Sprintf("自动续期全部失败（剩余 %d 天）: %v", cert.DaysUntilExpiry, err), "failed", "已加入失败队列，稍后自动重试")
 	g.recordAction("renew_cert", cert.Domain, fmt.Sprintf("续期失败: %s", cert.Domain), false, err.Error())
@@ -765,75 +765,135 @@ func (g *CertGuard) renewViaACME(ctx context.Context, domain string) error {
 			fmt.Sprintf("使用 %s 续期 %s 失败: %v", ca, domain, err),
 			"cert-renew-001")
 	}
-	// 所有 CA 都失败，说明服务器缺少 ACME 客户端，用 Error 级别
+	// 所有 CA 都失败，说明 acme.sh 安装失败或网络问题
 	g.eventBus.PublishAlert(types.AlertError, "cert",
 		fmt.Sprintf("证书续期全部失败: %s", domain),
-		fmt.Sprintf("所有 CA 均续期失败，请安装 acme.sh 或 certbot，或通过宝塔面板手动续期。域名: %s", domain),
+		fmt.Sprintf("所有 CA 均续期失败（已尝试自动安装 acme.sh）。域名: %s\n可能原因: 1. 80/443端口未开放 2. 域名解析未指向本机 3. 网络不通", domain),
 		"cert-renew-001")
 	return fmt.Errorf("all CAs failed for %s", domain)
 }
 
 // tryACMEWithCA attempts ACME renewal with a specific CA.
+// 如果 acme.sh 不存在，自动安装它（和宝塔面板手动申请证书时做的一样）。
 func (g *CertGuard) tryACMEWithCA(ctx context.Context, domain, ca string) error {
 	// Find acme.sh — check PATH first, then common BaoTa install locations
-	acmeSh, err := exec.LookPath("acme.sh")
-	if err != nil {
-		// Check common BaoTa install locations
-		acmePaths := []string{
-			"/www/server/acme.sh/acme.sh",
-			"/root/.acme.sh/acme.sh",
-			os.ExpandEnv("$HOME/.acme.sh/acme.sh"),
-			"/usr/local/acme.sh/acme.sh",
-		}
-		for _, p := range acmePaths {
-			if _, statErr := os.Stat(p); statErr == nil {
-				acmeSh = p
-				err = nil
-				break
+	acmeSh := findAcmeSh()
+
+	if acmeSh == "" {
+		// acme.sh 不存在 → 自动安装（就像宝塔面板第一次申请证书时做的那样）
+		g.eventBus.PublishAlert(types.AlertInfo, "cert",
+			fmt.Sprintf("自动安装 acme.sh 以续期 %s", domain),
+			fmt.Sprintf("服务器未安装 acme.sh/certbot，ServerGuard 正在自动安装 acme.sh 以完成证书续期。域名: %s", domain),
+			"cert-renew-001")
+
+		installed, installErr := g.installAcmeSh(ctx)
+		if installErr != nil || !installed {
+			// acme.sh 安装失败，尝试 certbot
+			if certbot, err := exec.LookPath("certbot"); err == nil {
+				cmd := exec.CommandContext(ctx, certbot, "renew", "--cert-name", domain, "--quiet")
+				if err := cmd.Run(); err != nil {
+					return fmt.Errorf("certbot renew failed: %v", err)
+				}
+				return nil
 			}
+			return fmt.Errorf("acme.sh 自动安装失败: %v（certbot 也不可用），请手动安装: curl https://get.acme.sh | sh", installErr)
+		}
+
+		// 安装成功后重新查找
+		acmeSh = findAcmeSh()
+		if acmeSh == "" {
+			return fmt.Errorf("acme.sh 安装完成但未找到可执行文件")
 		}
 	}
 
-	if err == nil {
-		// Use acme.sh via sh -c for better compatibility
-		var acmeCmd string
-		switch ca {
-		case "lets_encrypt":
-			acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server letsencrypt", acmeSh, domain)
-		case "zerossl":
-			acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server zerossl", acmeSh, domain)
-		case "trustasia":
-			acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server trustasia", acmeSh, domain)
-		case "buypass":
-			acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server buypass", acmeSh, domain)
-		default:
-			acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx", acmeSh, domain)
-		}
-		cmd := exec.CommandContext(ctx, "sh", "-c", acmeCmd)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("acme.sh failed: %v, output: %s", err, string(output))
-		}
-		// Install the certificate to BaoTa's cert directory
-		installCmdStr := fmt.Sprintf("%s --install-cert -d %s --key-file /www/server/panel/vhost/cert/%s/privkey.pem --fullchain-file /www/server/panel/vhost/cert/%s/fullchain.pem",
-			acmeSh, domain, domain, domain)
-		installCmd := exec.CommandContext(ctx, "sh", "-c", installCmdStr)
-		if output, err := installCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("install cert failed: %v, output: %s", err, string(output))
-		}
-		return nil
+	// Use acme.sh via sh -c for better compatibility
+	var acmeCmd string
+	switch ca {
+	case "lets_encrypt":
+		acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server letsencrypt", acmeSh, domain)
+	case "zerossl":
+		acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server zerossl", acmeSh, domain)
+	case "trustasia":
+		acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server trustasia", acmeSh, domain)
+	case "buypass":
+		acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx --server buypass", acmeSh, domain)
+	default:
+		acmeCmd = fmt.Sprintf("%s --issue -d %s --nginx", acmeSh, domain)
+	}
+	cmd := exec.CommandContext(ctx, "sh", "-c", acmeCmd)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("acme.sh failed: %v, output: %s", err, string(output))
 	}
 
-	// Try certbot if available
-	certbot, err := exec.LookPath("certbot")
-	if err == nil {
-		cmd := exec.CommandContext(ctx, certbot, "renew", "--cert-name", domain, "--quiet")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("certbot renew failed: %v", err)
+	// Install the certificate to BaoTa's cert directory (if BaoTa exists)
+	installCmdStr := fmt.Sprintf("%s --install-cert -d %s --key-file /www/server/panel/vhost/cert/%s/privkey.pem --fullchain-file /www/server/panel/vhost/cert/%s/fullchain.pem",
+		acmeSh, domain, domain, domain)
+	installCmd := exec.CommandContext(ctx, "sh", "-c", installCmdStr)
+	if _, err := installCmd.CombinedOutput(); err != nil {
+		// 安装到宝塔目录失败不是致命错误（可能不是宝塔环境），证书已在 acme.sh 默认目录
+			g.eventBus.PublishAlert(types.AlertWarning, "cert",
+				fmt.Sprintf("证书安装到宝塔目录失败: %s", domain),
+				fmt.Sprintf("acme.sh 已签发证书但安装到宝塔目录失败: %v。证书已保存在 acme.sh 默认目录。", err),
+				"cert-renew-001")
+	} else {
+		// 安装成功后 reload nginx
+		reloadCmd := exec.CommandContext(ctx, "sh", "-c", "nginx -s reload 2>/dev/null || /etc/init.d/nginx reload 2>/dev/null || true")
+		reloadCmd.Run()
+	}
+	return nil
+}
+
+// findAcmeSh 查找 acme.sh 可执行文件路径。
+// 按 PATH → 宝塔安装路径 → 常见路径顺序查找。
+func findAcmeSh() string {
+	// Check PATH first
+	if acmeSh, err := exec.LookPath("acme.sh"); err == nil {
+		return acmeSh
+	}
+	// Check common BaoTa install locations
+	acmePaths := []string{
+		"/www/server/acme.sh/acme.sh",
+		"/root/.acme.sh/acme.sh",
+		os.ExpandEnv("$HOME/.acme.sh/acme.sh"),
+		"/usr/local/acme.sh/acme.sh",
+	}
+	for _, p := range acmePaths {
+		if _, statErr := os.Stat(p); statErr == nil {
+			return p
 		}
-		return nil
+	}
+	return ""
+}
+
+// installAcmeSh 自动安装 acme.sh（和宝塔面板第一次申请证书时的行为一致）。
+// 安装方式: curl https://get.acme.sh | sh
+// 安装到 /root/.acme.sh/（acme.sh 官方默认位置）
+func (g *CertGuard) installAcmeSh(ctx context.Context) (bool, error) {
+	// 检查 curl 或 wget
+	var installCmd *exec.Cmd
+	if _, err := exec.LookPath("curl"); err == nil {
+		installCmd = exec.CommandContext(ctx, "sh", "-c", "curl -sSL https://get.acme.sh | sh -s -- --install-all")
+	} else if _, err := exec.LookPath("wget"); err == nil {
+		installCmd = exec.CommandContext(ctx, "sh", "-c", "wget -qO- https://get.acme.sh | sh -s -- --install-all")
+	} else {
+		return false, fmt.Errorf("curl 和 wget 都不可用")
 	}
 
-	return fmt.Errorf("no ACME client found (tried acme.sh in PATH and /www/server/acme.sh, ~/.acme.sh; also tried certbot)")
+	output, err := installCmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("安装失败: %v, 输出: %s", err, string(output))
+	}
+
+	// 验证安装成功
+	if acmeSh := findAcmeSh(); acmeSh != "" {
+		g.eventBus.PublishAlert(types.AlertInfo, "cert",
+			"acme.sh 安装成功",
+			fmt.Sprintf("acme.sh 已成功安装到 %s，将自动用于证书申请/续期。", findAcmeSh()),
+			"cert-renew-001")
+		return true, nil
+	}
+
+	return false, fmt.Errorf("安装命令执行完成但未找到 acme.sh 可执行文件")
 }
 
 // reloadNginx reloads Nginx to pick up new certificates.

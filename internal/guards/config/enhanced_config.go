@@ -131,7 +131,7 @@ func (m *ConfigBackupManager) Rollback(filePath, commitID string) error {
 	backupPath := filepath.Join(m.backupDir, filepath.Base(filePath)+"."+commitID)
 	content, err := os.ReadFile(backupPath)
 	if err != nil {
-		return fmt.Errorf("backup not found: %w", err)
+		return fmt.Errorf("备份未找到: %w", err)
 	}
 	return os.WriteFile(filePath, content, 0644)
 }

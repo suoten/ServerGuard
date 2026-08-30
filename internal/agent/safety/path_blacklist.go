@@ -48,6 +48,25 @@ var CleanupWhitelist = []string{
 	// ── 临时目录（仅清理旧压缩文件，通过 ProtectedPatterns 保护会话文件） ──
 	"/tmp",
 	"/var/tmp",
+
+	// ── Java 应用日志目录（自动发现，用于紧急清理 Java 暴日志场景） ──
+	// wvp-gb28181-pro 等Java应用常见日志路径
+	"/opt/wvp/logs",
+	"/opt/wvp-pro/logs",
+	"/opt/wvp-gb28181-pro/logs",
+	"/opt/mediakit/logs",
+	"/opt/zlm/logs",
+	"/opt/zlmediakit/logs",
+	// 通用 Java 应用日志
+	"/var/log/java",
+	"/var/log/wvp",
+	"/var/log/zlm",
+	// Spring Boot / 通用 Java 应用
+	"/opt/app/logs",
+	"/opt/app/log",
+
+	// ── systemd journal 日志（紧急时通过 journalctl vacuum 清理） ──
+	"/var/log/journal",
 }
 
 // ------------------------------------------------------------
@@ -153,8 +172,13 @@ var CleanupForbiddenExtensions = []string{
 
 // CleanupAllowedExtensions 磁盘清理仅允许删除的文件扩展名。
 // 只有这些扩展名的文件才会被清理（旧轮转日志和压缩包）。
+// 注意：活跃的 .log 文件不在此列表中（不直接删除），
+// 但在紧急情况下会通过 copytruncate 策略安全截断（见 EmergencyLogCleaner）。
 var CleanupAllowedExtensions = []string{
 	".gz", ".1", ".old", ".bz2", ".xz", ".zip",
+	// Java 应用轮转日志
+	".log.gz", ".log.1", ".log.old",
+	".out.gz", ".out.1", ".out.old",
 }
 
 // ============================================================

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
@@ -178,6 +179,7 @@ func (a *API) analyzeRedisKeys(c *gin.Context) {
 // ═════ 网络质量地图 ═════
 
 // getNetQuality GET /api/netquality — 获取最近的网络质量报告
+// 如果探测正在进行中，返回 "running" 状态让前端继续轮询
 func (a *API) getNetQuality(c *gin.Context) {
 	a.mu.RLock()
 	mon := a.netQualityMon
@@ -186,25 +188,92 @@ func (a *API) getNetQuality(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "网络质量监控器未初始化"})
 		return
 	}
-	report := mon.GetLastReport()
-	if report == nil {
-		c.JSON(http.StatusOK, gin.H{"message": "尚未执行探测", "report": nil})
+
+	// 先检查异步探测状态
+	a.mu.RLock()
+	running := a.netProbeRunning
+	a.mu.RUnlock()
+	if running {
+		c.JSON(http.StatusOK, gin.H{"status": "running", "message": "探测正在进行中"})
 		return
 	}
-	c.JSON(http.StatusOK, report)
+
+	// 优先返回异步探测结果（最新），否则回退到 Monitor 自己缓存的结果
+	a.mu.RLock()
+	asyncReport := a.netProbeResult
+	asyncErr := a.netProbeErr
+	asyncTime := a.netProbeTime
+	a.mu.RUnlock()
+
+	if asyncReport != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "completed",
+			"report":    asyncReport,
+			"timestamp": asyncTime,
+			"error":     asyncErr,
+		})
+		return
+	}
+
+	// 回退到 Monitor 内部缓存
+	report := mon.GetLastReport()
+	if report == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "idle", "message": "尚未执行探测", "report": nil})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "completed", "report": report})
 }
 
-// probeNetQuality POST /api/netquality/probe — 手动触发网络质量探测
+// probeNetQuality POST /api/netquality/probe — 触发网络质量探测（异步）
+// 探测涉及多次 ping + traceroute，耗时可能超过 60 秒，
+// 同步执行会导致 Hub WriteTimeout 30s → 502
+// 改为：POST 立即返回 "started"，前端轮询 GET /api/netquality 获取结果
 func (a *API) probeNetQuality(c *gin.Context) {
-	a.mu.RLock()
+	a.mu.Lock()
 	mon := a.netQualityMon
-	a.mu.RUnlock()
 	if mon == nil {
+		a.mu.Unlock()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "网络质量监控器未初始化"})
 		return
 	}
-	report := mon.Probe()
-	c.JSON(http.StatusOK, report)
+
+	// 如果探测正在进行中，返回当前状态
+	if a.netProbeRunning {
+		a.mu.Unlock()
+		c.JSON(http.StatusConflict, gin.H{
+			"status":  "running",
+			"message": "探测正在进行中，请稍后获取结果",
+		})
+		return
+	}
+
+	// 标记为运行中，启动异步探测
+	a.netProbeRunning = true
+	a.netProbeErr = ""
+	a.mu.Unlock()
+
+	go func() {
+		defer func() {
+			a.mu.Lock()
+			a.netProbeRunning = false
+			a.netProbeTime = time.Now()
+			a.mu.Unlock()
+		}()
+
+		// 手动触发的探测同样限时，防止网络故障时 goroutine 长期占用资源
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer probeCancel()
+		report := mon.Probe(probeCtx)
+
+		a.mu.Lock()
+		a.netProbeResult = report
+		a.mu.Unlock()
+	}()
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":  "started",
+		"message": "探测已启动，请轮询 GET /api/netquality 获取结果",
+	})
 }
 
 // getNetQualityTargets GET /api/netquality/targets — 获取探测目标列表

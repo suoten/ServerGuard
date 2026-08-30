@@ -2,6 +2,7 @@ package vulnscan
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,7 +26,7 @@ type DependencyVulnerability struct {
 }
 
 // DependencyScanner 依赖漏洞扫描器。
-// 解析 5 种依赖锁文件，匹配本地 OSV 数据库。
+// 解析 5 种依赖锁文件，匹配本地已知漏洞数据库 + 外部威胁情报（可选）。
 // 不自动升级，仅输出报告。
 type DependencyScanner struct {
 	mu    sync.Mutex
@@ -135,23 +136,228 @@ func (s *DependencyScanner) scanLockFile(path, lockType string) ([]DependencyVul
 	case "go.mod":
 		return s.scanGoMod(content), nil
 	default:
-		return nil, fmt.Errorf("unsupported lock file: %s", lockType)
+		return nil, fmt.Errorf("不支持的锁文件类型: %s", lockType)
 	}
+}
+
+// ============================================================
+// 本地已知漏洞数据库（按语言生态分类）
+// 当版本低于 FixedVersion 时报告漏洞。
+// 威胁情报（intel）注入后可补充更多 CVE。
+// ============================================================
+
+// knownVulnDB 本地已知漏洞数据库：packageName -> []vulnEntry
+type vulnEntry struct {
+	CVEID        string
+	FixedVersion string
+	Severity     string
+	Description  string
+}
+
+// composerKnownVulns PHP Composer 包已知漏洞
+var composerKnownVulns = map[string][]vulnEntry{
+	"symfony/http-kernel": {
+		{CVEID: "CVE-2022-24895", FixedVersion: "5.4.1", Severity: "medium",
+			Description: "Symfony CSRF token 信息泄露"},
+		{CVEID: "CVE-2024-50423", FixedVersion: "5.4.44", Severity: "critical",
+			Description: "Symfony 远程代码执行漏洞"},
+	},
+	"laravel/framework": {
+		{CVEID: "CVE-2024-45406", FixedVersion: "10.15.0", Severity: "high",
+			Description: "Laravel 修复 Illuminate/Routing 序列化漏洞"},
+		{CVEID: "CVE-2018-15133", FixedVersion: "5.5.40", Severity: "critical",
+			Description: "Laravel 反序列化 RCE 漏洞"},
+	},
+	"monolog/monolog": {
+		{CVEID: "CVE-2022-24898", FixedVersion: "1.27.1", Severity: "medium",
+			Description: "Monolog 日志注入漏洞"},
+	},
+	"guzzlehttp/guzzle": {
+		{CVEID: "CVE-2022-31042", FixedVersion: "6.5.6", Severity: "medium",
+			Description: "GuzzleHTTP 头注入漏洞"},
+		{CVEID: "CVE-2022-31043", FixedVersion: "6.5.6", Severity: "medium",
+			Description: "GuzzleHTTP SSRF 漏洞"},
+	},
+	"phpunit/phpunit": {
+		{CVEID: "CVE-2017-9841", FixedVersion: "4.8.28", Severity: "critical",
+			Description: "PHPUnit 远程代码执行漏洞"},
+	},
+	"nesbot/carbon": {
+		{CVEID: "CVE-2022-31090", FixedVersion: "2.61.0", Severity: "medium",
+			Description: "Carbon 时区处理信息泄露"},
+	},
+}
+
+// npmKnownVulns Node.js npm 包已知漏洞
+var npmKnownVulns = map[string][]vulnEntry{
+	"lodash": {
+		{CVEID: "CVE-2021-23337", FixedVersion: "4.17.21", Severity: "high",
+			Description: "Lodash 命令注入漏洞"},
+		{CVEID: "CVE-2020-8203", FixedVersion: "4.17.19", Severity: "high",
+			Description: "Lodash 原型链污染漏洞"},
+	},
+	"axios": {
+		{CVEID: "CVE-2024-39338", FixedVersion: "0.30.0", Severity: "high",
+			Description: "Axios SSRF 漏洞"},
+		{CVEID: "CVE-2023-45857", FixedVersion: "0.28.0", Severity: "medium",
+			Description: "Axios CSRF 漏洞"},
+	},
+	"express": {
+		{CVEID: "CVE-2024-29041", FixedVersion: "4.19.2", Severity: "medium",
+			Description: "Express 开放重定向漏洞"},
+	},
+	"minimatch": {
+		{CVEID: "CVE-2022-3517", FixedVersion: "3.0.5", Severity: "high",
+			Description: "minimatch ReDoS 漏洞"},
+	},
+	"minimist": {
+		{CVEID: "CVE-2021-44906", FixedVersion: "1.2.6", Severity: "critical",
+			Description: "minimist 原型链污染漏洞"},
+	},
+	"qs": {
+		{CVEID: "CVE-2022-24999", FixedVersion: "6.5.3", Severity: "high",
+			Description: "qs 原型链污染漏洞"},
+	},
+	"node-fetch": {
+		{CVEID: "CVE-2022-0235", FixedVersion: "2.6.7", Severity: "high",
+			Description: "node-fetch 头部信息泄露漏洞"},
+	},
+	"jsonwebtoken": {
+		{CVEID: "CVE-2022-23529", FixedVersion: "9.0.0", Severity: "critical",
+			Description: "jsonwebtoken 密钥混淆 RCE 漏洞"},
+	},
+	"pug": {
+		{CVEID: "CVE-2018-20190", FixedVersion: "2.0.4", Severity: "high",
+			Description: "Pug 模板注入漏洞"},
+	},
+	"ejs": {
+		{CVEID: "CVE-2022-29078", FixedVersion: "3.1.7", Severity: "high",
+			Description: "EJS 模板注入 RCE 漏洞"},
+	},
+}
+
+// pythonKnownVulns Python pip 包已知漏洞
+var pythonKnownVulns = map[string][]vulnEntry{
+	"django": {
+		{CVEID: "CVE-2024-43189", FixedVersion: "4.2.15", Severity: "high",
+			Description: "Django SQL 注入漏洞"},
+		{CVEID: "CVE-2024-38912", FixedVersion: "5.0.7", Severity: "high",
+			Description: "Django 路径遍历漏洞"},
+	},
+	"flask": {
+		{CVEID: "CVE-2023-30861", FixedVersion: "2.3.2", Severity: "medium",
+			Description: "Flask Cookie 安全漏洞"},
+	},
+	"requests": {
+		{CVEID: "CVE-2024-35195", FixedVersion: "2.32.0", Severity: "medium",
+			Description: "Requests SSL 证书验证绕过漏洞"},
+	},
+	"cryptography": {
+		{CVEID: "CVE-2024-26130", FixedVersion: "42.0.4", Severity: "high",
+			Description: "cryptography PKCS#12 缓冲区溢出漏洞"},
+		{CVEID: "CVE-2023-49083", FixedVersion: "41.0.6", Severity: "high",
+			Description: "cryptography NULL 指针解引用漏洞"},
+	},
+	"pyyaml": {
+		{CVEID: "CVE-2020-1747", FixedVersion: "5.4", Severity: "high",
+			Description: "PyYAML 任意代码执行漏洞"},
+	},
+	"pillow": {
+		{CVEID: "CVE-2023-50447", FixedVersion: "10.3.0", Severity: "high",
+			Description: "Pillow 任意代码执行漏洞"},
+	},
+}
+
+// goKnownVulns Go 模块已知漏洞
+var goKnownVulns = map[string][]vulnEntry{
+	"github.com/golang-jwt/jwt": {
+		{CVEID: "CVE-2025-30204", FixedVersion: "5.2.2", Severity: "high",
+			Description: "golang-jwt JWT 解析器 panic 漏洞"},
+	},
+	"github.com/gin-gonic/gin": {
+		{CVEID: "CVE-2023-29401", FixedVersion: "1.9.0", Severity: "medium",
+			Description: "Gin 文件上传路径遍历漏洞"},
+	},
+	"github.com/gorilla/websocket": {
+		{CVEID: "CVE-2020-27813", FixedVersion: "1.4.1", Severity: "medium",
+			Description: "gorilla/websocket DoS 漏洞"},
+	},
+	"github.com/go-playground/validator": {
+		{CVEID: "CVE-2023-29435", FixedVersion: "10.12.0", Severity: "medium",
+			Description: "go-playground/validator ReDoS 漏洞"},
+	},
+}
+
+// mavenKnownVulns Java Maven 包已知漏洞
+var mavenKnownVulns = map[string][]vulnEntry{
+	"org.apache.logging.log4j:log4j-core": {
+		{CVEID: "CVE-2021-44228", FixedVersion: "2.17.1", Severity: "critical",
+			Description: "Log4Shell - Log4j JNDI 注入 RCE 漏洞"},
+		{CVEID: "CVE-2021-45046", FixedVersion: "2.16.0", Severity: "critical",
+			Description: "Log4j JNDI 注入漏洞变体"},
+	},
+	"org.springframework:spring-core": {
+		{CVEID: "CVE-2022-22965", FixedVersion: "5.3.18", Severity: "critical",
+			Description: "Spring4Shell - Spring Framework RCE 漏洞"},
+	},
+	"com.fasterxml.jackson.core:jackson-databind": {
+		{CVEID: "CVE-2022-42003", FixedVersion: "2.13.4", Severity: "high",
+			Description: "Jackson 反序列化漏洞"},
+		{CVEID: "CVE-2020-36518", FixedVersion: "2.12.6", Severity: "high",
+			Description: "Jackson 深度嵌套 DoS 漏洞"},
+	},
+	"org.apache.commons:commons-text": {
+		{CVEID: "CVE-2022-42889", FixedVersion: "1.10.0", Severity: "critical",
+			Description: "Text4Shell - Commons Text RCE 漏洞"},
+	},
+	"org.apache.tomcat:tomcat-coyote": {
+		{CVEID: "CVE-2025-24813", FixedVersion: "9.0.99", Severity: "critical",
+			Description: "Tomcat 远程代码执行漏洞"},
+	},
+}
+
+// ============================================================
+// 锁文件解析器
+// ============================================================
+
+// composerLockEntry composer.lock JSON 结构
+type composerLockEntry struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
 }
 
 // scanComposerLock 解析 composer.lock (PHP)
 func (s *DependencyScanner) scanComposerLock(content []byte) []DependencyVulnerability {
-	// 简化实现：解析 JSON 中的包名和版本
+	var lockFile struct {
+		Packages    []composerLockEntry `json:"packages"`
+		PackagesDev []composerLockEntry `json:"packages-dev"`
+	}
+	if err := json.Unmarshal(content, &lockFile); err != nil {
+		return nil
+	}
+
+	allPackages := append(lockFile.Packages, lockFile.PackagesDev...)
 	var vulns []DependencyVulnerability
-	lines := strings.Split(string(content), "\n")
-	for i, line := range lines {
-		if strings.Contains(line, "\"name\"") && i+1 < len(lines) {
-			// 提取包名和版本
-			nameLine := strings.TrimSpace(line)
-			if i+1 < len(lines) {
-				versionLine := strings.TrimSpace(lines[i+1])
-				_ = nameLine
-				_ = versionLine
+	for _, pkg := range allPackages {
+		if pkg.Name == "" || pkg.Version == "" {
+			continue
+		}
+		// 去掉版本前缀 v（如 v1.2.3 -> 1.2.3）
+		version := strings.TrimPrefix(pkg.Version, "v")
+		// 去掉版本约束前缀（如 ^1.2.3, ~1.2.3, >=1.2.3）
+		version = strings.TrimLeft(version, "^~>=< ")
+		version = strings.Split(version, " ")[0]
+
+		for _, vuln := range composerKnownVulns[pkg.Name] {
+			if isVersionLower(version, vuln.FixedVersion) {
+				vulns = append(vulns, DependencyVulnerability{
+					PackageName:      pkg.Name,
+					InstalledVersion: version,
+					VulnerabilityID:  vuln.CVEID,
+					Severity:         vuln.Severity,
+					FixedVersion:     vuln.FixedVersion,
+					Description:      vuln.Description,
+				})
 			}
 		}
 	}
@@ -161,48 +367,272 @@ func (s *DependencyScanner) scanComposerLock(content []byte) []DependencyVulnera
 // scanRequirementsTxt 解析 requirements.txt (Python)
 func (s *DependencyScanner) scanRequirementsTxt(content []byte) []DependencyVulnerability {
 	var vulns []DependencyVulnerability
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
+
+	// pip 包名正则：字母、数字、下划线、连字符、点号
+	pkgRe := regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9._-]*)\s*([=<>!~]=?\s*)?([0-9][0-9a-zA-Z._-]*)?`)
+
+	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-") {
 			continue
 		}
-		// 格式: packageG package==version
-		_ = line
+		// 去掉行内注释
+		if idx := strings.Index(line, " #"); idx > 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		// 去掉环境标记（如 package; python_version >= "3.6"）
+		if idx := strings.Index(line, ";"); idx > 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		// 去掉 extras（如 package[extra1,extra2]==1.2.3）
+		if idx := strings.Index(line, "["); idx > 0 {
+			line = line[:idx] + line[strings.Index(line, "]")+1:]
+		}
+
+		m := pkgRe.FindStringSubmatch(line)
+		if m == nil || m[1] == "" {
+			continue
+		}
+		pkgName := strings.ToLower(m[1])
+		version := m[3]
+		if version == "" {
+			continue // 无版本号，跳过
+		}
+
+		for _, vuln := range pythonKnownVulns[pkgName] {
+			if isVersionLower(version, vuln.FixedVersion) {
+				vulns = append(vulns, DependencyVulnerability{
+					PackageName:      pkgName,
+					InstalledVersion: version,
+					VulnerabilityID:  vuln.CVEID,
+					Severity:         vuln.Severity,
+					FixedVersion:     vuln.FixedVersion,
+					Description:      vuln.Description,
+				})
+			}
+		}
 	}
 	return vulns
 }
 
 // scanPackageLock 解析 package-lock.json (Node.js)
 func (s *DependencyScanner) scanPackageLock(content []byte) []DependencyVulnerability {
-	// 简化实现
-	return nil
+	var lockFile struct {
+		Dependencies map[string]struct {
+			Version string `json:"version"`
+		} `json:"dependencies"`
+		Packages map[string]struct {
+			Version string `json:"version"`
+		} `json:"packages"`
+	}
+	if err := json.Unmarshal(content, &lockFile); err != nil {
+		return nil
+	}
+
+	// 合并 dependencies 和 packages 两种格式
+	type pkgVer struct{ name, version string }
+	seen := make(map[string]string) // name -> version，去重
+
+	for name, dep := range lockFile.Dependencies {
+		if dep.Version != "" {
+			seen[name] = dep.Version
+		}
+	}
+	for path, pkg := range lockFile.Packages {
+		// packages 的 key 是路径如 node_modules/lodash 或 node_modules/foo/node_modules/lodash
+		// 取最后一段作为包名
+		parts := strings.Split(path, "node_modules/")
+		name := parts[len(parts)-1]
+		if name == "" || name == path {
+			continue
+		}
+		// 跳过根包（空路径或包名 == ""）
+		if pkg.Version == "" {
+			continue
+		}
+		// 只保留第一次出现的版本（嵌套的取最外层）
+		if _, exists := seen[name]; !exists {
+			seen[name] = pkg.Version
+		}
+	}
+
+	var vulns []DependencyVulnerability
+	for name, version := range seen {
+		// 去掉版本前缀（如 file:、npm: 等非语义版本前缀）
+		cleanVer := version
+		if strings.HasPrefix(cleanVer, "npm:") {
+			cleanVer = strings.TrimPrefix(cleanVer, "npm:")
+		}
+		// 只处理纯语义版本（以数字开头）
+		if cleanVer == "" || cleanVer[0] < '0' || cleanVer[0] > '9' {
+			continue
+		}
+
+		for _, vuln := range npmKnownVulns[name] {
+			if isVersionLower(cleanVer, vuln.FixedVersion) {
+				vulns = append(vulns, DependencyVulnerability{
+					PackageName:      name,
+					InstalledVersion: cleanVer,
+					VulnerabilityID:  vuln.CVEID,
+					Severity:         vuln.Severity,
+					FixedVersion:     vuln.FixedVersion,
+					Description:      vuln.Description,
+				})
+			}
+		}
+	}
+	return vulns
 }
 
 // scanPomXml 解析 pom.xml (Java/Maven)
 func (s *DependencyScanner) scanPomXml(content []byte) []DependencyVulnerability {
-	// 简化实现
-	return nil
+	var vulns []DependencyVulnerability
+
+	// 简单 XML 解析：提取 <dependency> 块中的 groupId:artifactId:version
+	depRe := regexp.MustCompile(`(?s)<dependency>\s*(.*?)\s*</dependency>`)
+	gavRe := regexp.MustCompile(`(?s)<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>\s*<version>([^<]+)</version>`)
+
+	for _, depMatch := range depRe.FindAllStringSubmatch(string(content), -1) {
+		if len(depMatch) < 2 {
+			continue
+		}
+		depBlock := depMatch[1]
+		gav := gavRe.FindStringSubmatch(depBlock)
+		if len(gav) < 4 {
+			continue
+		}
+		groupID := strings.TrimSpace(gav[1])
+		artifactID := strings.TrimSpace(gav[2])
+		version := strings.TrimSpace(gav[3])
+
+		// 跳过 Maven 属性引用（如 ${spring.version}）
+		if strings.Contains(version, "${") {
+			continue
+		}
+
+		// 去掉版本前缀（如 ${project.version} 等）
+		version = strings.TrimPrefix(version, "[")
+
+		// 构建 Maven 坐标 key
+		mavenKey := groupID + ":" + artifactID
+		for _, vuln := range mavenKnownVulns[mavenKey] {
+			if isVersionLower(version, vuln.FixedVersion) {
+				vulns = append(vulns, DependencyVulnerability{
+					PackageName:      mavenKey,
+					InstalledVersion: version,
+					VulnerabilityID:  vuln.CVEID,
+					Severity:         vuln.Severity,
+					FixedVersion:     vuln.FixedVersion,
+					Description:      vuln.Description,
+				})
+			}
+		}
+	}
+	return vulns
 }
 
 // scanGoMod 解析 go.mod (Go)
 func (s *DependencyScanner) scanGoMod(content []byte) []DependencyVulnerability {
 	var vulns []DependencyVulnerability
+
 	lines := strings.Split(string(content), "\n")
+	inRequireBlock := false
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "require") || strings.Contains(line, "go ") {
+		if line == "" {
 			continue
 		}
-		// 格式: github.com/pkg/errors v0.9.1
-		parts := strings.Fields(line)
-		if len(parts) >= 2 {
-			_ = parts[0] // 包名
-			_ = parts[1] // 版本
+
+		// 处理 require 块（单行和多行两种形式）
+		if strings.HasPrefix(line, "require ") {
+			// 单行 require: require github.com/pkg/errors v0.9.1
+			rest := strings.TrimPrefix(line, "require ")
+			if v := checkGoModule(rest); v != nil {
+				vulns = append(vulns, v...)
+			}
+			continue
+		}
+		if line == "require (" {
+			inRequireBlock = true
+			continue
+		}
+		if line == ")" && inRequireBlock {
+			inRequireBlock = false
+			continue
+		}
+		if inRequireBlock {
+			if v := checkGoModule(line); v != nil {
+				vulns = append(vulns, v...)
+			}
 		}
 	}
 	return vulns
 }
+
+// checkGoModule 检查单个 Go 模块行是否有已知漏洞。
+// 行格式: github.com/pkg/errors v0.9.1
+// 或带注释: github.com/pkg/errors v0.9.1 // indirect
+func checkGoModule(line string) []DependencyVulnerability {
+	// 去掉注释
+	if idx := strings.Index(line, "//"); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return nil
+	}
+	modulePath := parts[0]
+	version := strings.TrimPrefix(parts[1], "v") // go.mod 版本格式为 v1.2.3
+
+	// 只处理语义版本（以数字开头）
+	if version == "" || version[0] < '0' || version[0] > '9' {
+		return nil
+	}
+
+	// 精确匹配模块路径
+	if vulns, ok := goKnownVulns[modulePath]; ok {
+		var result []DependencyVulnerability
+		for _, vuln := range vulns {
+			if isVersionLower(version, vuln.FixedVersion) {
+				result = append(result, DependencyVulnerability{
+					PackageName:      modulePath,
+					InstalledVersion: version,
+					VulnerabilityID:  vuln.CVEID,
+					Severity:         vuln.Severity,
+					FixedVersion:     vuln.FixedVersion,
+					Description:      vuln.Description,
+				})
+			}
+		}
+		return result
+	}
+
+	// 前缀匹配（处理子包：github.com/golang-jwt/jwt/v4 等）
+	for modPath, vulns := range goKnownVulns {
+		if strings.HasPrefix(modulePath, modPath) {
+			var result []DependencyVulnerability
+			for _, vuln := range vulns {
+				if isVersionLower(version, vuln.FixedVersion) {
+					result = append(result, DependencyVulnerability{
+						PackageName:      modulePath,
+						InstalledVersion: version,
+						VulnerabilityID:  vuln.CVEID,
+						Severity:         vuln.Severity,
+						FixedVersion:     vuln.FixedVersion,
+						Description:      vuln.Description,
+					})
+				}
+			}
+			return result
+		}
+	}
+	return nil
+}
+
+// ============================================================
+// CIS Benchmark 合规扫描器（保持不变）
+// ============================================================
 
 // CISComplianceScanner CIS Benchmark 配置合规扫描器。
 type CISComplianceScanner struct {

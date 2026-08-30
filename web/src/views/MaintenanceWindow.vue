@@ -33,7 +33,7 @@
       <!-- 推荐时段列表 -->
       <el-card shadow="hover" style="margin-bottom: 16px">
         <template #header><span>推荐变更时段 TOP {{ recommendation.best_slots?.length || 0 }}</span></template>
-        <el-table :data="recommendation.best_slots || []" stripe>
+        <el-table :data="(recommendation.best_slots || []).slice((slotPage-1)*slotSize, slotPage*slotSize)" stripe>
           <el-table-column label="排名" width="60" type="index" />
           <el-table-column label="星期" width="80">
             <template #default="{ row }">
@@ -79,8 +79,11 @@
               />
             </template>
           </el-table-column>
-        </el-table>
-      </el-card>
+</el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="slotPage" v-model:page-size="slotSize" :page-sizes="[10, 20, 50, 100]" :total="(recommendation.best_slots || []).length" layout="total, sizes, prev, pager, next" />
+</div>
+</el-card>
 
       <!-- 可视化图表 -->
       <el-card v-if="recommendation.best_slots && recommendation.best_slots.length > 0" shadow="hover">
@@ -114,6 +117,8 @@ const { isDark } = useDark()
 
 const recommendation = ref<any>(null)
 const loading = ref(false)
+const slotPage = ref(1)
+const slotSize = ref(10)
 
 async function fetchRecommendation() {
   loading.value = true
@@ -167,7 +172,19 @@ const chartOption = computed(() => {
   const scores = slots.map((s: any) => s.score)
 
   return {
-    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params: any) => {
+        const name = params[0]?.axisValueLabel || ''
+        let html = `${name}`
+        for (const p of params) {
+          const val = typeof p.value === 'number' ? p.value.toFixed(2) : p.value
+          html += `<br/>${p.marker}${p.seriesName}: ${val}`
+        }
+        return html
+      },
+    },
     legend: {
       data: ['CPU均值', 'CPU峰值', '内存均值', '综合评分'],
       top: 0,

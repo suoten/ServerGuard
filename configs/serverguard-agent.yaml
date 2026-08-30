@@ -4,7 +4,7 @@
 # Agent 设置
 agent:
   collect_interval: 15       # 采集间隔（秒）——宝塔模式下最低 15s
-  max_memory_mb: 50          # 最大内存使用（宝塔模式实际限制 60MB）
+  max_memory_mb: 128         # Go 堆软限制（GOMEMLIMIT 后备值，勿低于实际常驻内存，否则 GC 抖动烧 CPU）
   max_cpu_percent: 2         # 最大 CPU 使用百分比
 
 # Web 面板
@@ -30,6 +30,13 @@ safety:
   min_disk_free_mb: 500
   max_disk_io_wait_percent: 80
   trash_dir: "/var/lib/serverguard/.trash"
+
+# 攻击预警白名单
+# 这些 IP 永不触发封禁——管理员办公网络/跳板机公网 IP
+# 避免正常运维访问被误判为 CC 攻击/暴破等
+security:
+  exclude_ips: []
+  # 示例: ["139.201.16.193", "10.0.0.1"]
 
 # 数据采集
 collectors:

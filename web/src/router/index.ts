@@ -121,13 +121,37 @@ const routes = [
   },
   {
     path: '/reports',
-    name: 'Reports',
-    component: () => import('@/views/Reports.vue'),
+    redirect: '/knowledge',
   },
   {
     path: '/maintenance-window',
     name: 'MaintenanceWindow',
     component: () => import('@/views/MaintenanceWindow.vue'),
+  },
+  {
+    path: '/incidents',
+    name: 'Incidents',
+    component: () => import('@/views/Incidents.vue'),
+  },
+  {
+    path: '/onboarding',
+    name: 'Onboarding',
+    component: () => import('@/views/Onboarding.vue'),
+    meta: { public: true },
+  },
+  {
+    path: '/scene-templates',
+    redirect: '/knowledge',
+  },
+  {
+    path: '/devops',
+    name: 'DevOps',
+    component: () => import('@/views/DevOps.vue'),
+  },
+  {
+    path: '/data-governance',
+    name: 'DataGovern',
+    component: () => import('@/views/DataGovern.vue'),
   },
 ]
 
@@ -143,6 +167,18 @@ router.beforeEach((to, _from, next) => {
     next()
   } else {
     next('/login')
+  }
+})
+
+// Handle dynamic import failures (stale chunks after deploy)
+// When the browser has cached an old index.html that references old chunk filenames,
+// navigating to a route will fail to load the chunk. We catch this and reload.
+router.onError((error) => {
+  if (error?.message?.includes('Failed to fetch dynamically imported module') ||
+      error?.message?.includes('Importing a module script failed')) {
+    // Reload the page to get the new index.html with updated chunk references
+    console.warn('[Router] Stale chunk detected, reloading page...')
+    window.location.reload()
   }
 })
 

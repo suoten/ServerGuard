@@ -87,9 +87,22 @@ type Config struct {
 	Docker        DockerConfig    `yaml:"docker"`
 	System        SystemConfig    `yaml:"system"`
 	Network       NetworkConfig   `yaml:"network"`
-	Offline       OfflineConfig  `yaml:"offline"`
+	Offline       OfflineConfig   `yaml:"offline"`
 	Baota         BaotaConfig     `yaml:"baota"`
 	Upgrade       UpgradeConfig   `yaml:"upgrade"`
+	AI            AIConfig        `yaml:"ai"`
+}
+
+// AIConfig holds LLM enhancer settings.
+type AIConfig struct {
+	Enabled         bool   `yaml:"enabled" json:"enabled"`
+	Provider        string `yaml:"provider" json:"provider"`
+	APIKey          string `yaml:"api_key" json:"apiKey"`
+	APIBase         string `yaml:"api_base" json:"apiBase"`
+	Model           string `yaml:"model" json:"model"`
+	HumanizeAlert   bool   `yaml:"humanize_alert" json:"humanizeAlert"`
+	WeeklyReport    bool   `yaml:"weekly_report" json:"weeklyReport"`
+	ExplainIncident bool   `yaml:"explain_incident" json:"explainIncident"`
 }
 
 // AgentConfig holds agent-level settings.
@@ -104,6 +117,9 @@ type AgentConfig struct {
 	LearnMode       bool     `yaml:"learn_mode"` // first week: only alert, no action
 	LearnModeDays   int      `yaml:"learn_mode_days"`
 	EmergencyStop   bool     `yaml:"emergency_stop"`
+	// TrustAutoConfirm 信任演化：近 7 天确认执行 ≥8 次且成功率 100% 的规则
+	// 自动跳过人工确认（任一失败立即恢复确认）。关闭后所有确认类规则永远等待用户。
+	TrustAutoConfirm bool `yaml:"trust_auto_confirm"`
 }
 
 // StorageConfig holds database settings.
@@ -160,14 +176,14 @@ type NotifyConfig struct {
 	Silence  SilenceConfig   `yaml:"silence"`
 	// Simplified fields for easy setup
 	WxPusherAppToken string `yaml:"wxpusher_app_token"` // WxPusher appToken, get from wxpusher.zjiecode.com
-	WxPusherUID      string `yaml:"wxpusher_uid"`      // WxPusher UID, get by scanning app QR code
-	SMTPHost      string `yaml:"smtp_host"`      // e.g. smtp.gmail.com
-	SMTPPort      string `yaml:"smtp_port"`      // e.g. 587
-	SMTPUser      string `yaml:"smtp_user"`      // sender email
-	SMTPPassword  string `yaml:"smtp_password"`  // sender password/app password
-	EmailTo       string `yaml:"email_to"`       // recipient email(s), comma separated
-	DigestEnabled bool   `yaml:"digest_enabled"` // daily digest
-	DigestHour    int    `yaml:"digest_hour"`    // 8 = 8:00 AM
+	WxPusherUID      string `yaml:"wxpusher_uid"`       // WxPusher UID, get by scanning app QR code
+	SMTPHost         string `yaml:"smtp_host"`          // e.g. smtp.gmail.com
+	SMTPPort         string `yaml:"smtp_port"`          // e.g. 587
+	SMTPUser         string `yaml:"smtp_user"`          // sender email
+	SMTPPassword     string `yaml:"smtp_password"`      // sender password/app password
+	EmailTo          string `yaml:"email_to"`           // recipient email(s), comma separated
+	DigestEnabled    bool   `yaml:"digest_enabled"`     // daily digest
+	DigestHour       int    `yaml:"digest_hour"`        // 8 = 8:00 AM
 }
 
 type ChannelConfig struct {
@@ -341,10 +357,14 @@ type BaotaConfig struct {
 // UpgradeConfig holds auto-upgrade settings.
 // Agent 启动时定时检查官网 /api/v1/latest 接口，发现新版本后面板提示用户升级。
 type UpgradeConfig struct {
-	ServerURL     string   `yaml:"server_url"`       // 官网 API 地址，如 https://sg.jjtt.net/api/v1
-	Channel       string   `yaml:"channel"`          // stable / beta / edge
-	CheckInterval Duration `yaml:"check_interval"`   // 检查间隔，默认 6 小时
-	SigningKey    string   `yaml:"signing_key"`      // Ed25519 公钥（可选，用于签名验证）
+	ServerURL     string   `yaml:"server_url"`     // 官网 API 地址，如 https://sg.jjtt.net/api/v1
+	Channel       string   `yaml:"channel"`        // stable / beta / edge
+	CheckInterval Duration `yaml:"check_interval"` // 检查间隔，默认 6 小时
+	SigningKey    string   `yaml:"signing_key"`    // Ed25519 公钥（可选，用于签名验证）
+	// AutoApplyInMaintenance 维护窗口内自动升级（默认关闭）。
+	// 开启后：仅 stable 渠道 + 系统处于维护窗口期 + （配置了公钥时）签名校验通过，
+	// 三个条件同时满足才自动执行升级——把"半夜手动升"变成"窗口内自动升"。
+	AutoApplyInMaintenance bool `yaml:"auto_apply_in_maintenance"`
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
@@ -358,12 +378,17 @@ func DefaultConfig() *Config {
 			Name:            "serverguard-agent",
 			DataDir:         dataDir,
 			LogLevel:        "info",
-CollectInterval: Duration(10 * time.Second),
-	MaxMemoryMB:     50,
-	MaxCPUPercent:   3,
-			LearnMode:       true,
-			LearnModeDays:   7,
-			EmergencyStop:   false,
+			CollectInterval: Duration(10 * time.Second),
+			// 内存软限制：作为 GOMEMLIMIT 后备值（systemd 环境优先用环境变量）。
+			// 注意：不能低于实际常驻内存，否则 Go GC 会持续全速回收换内存（GC 抖动），
+			// 在 1C 服务器上表现为 CPU 占用飙升。128MB 与 systemd 单元在 1G 内存服务器上的
+			// GO_MEM_LIMIT=128MiB 一致。
+			MaxMemoryMB:      128,
+			MaxCPUPercent:    3,
+			LearnMode:        true,
+			LearnModeDays:    7,
+			EmergencyStop:    false,
+			TrustAutoConfirm: true,
 		},
 		Storage: StorageConfig{
 			Path:                  filepath.Join(dataDir, "serverguard.db"),

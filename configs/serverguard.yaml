@@ -15,6 +15,8 @@ agent:
   learn_mode: true  # first 7 days: only alert, no auto-actions
   learn_mode_days: 7
   emergency_stop: false
+  # Trust evolution: rules that have been confirmed and executed >=8 times in the last 7 days with a 100% success rate will automatically skip manual confirmation (any failure immediately restores confirmation)
+  trust_auto_confirm: true
 
 # Storage (SQLite with WAL mode)
 storage:
@@ -168,6 +170,9 @@ security:
   brute_force_window: 5m
   ban_duration: 1h
   ban_progression: true
+  # 白名单 IP：这些 IP 永不触发封禁（攻击预警 Z 模块也遵循此白名单）
+  # 典型用法：管理员办公网络/跳板机公网 IP，避免正常运维访问被误判为攻击
+  # 示例: ["139.201.16.193", "8.8.8.8"]
   exclude_ips: []
   monitor_paths: []
   monitor_ssh_log: /var/log/auth.log

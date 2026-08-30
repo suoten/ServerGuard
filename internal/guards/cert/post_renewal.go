@@ -1,6 +1,7 @@
 package cert
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -89,9 +90,12 @@ func (h *PostRenewalHandler) reloadWebServer() error {
 }
 
 // verifyHTTPS HTTPS 探测验证新证书已生效。
+// 加 10s 超时兜底：openssl s_client 对不可达/被防火墙丢弃的主机
+// TCP 连接可能挂起 2 分钟以上，阻塞续期验证流程。
 func (h *PostRenewalHandler) verifyHTTPS(domain string) bool {
-	// 使用 openssl 验证 HTTPS 证书
-	cmd := exec.Command("openssl", "s_client", "-connect", domain+":443", "-servername", domain)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "openssl", "s_client", "-connect", domain+":443", "-servername", domain)
 	cmd.Stdin = strings.NewReader("")
 	// 简化实现：检查命令是否能连接
 	return cmd.Run() == nil

@@ -39,17 +39,17 @@
               <el-menu-item index="/alerts">
                 <el-icon><Bell /></el-icon><span>告警中心</span>
               </el-menu-item>
-              <el-menu-item index="/findings">
-                <el-icon><Search /></el-icon><span>安全发现</span>
-              </el-menu-item>
               <el-menu-item index="/attacks">
                 <el-icon><Warning /></el-icon><span>攻击预警</span>
               </el-menu-item>
-              <el-menu-item index="/rules">
-                <el-icon><DocumentChecked /></el-icon><span>规则管理</span>
+              <el-menu-item index="/findings">
+                <el-icon><Search /></el-icon><span>安全扫描</span>
               </el-menu-item>
               <el-menu-item index="/safety">
                 <el-icon><Lock /></el-icon><span>安全控制</span>
+              </el-menu-item>
+              <el-menu-item index="/rules">
+                <el-icon><DocumentChecked /></el-icon><span>规则管理</span>
               </el-menu-item>
             </el-sub-menu>
 
@@ -59,16 +59,16 @@
                 <el-icon><Tools /></el-icon><span>运维管理</span>
               </template>
               <el-menu-item index="/guards">
-                <el-icon><Cpu /></el-icon><span>守护管理</span>
+                <el-icon><Cpu /></el-icon><span>服务守护</span>
               </el-menu-item>
               <el-menu-item index="/certs">
                 <el-icon><Key /></el-icon><span>证书管理</span>
               </el-menu-item>
+              <el-menu-item index="/large-files">
+                <el-icon><FolderOpened /></el-icon><span>磁盘与文件</span>
+              </el-menu-item>
               <el-menu-item index="/monitoring">
                 <el-icon><Connection /></el-icon><span>网站监控</span>
-              </el-menu-item>
-              <el-menu-item index="/large-files">
-                <el-icon><FolderOpened /></el-icon><span>大文件扫描</span>
               </el-menu-item>
               <el-menu-item index="/baota">
                 <el-icon><Compass /></el-icon><span>宝塔发现</span>
@@ -80,17 +80,23 @@
               <template #title>
                 <el-icon><MagicStick /></el-icon><span>智能运维</span>
               </template>
+              <el-menu-item index="/incidents">
+                <el-icon><Aim /></el-icon><span>故障事件</span>
+              </el-menu-item>
               <el-menu-item index="/apm">
                 <el-icon><DataLine /></el-icon><span>APM 监控</span>
               </el-menu-item>
-              <el-menu-item index="/knowledge">
-                <el-icon><Collection /></el-icon><span>故障知识库</span>
+              <el-menu-item index="/devops">
+                <el-icon><Tools /></el-icon><span>DevOps 运维</span>
+              </el-menu-item>
+              <el-menu-item index="/data-governance">
+                <el-icon><DataLine /></el-icon><span>数据治理</span>
               </el-menu-item>
               <el-menu-item index="/netquality">
                 <el-icon><MapLocation /></el-icon><span>网络质量</span>
               </el-menu-item>
-              <el-menu-item index="/reports">
-                <el-icon><Files /></el-icon><span>智能报告</span>
+              <el-menu-item index="/knowledge">
+                <el-icon><Collection /></el-icon><span>知识库与报告</span>
               </el-menu-item>
               <el-menu-item index="/maintenance-window">
                 <el-icon><Timer /></el-icon><span>变更窗口</span>
@@ -122,7 +128,7 @@
           <div class="sidebar-footer" :class="{ 'footer-collapsed': menuCollapsed }">
             <template v-if="!menuCollapsed">
               <span class="sg-dot sg-dot--pulse" style="background: #22c55e"></span>
-              <span class="version-text">v{{ agentStatus?.version || '0.1.0' }}</span>
+              <span class="version-text">v{{ agentStatus?.version || '0.3.0' }}</span>
             </template>
             <el-tooltip :content="menuCollapsed ? '展开侧边栏 (Ctrl+B)' : '收起侧边栏 (Ctrl+B)'" placement="right">
               <button
@@ -292,7 +298,7 @@ import {
   Lock, Cpu, Key, Connection, FolderOpened, Compass, Document, Tickets,
   UserFilled, Finished, Setting, Menu, ArrowDown, SwitchButton, Sunny, Moon,
   DataLine, Collection, MapLocation, Files, Timer,
-  Tools, MagicStick, Operation, Fold,
+  Tools, MagicStick, Operation, Fold, Link, Aim, Guide,
 } from '@element-plus/icons-vue'
 import { useOffline } from '@/composables/useOffline'
 import { useDark } from '@/composables/useDark'
@@ -321,7 +327,7 @@ const sidebarWidth = computed(() => menuCollapsed.value ? '64px' : '232px')
 const menuGroupMap: Record<string, string[]> = {
   security: ['/alerts', '/findings', '/attacks', '/rules', '/safety'],
   ops: ['/guards', '/certs', '/monitoring', '/large-files', '/baota'],
-  smart: ['/apm', '/knowledge', '/netquality', '/reports', '/maintenance-window'],
+  smart: ['/apm', '/incidents', '/knowledge', '/devops', '/data-governance', '/netquality', '/maintenance-window'],
   system: ['/logs', '/audit', '/rbac', '/config-approval', '/settings'],
 }
 
@@ -358,12 +364,14 @@ const isLoginPage = computed(() => route.path === '/login')
 const pageTitles: Record<string, string> = {
   '/dashboard': '仪表盘', '/servers': '服务器', '/alerts': '告警中心',
   '/findings': '安全发现', '/attacks': '攻击预警', '/rules': '规则管理',
-  '/safety': '安全控制', '/guards': '守护管理', '/certs': '证书管理',
-  '/monitoring': '网站监控', '/large-files': '大文件扫描', '/baota': '宝塔发现',
+  '/safety': '安全控制', '/guards': '服务守护', '/certs': '证书管理',
+  '/monitoring': '网站监控', '/large-files': '磁盘与文件', '/baota': '宝塔发现',
   '/logs': '操作日志', '/audit': '审计日志', '/rbac': '用户角色',
   '/config-approval': '配置审批', '/settings': '系统设置',
-  '/apm': 'APM 监控', '/knowledge': '故障知识库', '/netquality': '网络质量',
-  '/reports': '智能报告', '/maintenance-window': '变更窗口',
+  '/apm': 'APM 监控', '/knowledge': '知识库与报告', '/netquality': '网络质量',
+  '/maintenance-window': '变更窗口',
+  '/incidents': '故障事件', '/onboarding': '快速接入',
+  '/devops': 'DevOps 运维', '/data-governance': '数据治理',
 }
 const pageTitle = computed(() => pageTitles[route.path] || '')
 

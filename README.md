@@ -1,4 +1,21 @@
+<div align="center">
+
 # ServerGuard · 让服务器自己照顾自己
+
+**Self-Healing Server Operations & Security Agent**
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/suoten/ServerGuard?display_name=tag&sort=semver)](https://github.com/suoten/ServerGuard/releases)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey)](#支持的操作系统)
+[![GitHub Stars](https://img.shields.io/github/stars/suoten/ServerGuard?style=social)](https://github.com/suoten/ServerGuard/stargazers)
+[![Gitee Stars](https://gitee.com/suoten/serverguard/badge/star.svg?theme=dark)](https://gitee.com/suoten/serverguard/stargazers)
+
+[English](#english) | [中文](README.md)
+
+</div>
+
+---
 
 > 凌晨 3 点，磁盘涨到 95%。
 > 你在睡觉。ServerGuard 清掉 30 天前的旧日志，给 MySQL 留了活路，
@@ -12,6 +29,139 @@ ServerGuard 是一个部署在服务器上的轻量级 Agent（16MB 单二进制
 
 **安全理念**：该出手时不犹豫，不该碰的不碰，不确定的交给你决定。永远不会搞崩宝塔、IIS、Apache、MySQL、Nginx。
 
+## ✨ 特性一览
+
+- 🔥 **自动自愈**：磁盘清理 / 内存泄漏拦截 / 服务重启 / SSH 封禁 / 证书续期 / 挖矿木马查杀，发现即修复
+- 🧠 **智能运维**：基线异常检测（168 时段学习）、磁盘写满预测、根因分析快照、告警收敛降噪
+- 🛡️ **五层安全机制**：45+ 进程白名单、Kill 预算、熔断器、级联防护、全局紧急停止，绝不误伤服务器
+- 🌐 **多机集中管控**：Hub 统一纳管多台服务器，聚合视图 + 集中下发命令
+- 📊 **实时面板**：健康评分、网站/API/数据库监控、审计日志，Vue 3 面板嵌入单二进制
+- 📱 **全渠道告警**：微信（Server酱）/ 钉钉 / 企微 / 飞书 / 邮件 / Slack / Telegram / 自定义 Webhook
+- 📦 **零依赖部署**：单二进制 16MB，SQLite 存储，`install.sh` 一键安装，兼容宝塔面板
+
+<!-- 📸 截图：建议放 2-3 张面板截图（仪表盘、告警中心、安全监控），
+     截图放到 docs/screenshots/ 目录后取消下面注释
+![仪表盘](docs/screenshots/dashboard.png)
+![安全监控](docs/screenshots/security.png)
+-->
+
+## 📚 文档导航
+
+| 文档 | 说明 |
+|---|---|
+| [安装指南](docs/install.md) | 一键安装 / 手动安装 / 宝塔部署 / Docker |
+| [配置说明](docs/configuration.md) | 全部配置项详解 |
+| [sgctl 运维工具](docs/sgctl.md) | 配置导入导出、数据库维护、安全自检 |
+| [运维手册](docs/operations.md) | 日常运维、故障排查 |
+| [API 文档](docs/api.md) | REST API 全量接口 |
+| [变更日志](docs/CHANGELOG_v3.8.md) | 版本变更记录 |
+| [产品规划](ServerGuard_产品规划文档_v4.9.md) | Roadmap 与设计思路 |
+
+## 🚀 快速开始
+
+### 方式一：一键安装（推荐）
+
+从 [GitHub Releases](https://github.com/suoten/ServerGuard/releases)（或 [Gitee Releases](https://gitee.com/suoten/serverguard/releases)）下载对应架构的发布包：
+
+```bash
+# 1. 下载发布包（选择对应架构）
+#    x86_64（绝大多数服务器）:
+wget https://github.com/suoten/ServerGuard/releases/latest/download/serverguard-0.3.0-linux-amd64.zip
+#    ARM64（鲲鹏/飞腾/Kylin V10）:
+wget https://github.com/suoten/ServerGuard/releases/latest/download/serverguard-0.3.0-linux-arm64.zip
+
+# 2. 解压
+unzip serverguard-0.3.0-linux-amd64.zip
+
+# 3. 运行安装脚本
+sudo bash install.sh
+
+# 4. 打开面板
+#    浏览器访问 http://你的服务器IP:18090
+#    用户名: admin  密码: admin123
+#    首次登录后请立即修改密码！
+```
+
+> 国内服务器下载慢？把 `github.com/suoten/ServerGuard` 换成 `gitee.com/suoten/serverguard` 即可。
+
+`install.sh` 自动完成：
+1. 复制二进制到 `/opt/serverguard/`
+2. 生成随机 JWT Secret 的配置文件
+3. 安装 systemd 服务（开机自启 + 崩溃自动重启）
+4. 放行防火墙 18090 端口（firewalld / ufw / iptables 自动检测）
+5. 启动服务并输出面板地址
+
+### 方式二：手动安装
+
+```bash
+# 1. 创建目录
+sudo mkdir -p /opt/serverguard /var/lib/serverguard
+
+# 2. 复制二进制（amd64 或 arm64）
+sudo cp serverguard-agent /opt/serverguard/serverguard-agent
+sudo chmod +x /opt/serverguard/serverguard-agent
+
+# 3. 复制配置并修改 JWT Secret（重要！）
+sudo cp configs/serverguard-agent.yaml /opt/serverguard/config.yaml
+sudo sed -i "s/CHANGE_ME_TO_RANDOM_STRING/$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)/" /opt/serverguard/config.yaml
+
+# 4. 安装 systemd 服务
+sudo cp deploy/serverguard-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now serverguard-agent
+
+# 5. 放行防火墙
+sudo firewall-cmd --permanent --add-port=18090/tcp && sudo firewall-cmd --reload  # CentOS/Kylin
+# 或
+sudo ufw allow 18090/tcp  # Ubuntu
+```
+
+### 方式三：Docker 部署
+
+```bash
+git clone https://github.com/suoten/ServerGuard.git
+cd ServerGuard
+docker compose up -d
+# Agent 面板: http://服务器IP:9090
+# Hub 管控台: http://服务器IP:8444（单机部署可删除 hub 服务）
+```
+
+### 方式四：在宝塔面板上部署
+
+> 适合已经在用宝塔面板的用户。
+
+1. 宝塔面板 → 文件 → `/opt` → 新建 `serverguard` 目录，上传二进制并重命名为 `serverguard-agent`，上传 `config.yaml`
+2. 宝塔面板 → 安全 → 放行端口 18090
+3. 终端执行：
+```bash
+sudo chmod +x /opt/serverguard/serverguard-agent
+sudo cp /opt/serverguard/serverguard-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now serverguard-agent
+```
+4. （可选）宝塔 → 网站 → 反向代理到 `http://127.0.0.1:18090`，用域名 + 443 访问面板
+
+**宝塔环境下的额外优势**：
+- 自动检测宝塔面板，优先用宝塔API续期证书（不消耗ACME配额）
+- 自动发现宝塔管理的网站，一键导入监控
+- 监控 Nginx/MySQL/PHP 进程，挂了自动重启
+
+### 从源码构建
+
+```bash
+# 构建前端并嵌入
+cd web && npm install && npm run build && cd ..
+
+# 构建 Agent（Linux amd64）
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o serverguard-agent ./cmd/serverguard-agent
+
+# 构建 Hub 多机管控端
+go build -o serverguard-hub ./cmd/serverguard-hub
+
+# 构建 sgctl 运维工具
+go build -o sgctl ./cmd/sgctl
+```
+
 ---
 
 ## 为什么需要 ServerGuard？
@@ -21,7 +171,8 @@ ServerGuard 是一个部署在服务器上的轻量级 Agent（16MB 单二进制
 | 凌晨3点磁盘满了，MySQL崩溃，网站打不开 | 磁盘95%时自动清理旧日志，你睡觉时问题已经解决 |
 | 某个进程内存泄漏吃光内存，内核OOM随机杀进程 | 检测到内存不足，智能终止非关键进程（白名单进程永不杀），发微信通知你 |
 | SSL证书过期忘了续，用户浏览器报红叉 | 提前14天自动续期，续完自动reload并验证生效 |
-| SSH被暴力破解，被人挂马挖矿 | 检测到5次失败登录自动封禁IP，发现挖矿进程直接杀掉 |
+| SSH被暴力破解，被人挂马挖矿 | 检测到30次失败登录自动封禁IP，发现挖矿进程直接杀掉 |
+| Python脚本循环启动上百个进程，MySQL连接池占满 | 进程爆炸检测自动终止多余进程，MySQL连接按来源统计定位元凶 |
 | 日志文件涨到50GB把磁盘撑爆 | 自动轮转压缩日志，排除web服务活跃日志 |
 | 服务器被植入WebShell后门 | 扫描PHP文件特征码 + 3000+ YARA规则，发现WebShell立即告警 |
 | crontab被篡改植入定时挖矿任务 | 检测可疑cron条目（反弹shell/挖矿/base64），立即告警 |
@@ -46,7 +197,8 @@ ServerGuard 是一个部署在服务器上的轻量级 Agent（16MB 单二进制
 | CPU超限 | 单进程 CPU > 80% 持续60s | 降优先级 → SIGTERM → SIGKILL（白名单进程不杀） |
 | 服务挂了 | 进程不存在 / 端口不通 | 自动重启服务（启动时自动检测Nginx/MySQL/PHP/宝塔等） |
 | 日志暴涨 | 单文件 > 500MB | 安全轮转+压缩（排除web服务活跃日志） |
-| SSH暴力破解 | 5分钟内5次失败 | 渐进式封禁：限速 → 1小时 → 24小时（永不封私有IP） |
+| SSH暴力破解 | 5分钟内30次失败 | 渐进式封禁：限速 → 1小时 → 24小时（永不封私有IP） |
+| 进程爆炸 | 同一程序 > 30个实例 | 保留最早3个，终止多余进程（走安全检查链） |
 | 挖矿/木马 | 匹配已知恶意进程名 | 自动终止进程 + 告警（30+种恶意进程特征库） |
 | 证书到期 | 剩余 < 14天 | 宝塔API / certbot / acme.sh 自动续期 |
 | 僵尸进程 | 僵尸 > 10个 | 向父进程发 SIGCHLD 清理 |
@@ -150,7 +302,7 @@ Hub 从单机面板升级为真正的多机集中管控：Agent 经 WebSocket（
 
 | 检查项 | 说明 | 自动处理 |
 |---|---|---|
-| SSH暴力破解 | 5min内5次失败登录 | 自动封禁IP（不封私有IP） |
+| SSH暴力破解 | 5min内30次失败登录 | 自动封禁IP（不封私有IP） |
 | 挖矿/木马进程 | 30+种已知恶意进程特征库 | 自动终止进程 |
 | 可疑目录进程 | 从/tmp、/dev/shm运行可执行文件 | 自动终止进程 |
 | WebShell检测 | PHP文件30+特征 + 3000+ YARA规则 | 告警（只读不删） |
@@ -197,7 +349,7 @@ Hub 从单机面板升级为真正的多机集中管控：Agent 经 WebSocket（
 
 ---
 
-## 🆕 v0.2.0 能力清单（V3.9 — APM-lite + 知识沉淀）
+## 🆕 v0.3.0 能力清单（V4.0 — 根因链推理 + DevOps + 数据治理）
 
 <details>
 <summary>展开查看：APM-lite / 网络质量 / 故障知识库 / 智能报告 / 变更窗口推荐</summary>
@@ -229,7 +381,7 @@ Hub 从单机面板升级为真正的多机集中管控：Agent 经 WebSocket（
 - **API**：`GET /api/netquality`、`POST /api/netquality/probe`、`GET /api/netquality/targets`
 
 #### 私有故障知识库
-- **自动记录**：每次自动修复执行时，自动记录“症状 → 根因 → 修复动作 → 效果”到 SQLite 知识库
+- **自动记录**：每次自动修复执行时，自动记录"症状 → 根因 → 修复动作 → 效果"到 SQLite 知识库
 - **指纹去重**：相同症状的故障自动累加出现次数，避免知识库膨胀
 - **相似检索**：新故障出现时，自动搜索历史相似故障的解决方案，提示历史修复经验
 - **统计分析**：按来源模块统计故障分布，识别反复出现的根因
@@ -242,8 +394,8 @@ Hub 从单机面板升级为真正的多机集中管控：Agent 经 WebSocket（
 - **API**：`GET /api/report/weekly`、`POST /api/report/weekly/send`、`GET /api/report/daily`、`POST /api/report/daily/send`
 
 #### 智能变更窗口推荐
-- **30 天负载分析**：按“周几 × 小时”分桶统计 CPU/内存均值和峰值，找出负载最低的时段
-- **推荐理由**：“基于近 30 天 N 个采样点分析，负载最低的时段是周四 02:00-03:00（CPU 均值 12%，峰值 18%）”
+- **30 天负载分析**：按"周几 × 小时"分桶统计 CPU/内存均值和峰值，找出负载最低的时段
+- **推荐理由**："基于近 30 天 N 个采样点分析，负载最低的时段是周四 02:00-03:00（CPU 均值 12%，峰值 18%）"
 - **备选时段**：提供 Top 5 最佳窗口，支持夜间优先筛选
 - **API**：`GET /api/maintenance-window/recommend`
 
@@ -253,6 +405,88 @@ Hub 从单机面板升级为真正的多机集中管控：Agent 经 WebSocket（
 - **经验教训**：根据故障类型和修复结果自动生成经验教训和建议
 - **一键推送**：面板点击即可生成复盘报告并推送到企业微信群
 - **API**：`GET /api/report/postmortem?start=...&end=...`、`POST /api/report/postmortem/generate`
+
+</details>
+
+---
+
+## 🆕 V4.0-V4.1 新增模块
+
+<details>
+<summary>展开查看：态势感知 / 数据治理 / DevOps 闭环 / 反弹Shell / 源码审计 / 实时挂马拦截 / 幽灵文件 / 进程爆炸</summary>
+
+#### 全局态势感知引擎
+系统级"大脑"——根据资源状态和威胁态势动态调节 Agent 自身行为：
+- **5 档态势**：空闲（Idle）→ 常规（Normal）→ 繁忙（Busy）→ 危急（Crisis）→ 战时（Combat）
+- **空闲窗口**：CPU/内存宽裕时安全扫描加密跑、预测类任务提前执行
+- **战时模式**：检测到持续攻击信号后安全扫描提频 3 倍，非安全任务全部让路；攻击平息后自动退出
+- **自动处置偏置**：战时对低风险安全动作自动提级（攻击不等人），危急时只告警不动作
+
+#### 数据治理守护（V4.1）
+9 项数据库安全与治理能力：
+- **数据库自动备份管家**：定时 mysqldump/pg_dump，备份保留策略，备份文件权限校验
+- **敏感数据泄露扫描**：扫描数据库中的明文密码、身份证、手机号等敏感信息
+- **大表增长预警**：监控表大小增长趋势，超阈值告警并给归档建议
+- **备份完整性校验**：定期验证备份文件可恢复性
+- **数据库死锁自动猎杀**：检测长时间死锁并自动终止死锁进程
+- **连接池泄漏诊断**：检测 Sleep 连接过多并定位来源进程（MySQL 连接按 Host 分组统计）
+- **缓存雪崩预防器**：监控 Redis 大 Key 过期时间分布，防止同时批量过期
+
+#### DevOps 守护（V4.0）
+8 项 DevOps 闭环能力：
+- **Git Webhook 部署守护**：接收 GitHub/Gitee Webhook，自动拉取部署
+- **环境一致性漂移检测**：对比多环境配置差异，发现配置漂移
+- **构建产物自动清理**：定时清理 CI/CD 构建目录中的旧产物
+- **定时任务死锁检测**：检测 cron 任务冲突和长时间未执行的定时任务
+- **批处理作业守护**：监控定时批处理任务执行状态，失败自动告警
+- **文件传输守护**：监控重要文件传输任务的完成状态
+- **第三方 API 健康度**：定时检测关键第三方 API 可用性
+
+#### 反弹 Shell 检测
+检测服务器上运行的可疑反弹 Shell 进程：
+- `bash -i >& /dev/tcp/` 类特征匹配
+- Python/Perl 一行反弹 Shell 模式
+- socat/ncat 反弹连接
+- 进程异常外部端口连接（排除内网 IP 后告警）
+
+#### 源码漏洞审计（W12-W18）
+静态分析 PHP/JSP/Python/Node 源码中的安全漏洞：
+- SQL 注入漏洞（用户输入拼接 SQL）
+- XSS 跨站脚本漏洞（未转义输出）
+- 文件上传漏洞（未校验文件类型）
+- 命令注入漏洞（用户输入拼接系统命令）
+- 路径遍历漏洞（用户输入拼接文件路径）
+- 不安全的反序列化
+- SSRF 服务端请求伪造
+- 硬编码凭证检测
+
+#### 实时挂马拦截
+定时轮询 Web 目录文件变更，检测到新增可疑文件时自动隔离 + 告警：
+- 新增 PHP/JSP/ASP 文件自动扫描恶意特征
+- 已知文件的 mtime 变更触发重新扫描
+- 可疑文件自动移入隔离目录（可恢复）
+- 兼容无 inotify 的环境（轮询模式）
+
+#### 幽灵文件检测
+"已删除但句柄未释放"的隐形空间杀手：
+- 检测 `/proc/*/fd` 中指向已删除文件的句柄
+- 识别 Java/Python 进程持有已删除日志文件句柄的场景
+- 计算幽灵文件实际磁盘占用
+- 告警并建议重启对应进程释放句柄
+
+#### 进程爆炸检测（A6）
+防止程序无限循环启动大量进程实例耗尽系统资源：
+- 按进程名 + 命令行分组统计
+- 同一程序超过 30 个实例 → 触发进程爆炸告警
+- 保留最早启动的 3 个进程，SIGTERM 终止多余实例
+- 完整安全检查链（白名单/宝塔保护/Kill 预算/熔断器）
+
+#### MySQL 连接耗尽定位
+增强 MySQL 连接数检测，按来源 Host 分组统计：
+- 查询 `information_schema.processlist` 按 Host 分组
+- 显示 Top 5 来源 IP 和连接数
+- 单个来源占用超过 50% 连接时给出强提示
+- 与进程爆炸检测联动：定位是哪个程序耗尽了连接池
 
 </details>
 
@@ -311,83 +545,6 @@ sgctl config-version tag|export|import            # 配置版本管理
 
 ---
 
-## 快速开始
-
-### 方式一：一键安装（推荐）
-
-```bash
-# 1. 下载发布包（选择对应架构）
-#    x86_64（绝大多数服务器）:
-wget https://your-server/serverguard-0.1.0-linux-amd64.zip
-#    ARM64（鲲鹏/飞腾/Kylin V10）:
-wget https://your-server/serverguard-0.1.0-linux-arm64.zip
-
-# 2. 解压
-unzip serverguard-0.1.0-linux-amd64.zip
-
-# 3. 运行安装脚本
-sudo bash install.sh
-
-# 4. 打开面板
-#    浏览器访问 http://你的服务器IP:18090
-#    用户名: admin  密码: admin123
-#    首次登录后请立即修改密码！
-```
-
-`install.sh` 自动完成：
-1. 复制二进制到 `/opt/serverguard/`
-2. 生成随机 JWT Secret 的配置文件
-3. 安装 systemd 服务（开机自启 + 崩溃自动重启）
-4. 放行防火墙 18090 端口（firewalld / ufw / iptables 自动检测）
-5. 启动服务并输出面板地址
-
-### 方式二：手动安装
-
-```bash
-# 1. 创建目录
-sudo mkdir -p /opt/serverguard /var/lib/serverguard
-
-# 2. 复制二进制（amd64 或 arm64）
-sudo cp serverguard-agent-linux-amd64 /opt/serverguard/serverguard-agent
-sudo chmod +x /opt/serverguard/serverguard-agent
-
-# 3. 复制配置并修改 JWT Secret（重要！）
-sudo cp configs/serverguard-agent.yaml /opt/serverguard/config.yaml
-sudo sed -i "s/CHANGE_ME_TO_RANDOM_STRING/$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)/" /opt/serverguard/config.yaml
-
-# 4. 安装 systemd 服务
-sudo cp deploy/serverguard-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now serverguard-agent
-
-# 5. 放行防火墙
-sudo firewall-cmd --permanent --add-port=18090/tcp && sudo firewall-cmd --reload  # CentOS/Kylin
-# 或
-sudo ufw allow 18090/tcp  # Ubuntu
-```
-
-### 方式三：在宝塔面板上部署
-
-> 适合已经在用宝塔面板的用户。
-
-1. 宝塔面板 → 文件 → `/opt` → 新建 `serverguard` 目录，上传二进制并重命名为 `serverguard-agent`，上传 `config.yaml`
-2. 宝塔面板 → 安全 → 放行端口 18090
-3. 终端执行：
-```bash
-sudo chmod +x /opt/serverguard/serverguard-agent
-sudo cp /opt/serverguard/serverguard-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now serverguard-agent
-```
-4. （可选）宝塔 → 网站 → 反向代理到 `http://127.0.0.1:18090`，用域名 + 443 访问面板
-
-**宝塔环境下的额外优势**：
-- 自动检测宝塔面板，优先用宝塔API续期证书（不消耗ACME配额）
-- 自动发现宝塔管理的网站，一键导入监控
-- 监控 Nginx/MySQL/PHP 进程，挂了自动重启
-
----
-
 ## 支持的操作系统
 
 | 操作系统 | 架构 | 状态 |
@@ -443,7 +600,8 @@ sudo systemctl enable --now serverguard-agent
 | 内存泄漏拦截 | 进程内存 > 30% | 快照 → 重启 | ✅ 默认只告警 |
 | 磁盘空间守护 | 磁盘 > 95% | 清理旧日志压缩文件 | ❌ 直接执行（只清30天+的.gz/.1/.old） |
 | 日志暴涨防护 | 单文件 > 500MB | 轮转压缩 | ❌ 直接执行（排除web服务日志） |
-| SSH暴力破解 | 5min内5次失败 | 渐进式封禁IP（限速→1h→24h） | ❌ 直接执行（不封私有IP） |
+| SSH暴力破解 | 5min内30次失败 | 渐进式封禁IP（限速→1h→24h） | ❌ 直接执行（不封私有IP） |
+| 进程爆炸拦截 | 同一程序 > 30个实例 | 保留3个，SIGTERM终止多余 | ✅ 默认只告警 |
 | SSL证书续期 | 剩余 < 14天（错峰触发） | 多CA降级续期 → reload → 验证 | ❌ 直接执行 |
 | 僵尸进程清理 | 僵尸 > 10个 | SIGCHLD清理 | ✅ 默认只告警 |
 | 依赖链隔离 | 上游服务宕机 | 标记下游为 isolated，暂停监控 | ❌ 直接执行 |
@@ -487,7 +645,7 @@ vim /opt/serverguard/config.yaml
 systemctl restart serverguard-agent
 
 # 升级版本
-sudo cp serverguard-agent-linux-amd64 /opt/serverguard/serverguard-agent
+sudo cp serverguard-agent /opt/serverguard/serverguard-agent
 sudo chmod +x /opt/serverguard/serverguard-agent
 sudo systemctl restart serverguard-agent
 
@@ -547,6 +705,16 @@ sudo bash /opt/serverguard/uninstall.sh
 │  │Knowledge │  │ WindowRec│  │PostMortem│  V3.9新增    │
 │  │故障知识库│  │变更窗口  │  │复盘报告  │  APM+知识    │
 │  └──────────┘  └──────────┘  └──────────┘              │
+│                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │
+│  │ Posture  │  │DataGovern│ │ DevOps   │  │RevShell │ │
+│  │态势感知  │  │数据治理  │  │DevOps   │  │反弹Shell│ │
+│  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │
+│                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │
+│  │CodeAudit │  │RealtimeG │  │GhostFile │  │ProcExplod│ │
+│  │源码审计  │  │实时挂马  │  │幽灵文件  │  │进程爆炸 │ │
+│  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -570,7 +738,41 @@ Collector采集指标 → Guards检测异常 → RuleEngine匹配规则
 | 嵌入 | 前端编译后通过 Go embed 嵌入二进制，单文件部署 |
 | 依赖 | 零运行时依赖，单二进制文件，不需要安装任何东西 |
 
-> 📋 **变更日志**：v0.2.0 新增 APM-lite + 知识沉淀（V3.9），详见上方能力清单。v0.1.0 功能变更记录见 [docs/CHANGELOG_v3.8.md](docs/CHANGELOG_v3.8.md)
+> 📋 **变更日志**：v0.3.0 新增根因链推理引擎 + DevOps 闭环 + 数据治理 + 幽灵文件检测 + 反弹Shell检测 + 源码漏洞审计 + 实时挂马拦截 + 进程爆炸检测 + MySQL连接耗尽定位 + 全局态势感知引擎（V4.0-V4.1），详见上方能力清单。v0.1.0 功能变更记录见 [docs/CHANGELOG_v3.8.md](docs/CHANGELOG_v3.8.md)
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] Helm Chart / K8s DaemonSet 部署
+- [ ] 插件体系（自定义检测与自愈规则）
+- [ ] Hub 多租户 / RBAC 完善
+- [ ] 英文文档
+
+---
+
+## 🤝 参与贡献
+
+欢迎任何形式的贡献！
+
+1. Fork 本仓库，创建你的分支：`git checkout -b feature/your-feature`
+2. 提交变更：`git commit -m "feat: add your feature"`
+3. 推送分支：`git push origin feature/your-feature`
+4. 提交 [Pull Request](https://github.com/suoten/ServerGuard/compare)
+
+提交 Issue 前请先搜索是否已有重复；报告 Bug 请附上操作系统版本、Agent 版本和相关日志。安全漏洞请勿公开 Issue，请联系 maintainer（见下方社区）。
+
+## 💬 社区与交流
+
+- 🐛 问题反馈：[GitHub Issues](https://github.com/suoten/ServerGuard/issues) / [Gitee Issues](https://gitee.com/suoten/serverguard/issues)
+- 💡 功能建议与讨论：[GitHub Discussions](https://github.com/suoten/ServerGuard/discussions)
+- ⭐ 觉得有用的话，点个 Star 就是最大的支持——更新第一时间收到通知！
+
+## ❤️ 赞助支持
+
+如果 ServerGuard 帮你省下了凌晨爬起来救服务器的次数，欢迎请作者喝杯咖啡 ☕
+
+<!-- 在此放置 GitHub Sponsors / 爱发电 / 微信收款码链接 -->
 
 ---
 
@@ -609,6 +811,14 @@ A: 支持多机集中管控（Hub）。每台服务器装一个 Agent，通过 H
 
 ---
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=suoten/ServerGuard&type=Date)](https://star-history.com/#suoten/ServerGuard&Date)
+
+---
+
 ## License
 
-Private - 硕腾网络
+本项目基于 [Apache License 2.0](LICENSE) 开源。
+
+Copyright © 2026 硕腾网络 (Suoten Network)

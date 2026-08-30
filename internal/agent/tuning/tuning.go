@@ -27,6 +27,12 @@ type alertState struct {
 	hasValue bool
 	// lastSuggest 上次进行阈值调整的时间。
 	lastSuggest time.Time
+	// totalSamples 累计收到的样本数（单调递增）。
+	totalSamples int
+	// samplesAtLastSuggest 上次建议时已收到的累计样本数。
+	// 用于确保只在有新证据进入时才重新调整——
+	// 否则"无误报就降阈值"会在每次读取阈值时重复扣减，把阈值漂移到下限。
+	samplesAtLastSuggest int
 }
 
 // ThresholdTuner 告警阈值自调优器。
@@ -75,6 +81,7 @@ func (t *ThresholdTuner) record(alertType string, isFP bool) {
 	if len(st.window) > t.windowSize {
 		st.window = st.window[len(st.window)-t.windowSize:]
 	}
+	st.totalSamples++
 }
 
 // SuggestThreshold 根据最近样本给出新的建议阈值。
@@ -82,6 +89,10 @@ func (t *ThresholdTuner) record(alertType string, isFP bool) {
 // 样本充足且完全无误报 → 向 current-step 方向回调（提高敏感度）；
 // 样本不足或误报率适中 → 保持当前值。
 // 返回的阈值被夹紧在 [min, max] 内。
+//
+// 重要：只有窗口内出现了上次建议之后的新样本才会重新计算。
+// 该方法在每轮检测读取阈值时都会被调用，若无此保护，
+// "无误报降阈值"会在没有新证据的情况下反复触发，把阈值漂移到下限。
 func (t *ThresholdTuner) SuggestThreshold(alertType string, current, min, max, step float64) float64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -99,7 +110,7 @@ func (t *ThresholdTuner) SuggestThreshold(alertType string, current, min, max, s
 	}
 
 	newVal := base
-	if len(st.window) >= t.minSamples {
+	if len(st.window) >= t.minSamples && st.totalSamples != st.samplesAtLastSuggest {
 		fp := 0
 		for _, v := range st.window {
 			if v {
@@ -121,9 +132,12 @@ func (t *ThresholdTuner) SuggestThreshold(alertType string, current, min, max, s
 		newVal = max
 	}
 
-	st.lastValue = newVal
-	st.hasValue = true
-	st.lastSuggest = time.Now()
+	if !st.hasValue || newVal != base || st.totalSamples != st.samplesAtLastSuggest {
+		st.lastValue = newVal
+		st.hasValue = true
+		st.lastSuggest = time.Now()
+		st.samplesAtLastSuggest = st.totalSamples
+	}
 
 	return newVal
 }

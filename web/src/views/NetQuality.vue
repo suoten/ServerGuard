@@ -100,18 +100,21 @@
     <!-- 探测目标 -->
     <el-card shadow="hover">
       <template #header><span>探测目标列表</span></template>
-      <el-table :data="targets" size="small" stripe>
+      <el-table :data="targets.slice((targetPage-1)*targetSize, targetPage*targetSize)" size="small" stripe>
         <el-table-column label="#" width="40" type="index" />
         <el-table-column label="名称" prop="name" width="150" />
         <el-table-column label="主机" prop="host" min-width="200" />
         <el-table-column label="说明" prop="comment" min-width="200" />
       </el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="targetPage" v-model:page-size="targetSize" :page-sizes="[10, 20, 50, 100]" :total="targets.length" layout="total, sizes, prev, pager, next" />
+</div>
     </el-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import dayjs from 'dayjs'
 import VChart from 'vue-echarts'
@@ -128,17 +131,27 @@ const { isDark } = useDark()
 
 const report = ref<any>(null)
 const targets = ref<any[]>([])
+const targetPage = ref(1)
+const targetSize = ref(10)
 const loading = ref(false)
 const probing = ref(false)
+let pollTimer: ReturnType<typeof setInterval> | null = null
 
 async function fetchReport() {
   loading.value = true
   try {
     const resp = await axios.get('/api/netquality')
-    if (resp.data.report !== null && resp.data.report !== undefined) {
-      report.value = resp.data.report
-    } else if (resp.data.results) {
-      report.value = resp.data
+    // 后端返回 { status: "completed"|"running"|"idle", report: {...} }
+    const data = resp.data
+    if (data.report) {
+      report.value = data.report
+    } else if (data.results) {
+      // 兼容直接返回 report 对象的情况
+      report.value = data
+    }
+    // 如果探测正在进行中，自动轮询
+    if (data.status === 'running' && !pollTimer) {
+      startPolling()
     }
   } catch { /* 静默 */ } finally {
     loading.value = false
@@ -156,11 +169,60 @@ async function probeNow() {
   probing.value = true
   try {
     const resp = await axios.post('/api/netquality/probe')
-    report.value = resp.data
-  } catch (err) {
-    console.error('探测失败:', err)
-  } finally {
-    probing.value = false
+    // 后端返回 202: { status: "started", message: "..." }
+    // 或者 409: { status: "running", message: "..." }
+    if (resp.data.status === 'started' || resp.data.status === 'running') {
+      // 开始轮询结果
+      startPolling()
+    } else if (resp.data.report) {
+      // 意外直接返回了结果
+      report.value = resp.data.report
+      probing.value = false
+    }
+  } catch (err: any) {
+    // 409 Conflict 也意味着正在运行
+    if (err?.response?.status === 409) {
+      startPolling()
+    } else {
+      console.error('探测失败:', err)
+      probing.value = false
+    }
+  }
+}
+
+function startPolling() {
+  probing.value = true
+  if (pollTimer) clearInterval(pollTimer)
+  pollTimer = setInterval(async () => {
+    try {
+      const resp = await axios.get('/api/netquality')
+      const data = resp.data
+      if (data.status === 'completed' && data.report) {
+        report.value = data.report
+        probing.value = false
+        stopPolling()
+      } else if (data.status === 'running') {
+        // 继续等待
+      }
+    } catch {
+      stopPolling()
+      probing.value = false
+    }
+  }, 3000) // 每 3 秒轮询一次
+
+  // 安全超时：2 分钟后停止轮询
+  setTimeout(() => {
+    if (probing.value) {
+      stopPolling()
+      probing.value = false
+    }
+  }, 120000)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
   }
 }
 
@@ -219,6 +281,15 @@ const chartOption = computed(() => {
     tooltip: {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
+      formatter: (params: any) => {
+        const name = params[0]?.axisValueLabel || ''
+        let html = `${name}`
+        for (const p of params) {
+          const val = typeof p.value === 'number' ? p.value.toFixed(2) : p.value
+          html += `<br/>${p.marker}${p.seriesName}: ${val}`
+        }
+        return html
+      },
     },
     legend: {
       data: ['平均延迟(ms)', '丢包率(%)', '抖动(ms)'],
@@ -279,6 +350,10 @@ const chartOption = computed(() => {
 onMounted(() => {
   fetchReport()
   fetchTargets()
+})
+
+onUnmounted(() => {
+  stopPolling()
 })
 </script>
 

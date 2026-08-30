@@ -3,8 +3,8 @@ package decider
 import (
 	"fmt"
 
-	"github.com/suoten/serverguard/internal/types"
 	"github.com/suoten/serverguard/internal/agent/eventbus"
+	"github.com/suoten/serverguard/internal/types"
 )
 
 // ConfirmNotifier 确认消息专用通知推送模块。

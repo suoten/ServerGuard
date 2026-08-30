@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/suoten/serverguard/internal/agent/eventbus"
 	"github.com/suoten/serverguard/internal/agent/executor"
+	"github.com/suoten/serverguard/internal/agent/posture"
 	"github.com/suoten/serverguard/internal/agent/ruleengine"
 	"github.com/suoten/serverguard/internal/agent/safety"
 	"github.com/suoten/serverguard/internal/storage"
 	"github.com/suoten/serverguard/internal/types"
-	"github.com/suoten/serverguard/internal/agent/eventbus"
 )
 
 // Decider evaluates matched rules and decides whether to execute actions.
@@ -34,6 +38,89 @@ type Decider struct {
 	eventBus   *eventbus.EventBus
 	storage    *storage.Storage
 	confirmMgr *ConfirmManager
+
+	// 态势感知（可选注入）：战时对低风险安全动作自动提级、危急时只告警
+	posture PostureSource
+
+	// 信任演化开关：历史高成功率的确认类规则自动跳过人工确认（默认关闭，可配置开启）
+	trustAutoConfirm bool
+
+	// 规则自检降级缓存（规则ID -> 评估结论），避免每次触发都查库
+	mu            sync.Mutex
+	degradedCache map[string]degradeState
+	trustCache    map[string]trustState
+}
+
+// trustState 单条规则的信任评估缓存。
+type trustState struct {
+	trusted   bool
+	checkedAt time.Time
+}
+
+// 信任演化参数：一条需要确认的规则，近 7 天被确认执行 ≥8 次且成功率 100%
+// 才算"赢得信任"，此后自动跳过确认（任何失败立即失去信任回到人工确认）。
+const (
+	trustLookback   = 7 * 24 * time.Hour
+	trustMinSamples = 8
+	trustMinRatePct = 100.0
+)
+
+// PostureSource 提供当前系统态势（由 posture.Engine 实现；接口便于测试桩替换）。
+type PostureSource interface {
+	Current() posture.Posture
+	AutoResolve() posture.Bias
+}
+
+// SetPostureProvider 注入态势感知引擎。
+func (d *Decider) SetPostureProvider(p PostureSource) {
+	d.posture = p
+}
+
+// SetTrustAutoConfirm 开关信任演化（默认关闭）。
+func (d *Decider) SetTrustAutoConfirm(v bool) {
+	d.trustAutoConfirm = v
+}
+
+// isTrustworthy 纯函数：判断历史记录是否赢得信任。
+// 条件：样本足够 + 全部成功。任何一次失败都立即失去信任。
+func isTrustworthy(entries []ruleengine.RuleHistoryEntry, minSamples int, minRatePct float64) bool {
+	if len(entries) < minSamples {
+		return false
+	}
+	success := 0
+	for _, e := range entries {
+		if e.Success {
+			success++
+		}
+	}
+	return float64(success)/float64(len(entries))*100 >= minRatePct
+}
+
+// ruleTrusted 判断规则是否已赢得信任（带缓存，每规则每小时最多复评一次）。
+// 返回值：(是否已信任, 是否本次评估中刚晋升为信任——用于发一次晋升通知)。
+func (d *Decider) ruleTrusted(ruleID string) (bool, bool) {
+	if d.storage == nil || !d.trustAutoConfirm {
+		return false, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.trustCache == nil {
+		d.trustCache = make(map[string]trustState)
+	}
+	now := time.Now()
+	if st, ok := d.trustCache[ruleID]; ok && now.Before(st.checkedAt.Add(degradedRecheckInterval)) {
+		return st.trusted, false
+	}
+
+	entries, err := d.storage.GetActionHistoryByRule(ruleID, now.Add(-trustLookback), 50)
+	trusted := err == nil && isTrustworthy(entries, trustMinSamples, trustMinRatePct)
+	prevTrusted := false
+	if st, ok := d.trustCache[ruleID]; ok {
+		prevTrusted = st.trusted
+	}
+	d.trustCache[ruleID] = trustState{trusted: trusted, checkedAt: now}
+	return trusted, trusted && !prevTrusted
 }
 
 // New creates a new Decider.
@@ -50,6 +137,58 @@ func New(re *ruleengine.RuleEngine, exec *executor.Executor, sm *safety.SafetyMa
 // SetConfirmManager 设置确认管理器
 func (d *Decider) SetConfirmManager(cm *ConfirmManager) {
 	d.confirmMgr = cm
+}
+
+// 规则自检降级参数。
+const (
+	// degradedLookback 成功率评估窗口
+	degradedLookback = 7 * 24 * time.Hour
+	// degradedMinSamples 触发降级所需的最少尝试次数（样本不足不降级）
+	degradedMinSamples = 5
+	// degradedSuccessFloorPct 成功率下限（%），低于此值降级为只告警
+	degradedSuccessFloorPct = 30
+	// degradedRecheckInterval 降级状态的复评间隔——到期后重新统计，修复成功即自动恢复
+	degradedRecheckInterval = 1 * time.Hour
+)
+
+// ruleDegraded 判断规则是否因成功率过低而被自动降级。
+// 结果缓存 degradedUntil 内不重复查询数据库（每规则每小时最多复评一次）。
+func (d *Decider) ruleDegraded(rule *types.Rule) bool {
+	if d.storage == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.degradedCache == nil {
+		d.degradedCache = make(map[string]degradeState)
+	}
+	now := time.Now()
+	st, ok := d.degradedCache[rule.ID]
+	if ok && now.Before(st.checkedAt.Add(degradedRecheckInterval)) {
+		return st.degraded // 复评窗口内直接用缓存结论
+	}
+
+	entries, err := d.storage.GetActionHistoryByRule(rule.ID, now.Add(-degradedLookback), 50)
+	degraded := false
+	if err == nil && len(entries) >= degradedMinSamples {
+		success := 0
+		for _, e := range entries {
+			if e.Success {
+				success++
+			}
+		}
+		rate := float64(success) / float64(len(entries)) * 100
+		degraded = rate < degradedSuccessFloorPct
+	}
+	d.degradedCache[rule.ID] = degradeState{degraded: degraded, checkedAt: now}
+	return degraded
+}
+
+// degradeState 单条规则的降级评估缓存。
+type degradeState struct {
+	degraded  bool
+	checkedAt time.Time
 }
 
 // DecisionResult represents the result of a decision.
@@ -109,6 +248,20 @@ func (d *Decider) Evaluate(ctx context.Context, matches []ruleengine.MatchResult
 			continue
 		}
 
+		// 4.5 规则自检降级：近 7 天执行成功率过低（样本足够）的规则自动降级为只告警。
+		// 反复失败还继续机械重试 = "越修越坏"的另一种形式；降级后告警照发，人工接手。
+		if d.ruleDegraded(rule) {
+			result.Approved = false
+			result.Reason = "rule auto-degraded: low success rate"
+			d.eventBus.PublishAlert(types.AlertWarning, rule.Module,
+				fmt.Sprintf("[规则自检] %s 已自动降级为只告警", rule.Name),
+				fmt.Sprintf("规则 %s 近 7 天自动处置成功率低于 %d%%（≥%d 次尝试），已暂停自动执行、保留告警。\n反复失败说明根因未除——请查看操作历史与诊断报告后人工处理；修复后规则会在下个评估周期自动恢复。",
+					rule.Name, degradedSuccessFloorPct, degradedMinSamples),
+				rule.ID)
+			results = append(results, result)
+			continue
+		}
+
 		// 1. Cooldown check + 2. Max triggers check
 		if !d.safety.CanTriggerRule(rule.ID, rule.Cooldown, rule.MaxTriggers) {
 			result.Approved = false
@@ -132,12 +285,47 @@ func (d *Decider) Evaluate(ctx context.Context, matches []ruleengine.MatchResult
 
 		// 5. User confirmation check (W/X/Y 模块需要用户确认)
 		if rule.NeedsConfirmation {
-			confirmed, err := d.requestConfirmation(ctx, rule, &target)
-			if err != nil || !confirmed {
-				result.Approved = false
-				result.Reason = "user confirmation required but not received"
-				results = append(results, result)
-				continue
+			// 5.0 信任演化：该规则近 7 天被确认执行 ≥8 次且全部成功 → 用户实际上
+			// 反复做出了相同决定，继续每次打断没有价值。跳过确认、留痕审计；
+			// 任何一次失败都会让成功率跌破 100%，规则立即回到人工确认。
+			trusted, promoted := d.ruleTrusted(rule.ID)
+			if trusted {
+				if promoted {
+					d.eventBus.PublishAlert(types.AlertInfo, "posture",
+						fmt.Sprintf("[信任演化] %s 转为自动执行", rule.Name),
+						fmt.Sprintf("规则 %s 近 7 天确认执行 ≥%d 次且成功率 100%%，起跳过人工确认。任一失败将自动恢复人工确认。",
+							rule.ID, trustMinSamples),
+						rule.ID)
+				}
+				_ = d.storage.SaveAudit(types.AuditEntry{
+					ID:        uuid.NewString(),
+					Timestamp: time.Now(),
+					Actor:     "system",
+					Action:    "trust_auto_confirm",
+					Target:    rule.Name,
+					Reason:    fmt.Sprintf("近 7 天确认执行 ≥%d 次且成功率 100%%", trustMinSamples),
+					Result:    "auto-confirmed",
+				})
+			} else if d.posture != nil &&
+				d.posture.AutoResolve() == posture.BiasCombatAuto &&
+				d.posture.Current() == posture.PostureCombat &&
+				combatSafeActions(rule.Actions) {
+				// 5.1 战时自动提级：正在被攻击时，低风险安全动作（封禁 IP 等）跳过人工确认直接处置。
+				// 攻击进行中让人等 5 分钟确认超时等于放任攻击者；事后通过审计与报告向用户说明。
+				// 仅对"战时安全动作白名单"生效——重启服务、清磁盘等业务动作绝不提级。
+				d.eventBus.PublishAlert(types.AlertInfo, "posture",
+					fmt.Sprintf("[战时提级] %s 跳过人工确认自动执行", rule.Name),
+					fmt.Sprintf("系统处于战时态势（持续攻击中），规则 %s 的安全动作 %v 由等待确认改为立即执行。此决策已记录审计，可在操作历史中复查。",
+						rule.ID, actionTypes(rule.Actions)),
+					rule.ID)
+			} else {
+				confirmed, err := d.requestConfirmation(ctx, rule, &target)
+				if err != nil || !confirmed {
+					result.Approved = false
+					result.Reason = "user confirmation required but not received"
+					results = append(results, result)
+					continue
+				}
 			}
 		}
 
@@ -372,4 +560,36 @@ func (d *Decider) requestConfirmation(ctx context.Context, rule *types.Rule, tar
 			}
 		}
 	}
+}
+
+// combatSafeActions 判断规则的动作是否全部属于"战时安全动作白名单"。
+// 只有这些低风险、纯对抗性的动作才允许在战时跳过人工确认：
+//   - ban_ip：封禁攻击源 IP，不触碰业务进程与数据
+//   - alert：仅告警，无副作用
+//   - snapshot：只读取证
+//
+// kill/restart/clean_disk 等涉及业务可用性的动作无论何时都必须走原确认流程——
+// 战时提级是为了更快反击攻击者，不是为了给误伤业务开绿灯。
+func combatSafeActions(actions []types.Action) bool {
+	if len(actions) == 0 {
+		return false // 无动作可执行，不值得提级
+	}
+	for _, a := range actions {
+		switch a.Type {
+		case types.ActionBanIP, types.ActionAlert, types.ActionSnapshot:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// actionTypes 返回动作类型列表（用于审计文案）。
+func actionTypes(actions []types.Action) []string {
+	out := make([]string, 0, len(actions))
+	for _, a := range actions {
+		out = append(out, string(a.Type))
+	}
+	return out
 }

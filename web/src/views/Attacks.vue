@@ -1,6 +1,37 @@
 <template>
   <div class="attack-page">
-    <!-- 攻击事件流（自动检测） -->
+    <!-- 紧急停止状态提示：急停期间 Agent 暂停所有自动扫描，页面必须显式告知 -->
+    <el-alert v-if="emergencyStopped" type="warning" :closable="false" style="margin-bottom: 16px">
+      <template #title>
+        ⚠️ Agent 处于紧急停止状态——所有自动扫描与修复已暂停，本页不会有新结果。
+        <el-button type="primary" size="small" style="margin-left: 12px" @click="resumeFromStop">恢复自动扫描</el-button>
+      </template>
+    </el-alert>
+    <!-- 严重度筛选卡片 -->
+    <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap">
+      <div
+        v-for="tab in severityTabs"
+        :key="tab.key"
+        @click="activeSeverity = tab.key"
+        :style="{
+          cursor: 'pointer',
+          flex: '1 1 120px',
+          minWidth: '120px',
+          padding: '10px 14px',
+          borderRadius: '8px',
+          border: activeSeverity === tab.key ? `2px solid ${tab.color}` : '1px solid #e4e7ed',
+          background: activeSeverity === tab.key ? tab.bg : '#fff',
+          transition: 'all 0.2s',
+          textAlign: 'center',
+        }"
+      >
+<div :style="{ fontSize: '22px', fontWeight: 700, color: tab.color, lineHeight: '1.2' }">
+<CountUp :value="tab.count" />
+</div>
+        <div style="font-size: 12px; color: #909399; margin-top: 4px">{{ tab.label }}</div>
+      </div>
+    </div>
+
     <el-card style="margin-bottom: 20px">
       <template #header>
         <div class="card-header">
@@ -10,7 +41,7 @@
             <el-button :type="sortBySeverity ? 'danger' : 'default'" size="small" plain @click="sortBySeverity = !sortBySeverity">
               {{ sortBySeverity ? '🔴 按严重程度' : '🕐 按时间' }}
             </el-button>
-            <el-tag type="success" size="small">每 5 分钟自动扫描</el-tag>
+            <el-tag type="success" size="small">自动轮转扫描</el-tag>
             <el-button type="success" size="small" @click="triggerScan" :loading="scanning">立即扫描</el-button>
             <el-button type="danger" size="small" @click="emergencyRollback">紧急回滚所有封禁</el-button>
           </div>
@@ -54,9 +85,20 @@
         </el-table-column>
         <template #empty>
           <div style="padding: 30px 0; text-align: center">
-            <el-icon style="font-size: 32px; color: #c0c4cc; margin-bottom: 10px"><Loading /></el-icon>
-            <p style="color: #909399; margin: 0">Agent 正在自动检测攻击事件，请稍候...</p>
-            <p style="color: #c0c4cc; font-size: 12px; margin-top: 8px">检测到攻击后会自动显示并封禁恶意 IP</p>
+            <el-icon v-if="scanning" style="font-size: 32px; color: #409eff; margin-bottom: 10px" class="is-loading"><Loading /></el-icon>
+            <el-icon v-else style="font-size: 32px; color: #c0c4cc; margin-bottom: 10px"><SuccessFilled /></el-icon>
+            <template v-if="scanning">
+              <p style="color: #409eff; margin: 0">Agent 正在检测攻击事件，请稍候...</p>
+              <p style="color: #c0c4cc; font-size: 12px; margin-top: 8px">检测完成后将自动显示结果</p>
+            </template>
+            <template v-else-if="loadError">
+              <p style="color: #f56c6c; margin: 0">事件加载失败：{{ loadError }}</p>
+              <p style="color: #c0c4cc; font-size: 12px; margin-top: 8px">请检查 Agent 是否在线，或点击上方"立即扫描"重试</p>
+            </template>
+            <template v-else>
+              <p style="color: #67c23a; margin: 0">暂无攻击事件，系统运行正常</p>
+              <p style="color: #c0c4cc; font-size: 12px; margin-top: 8px">Agent 按轮转计划自动扫描（安全扫描约每 40 分钟一轮），也可点击上方按钮手动触发</p>
+            </template>
           </div>
         </template>
       </el-table>
@@ -189,10 +231,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Loading, Search } from '@element-plus/icons-vue'
+import { Loading, Search, SuccessFilled } from '@element-plus/icons-vue'
 import axios from 'axios'
 import dayjs from 'dayjs'
 import { useRouter } from 'vue-router'
+import CountUp from '../components/CountUp.vue'
 
 const router = useRouter()
 
@@ -203,6 +246,8 @@ const loadingEvents = ref(false)
 const loadingProfiles = ref(false)
 const loadingBanned = ref(false)
 const scanning = ref(false)
+const loadError = ref('')
+const emergencyStopped = ref(false)
 const ipLookupIP = ref('')
 const ipLocationCache = ref<Record<string, string>>({})
 const searchQuery = ref('')
@@ -217,6 +262,7 @@ const bannedSize = ref(10)
 const attackDetailVisible = ref(false)
 const currentAttack = ref<any>(null)
 const sortBySeverity = ref(true)
+const activeSeverity = ref('') // ''=全部, critical, high, medium, low, info
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const severityOrder: Record<string, number> = {
@@ -225,6 +271,9 @@ const severityOrder: Record<string, number> = {
 
 const filteredEvents = computed(() => {
   let result = events.value
+  if (activeSeverity.value) {
+    result = result.filter((e: any) => e.severity === activeSeverity.value)
+  }
   if (searchQuery.value) {
     const q = searchQuery.value.toLowerCase()
     result = result.filter((e: any) =>
@@ -246,6 +295,23 @@ const pagedEvents = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
   return filteredEvents.value.slice(start, start + pageSize.value)
 })
+
+const severityStats = computed(() => {
+  const stats: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 }
+  for (const e of events.value) {
+    if (stats[e.severity] !== undefined) stats[e.severity]++
+  }
+  return stats
+})
+
+const severityTabs = computed(() => [
+  { key: '', label: '全部', count: events.value.length, color: '#409eff', bg: '#ecf5ff' },
+  { key: 'critical', label: '严重', count: severityStats.value.critical, color: '#f56c6c', bg: '#fef0f0' },
+  { key: 'high', label: '高危', count: severityStats.value.high, color: '#f56c6c', bg: '#fef0f0' },
+  { key: 'medium', label: '中危', count: severityStats.value.medium, color: '#e6a23c', bg: '#fdf6ec' },
+  { key: 'low', label: '低危', count: severityStats.value.low, color: '#909399', bg: '#f4f4f5' },
+  { key: 'info', label: '信息', count: severityStats.value.info, color: '#909399', bg: '#f4f4f5' },
+])
 const filteredProfiles = computed(() => {
   let result = profiles.value
   if (profileSearch.value) {
@@ -324,7 +390,10 @@ const attackTypeLabel = (t: string) => {
     'sql_injection': 'SQL注入', 'xss': 'XSS攻击', 'webshell_upload': 'Webshell上传',
     'ssh_brute_force': 'SSH暴破', 'port_scan': '端口扫描', 'ddos': 'DDoS攻击',
     'ddos_suspected': 'DDoS疑似', 'directory_traversal': '目录遍历', 'directory_brute': '目录爆破',
-    'cc_attack': 'CC攻击', 'data_exfiltration': '数据外泄', 'malicious_crawler': '恶意爬虫',
+    'dir_traversal': '目录遍历', 'cc_attack': 'CC攻击', 'data_exfiltration': '数据外泄',
+    'malicious_crawler': '恶意爬虫',
+    'web_scanner': '扫描器探测', 'sensitive_probe': '敏感文件探测', 'code_injection': '代码执行攻击',
+    'cms_bruteforce': '后台登录爆破', 'dir_bruteforce': '目录爆破探测',
     'rate_limit_violation': '频率超限', 'ban_limit_reached': '封禁上限（仅告警）',
   }
   if (t.startsWith('rate_limited')) return '限速触发'
@@ -445,6 +514,11 @@ const autoLookupIPs = async () => {
   await Promise.all(ips.map(ip => lookupIP(ip)))
 }
 
+// 监听严重度筛选变化，重置分页
+watch(activeSeverity, () => {
+  currentPage.value = 1
+})
+
 // 监听分页变化，自动查询新页的 IP
 watch([currentPage, pageSize], () => {
   autoLookupIPs()
@@ -469,12 +543,13 @@ const showAttackDetail = (row: any) => {
 const loadEvents = async () => {
   loadingEvents.value = true
   try {
-    const resp = await axios.get('/api/attack-events', { params: { limit: 200 } })
+    const resp = await axios.get('/api/attack-events', { params: { limit: 200 }, timeout: 10000 })
     events.value = resp.data.events || []
+    loadError.value = ''
     // 加载完成后自动查询当前页 IP 属地
     setTimeout(autoLookupIPs, 100)
-  } catch {
-    // 静默失败
+  } catch (e: any) {
+    loadError.value = e?.response?.data?.error || e?.message || '网络错误'
   } finally {
     loadingEvents.value = false
   }
@@ -483,7 +558,7 @@ const loadEvents = async () => {
 const loadProfiles = async () => {
   loadingProfiles.value = true
   try {
-    const resp = await axios.get('/api/attack-profiles', { params: { limit: 100 } })
+    const resp = await axios.get('/api/attack-profiles', { params: { limit: 100 }, timeout: 10000 })
     profiles.value = resp.data.profiles || []
   } catch {
     // 静默失败
@@ -495,7 +570,7 @@ const loadProfiles = async () => {
 const loadBanned = async () => {
   loadingBanned.value = true
   try {
-    const resp = await axios.get('/api/scan/attackwarn/banned')
+    const resp = await axios.get('/api/scan/attackwarn/banned', { timeout: 10000 })
     bannedIPs.value = resp.data.banned || []
   } catch {
     // 静默失败
@@ -504,19 +579,60 @@ const loadBanned = async () => {
   }
 }
 
+// 查询紧急停止状态：急停期间所有自动扫描暂停，必须在页面显式提示
+const loadEmergencyStatus = async () => {
+  try {
+    const resp = await axios.get('/api/status', { timeout: 10000 })
+    emergencyStopped.value = !!resp.data?.safety?.emergency_stop || resp.data?.emergency_stop === true
+  } catch {
+    // 状态获取失败不阻塞页面
+  }
+}
+
+// 恢复自动扫描（解除紧急停止）
+const resumeFromStop = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '确认恢复自动扫描与修复？Agent 将重新开始按轮转计划执行安全与攻击扫描。',
+      '恢复自动扫描',
+      { type: 'warning', confirmButtonText: '确认恢复', cancelButtonText: '取消' }
+    )
+    await axios.post('/api/emergency-resume', {}, { timeout: 10000 })
+    emergencyStopped.value = false
+    ElMessage.success('已恢复自动扫描')
+    loadAll()
+  } catch (e: any) {
+    if (e !== 'cancel' && e?.message !== 'cancel') {
+      ElMessage.error(e?.response?.data?.error || '恢复失败')
+    }
+  }
+}
+
 // 跳转到攻击预警页面并定位某个IP
 const goToAttacks = (ip: string) => {
   router.push({ path: '/attacks', query: { ip } })
 }
 
+let scanPollTimer: ReturnType<typeof setTimeout> | null = null
+
 const triggerScan = async () => {
   scanning.value = true
   try {
-    const resp = await axios.post('/api/scan/attackwarn', {})
-    ElMessage.success(resp.data.message || '扫描完成')
-    loadEvents()
-    loadProfiles()
-    loadBanned()
+    const resp = await axios.post('/api/scan/attackwarn', {}, { timeout: 15000 })
+    ElMessage.success(resp.data.message || '扫描已启动，请稍后查看结果')
+    // 立即刷新一次
+    loadAll()
+    // 启动轮询：5 秒后开始，每 5 秒刷新，持续 2 分钟
+    if (scanPollTimer) clearTimeout(scanPollTimer)
+    let pollCount = 0
+    const maxPolls = 24 // 2 分钟
+    const pollData = () => {
+      if (pollCount >= maxPolls) return
+      pollCount++
+      loadAll()
+      scanPollTimer = setTimeout(pollData, 5000)
+    }
+    scanPollTimer = setTimeout(pollData, 5000)
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.error || '扫描失败')
   } finally {
@@ -545,16 +661,18 @@ const loadAll = () => {
   loadEvents()
   loadProfiles()
   loadBanned()
+  loadEmergencyStatus()
 }
 
 onMounted(() => {
   loadAll()
-  // 每 30 秒自动刷新，展示 Agent 自动扫描的最新结果
+  // 每 60 秒自动刷新，展示 Agent 自动扫描的最新结果
   refreshTimer = setInterval(loadAll, 60000)
 })
 
 onUnmounted(() => {
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+  if (scanPollTimer) { clearTimeout(scanPollTimer); scanPollTimer = null }
 })
 </script>
 

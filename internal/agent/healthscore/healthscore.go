@@ -28,12 +28,16 @@ type Deduction struct {
 }
 
 // Scorer calculates health scores based on system metrics.
+// 向宝塔学习：不每轮都查数据库算健康分，降频到每 5 轮查一次
 type Scorer struct {
-	mu      sync.RWMutex
-	current Score
-	history []int // last 7 scores for trend
-	store   *storage.Storage
-	probe   *probe.Probe
+	mu           sync.RWMutex
+	current      Score
+	history      []int // last 7 scores for trend
+	store        *storage.Storage
+	probe        *probe.Probe
+	alertCount   int  // 缓存的未解决告警数
+	alertTick    int  // 计数器：每 N 轮才查一次 DB
+	alertRefresh bool // 是否需要立即刷新
 }
 
 // New creates a new Scorer.
@@ -49,6 +53,7 @@ func New(store *storage.Storage, p *probe.Probe) *Scorer {
 			Deductions:   []Deduction{},
 			Trend:        "stable",
 		},
+		alertRefresh: true, // 首次立即查
 	}
 }
 
@@ -146,17 +151,24 @@ func (s *Scorer) Calculate(metrics map[string]interface{}) Score {
 	}
 
 	// Unresolved alerts
+	// 向宝塔学习：不每轮都查 DB，每 5 轮查一次，中间用缓存
 	if s.store != nil {
-		if alerts, err := s.store.GetUnresolvedAlerts(); err == nil {
-			alertCount := len(alerts)
-			if alertCount > 0 {
-				points := alertCount * 5
-				if points > 30 {
-					points = 30
-				}
-				availScore -= points
-				deductions = append(deductions, Deduction{"availability", fmt.Sprintf("%d 条未解决告警", alertCount), points})
+		s.alertTick++
+		if s.alertRefresh || s.alertTick >= 5 {
+			if alerts, err := s.store.GetUnresolvedAlerts(); err == nil {
+				s.alertCount = len(alerts)
 			}
+			s.alertTick = 0
+			s.alertRefresh = false
+		}
+		alertCount := s.alertCount
+		if alertCount > 0 {
+			points := alertCount * 5
+			if points > 30 {
+				points = 30
+			}
+			availScore -= points
+			deductions = append(deductions, Deduction{"availability", fmt.Sprintf("%d 条未解决告警", alertCount), points})
 		}
 	}
 

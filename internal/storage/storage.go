@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,9 @@ type Storage struct {
 	db   *sql.DB
 	mu   sync.RWMutex
 	path string
+	// 向宝塔学习：缓存 retention policy，不每次维护都查 DB
+	cachedRP   RetentionPolicy
+	rpLoaded   bool
 }
 
 // New creates a new Storage instance and initializes the database.
@@ -42,9 +46,12 @@ func New(path string) (*Storage, error) {
 	}
 
 	// Connection pool settings
-	db.SetMaxOpenConns(1) // SQLite single writer
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxIdleTime(0)
+	// 向宝塔学习：WAL 模式下 SQLite 支持并发读 + 单写
+	// 原来只开 1 个连接，读查询和写操作互斥等待 → 慢查询阻塞采集写入 → 502
+	// WAL 模式下开多个连接：写串行（SQLite 保证），读并行
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	s := &Storage{db: db, path: path}
 
@@ -312,7 +319,8 @@ func (s *Storage) migrateAttackProfiles() {
 
 // maintenanceLoop runs periodic maintenance tasks.
 func (s *Storage) maintenanceLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	// 向宝塔学习：维护周期从 5min 延长到 15min，减少 DB 写入锁竞争
+	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -330,10 +338,18 @@ func (s *Storage) walCheckpoint() {
 
 // purgeOldData removes expired data based on retention policies.
 // 使用差异化保留策略，审计表(WORM)跳过清理。
+// 向宝塔学习：缓存 retention policy，不每次维护都查 DB
 func (s *Storage) purgeOldData() {
-	rp, err := s.GetRetentionPolicy()
-	if err != nil {
-		rp = DefaultRetentionPolicy()
+	s.mu.RLock()
+	rp := s.cachedRP
+	loaded := s.rpLoaded
+	s.mu.RUnlock()
+	if !loaded {
+		rp, _ = s.GetRetentionPolicy()
+		s.mu.Lock()
+		s.cachedRP = rp
+		s.rpLoaded = true
+		s.mu.Unlock()
 	}
 	_ = s.EnforceRetention(rp)
 }
@@ -379,14 +395,39 @@ func (s *Storage) SaveMetrics(metrics []types.Metric) error {
 }
 
 // GetMetrics retrieves metrics by type and time range.
+// mType / name 为空时表示不过滤（通配）。
+// 查询范围同时覆盖 raw 表和聚合表（metrics_1m / metrics_1h），
+// 因为降采样会把 >1h 的原始数据聚合并删除，只查 raw 会丢失历史。
 func (s *Storage) GetMetrics(mType string, name string, since time.Time, limit int) ([]types.Metric, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(
-		"SELECT type, name, value, unit, timestamp, labels FROM metrics WHERE type=? AND name=? AND timestamp>=? ORDER BY timestamp DESC LIMIT ?",
-		mType, name, since, limit,
-	)
+	sinceStr := since.UTC().Format(time.RFC3339)
+
+	query := fmt.Sprintf(`
+SELECT type, name, value, unit, timestamp, labels FROM (
+	SELECT type, name, value, unit, timestamp, labels FROM metrics
+	WHERE granularity = 'raw' AND timestamp >= ? %s %s
+	UNION ALL
+	SELECT type, name, avg, unit, strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', timestamp), labels FROM metrics_1m
+	WHERE timestamp >= datetime(?) %s %s
+	UNION ALL
+	SELECT type, name, avg, unit, strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', timestamp), labels FROM metrics_1h
+	WHERE timestamp >= datetime(?) %s %s
+) ORDER BY timestamp DESC LIMIT ?`,
+		metricsWildcardAnd("type", mType), metricsWildcardAnd("name", name),
+		metricsWildcardAnd("type", mType), metricsWildcardAnd("name", name),
+		metricsWildcardAnd("type", mType), metricsWildcardAnd("name", name))
+
+	args := []interface{}{sinceStr}
+	args = append(args, metricsWildcardArgs(mType, name)...)
+	args = append(args, sinceStr)
+	args = append(args, metricsWildcardArgs(mType, name)...)
+	args = append(args, sinceStr)
+	args = append(args, metricsWildcardArgs(mType, name)...)
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -406,6 +447,25 @@ func (s *Storage) GetMetrics(mType string, name string, since time.Time, limit i
 	return metrics, nil
 }
 
+// metricsWildcardAnd 返回按列过滤的 AND 子句（空值表示不过滤）。
+func metricsWildcardAnd(column, value string) string {
+	if value == "" {
+		return ""
+	}
+	return " AND " + column + " = ?"
+}
+
+// metricsWildcardArgs 返回与 metricsWildcardAnd 对应的参数（单表份）。
+func metricsWildcardArgs(values ...string) []interface{} {
+	var args []interface{}
+	for _, v := range values {
+		if v != "" {
+			args = append(args, v)
+		}
+	}
+	return args
+}
+
 // BaselineBucket 一个"周几×小时"时段的基线统计（UTC）。
 type BaselineBucket struct {
 	Bucket int     // 0..167 = weekday(0=Sun)*24 + hour
@@ -415,18 +475,30 @@ type BaselineBucket struct {
 }
 
 // GetMetricBaselineStats 按"周几×小时"聚合指标历史，用于分时段基线异常检测。
-// 利用 AVG(v*v)-AVG(v)^2 计算方差，单查询完成，避免拉取原始明细。
+// 单查询完成，避免拉取原始明细。
+// 数据源同时包含 raw 表和 1 分钟聚合表（metrics_1m）：
+// 降采样会把 >1h 的 raw 聚合进 metrics_1m 后删除，只查 raw 将无法积累多天基线。
+// 聚合行按 avg*count 折算为 Σx/Σx²（把一分钟内的样本近似为同值），对跨天基线的均值/方差影响可忽略。
 func (s *Storage) GetMetricBaselineStats(name string, since time.Time) ([]BaselineBucket, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	sinceStr := since.UTC().Format(time.RFC3339)
 	rows, err := s.db.Query(
-		`SELECT (CAST(strftime('%w', timestamp) AS INTEGER) * 24 + CAST(strftime('%H', timestamp) AS INTEGER)) AS bucket,
-		        AVG(value), AVG(value * value), COUNT(*)
-		 FROM metrics
-		 WHERE name = ? AND timestamp >= ?
-		 GROUP BY bucket`,
-		name, since.UTC().Format(time.RFC3339),
+		`SELECT bucket, SUM(sum_x), SUM(sum_x2), SUM(cnt) FROM (
+			SELECT (CAST(strftime('%w', timestamp) AS INTEGER) * 24 + CAST(strftime('%H', timestamp) AS INTEGER)) AS bucket,
+			       SUM(value) AS sum_x, SUM(value * value) AS sum_x2, COUNT(*) AS cnt
+			 FROM metrics
+			 WHERE granularity='raw' AND name = ? AND timestamp >= ?
+			 GROUP BY bucket
+			UNION ALL
+			SELECT (CAST(strftime('%w', timestamp) AS INTEGER) * 24 + CAST(strftime('%H', timestamp) AS INTEGER)) AS bucket,
+			       AVG(avg) * COUNT(*) AS sum_x, AVG(avg) * AVG(avg) * COUNT(*) AS sum_x2, COUNT(*) AS cnt
+			 FROM metrics_1m
+			 WHERE name = ? AND timestamp >= datetime(?)
+			 GROUP BY bucket
+		) GROUP BY bucket`,
+		name, sinceStr, name, sinceStr,
 	)
 	if err != nil {
 		return nil, err
@@ -436,18 +508,22 @@ func (s *Storage) GetMetricBaselineStats(name string, since time.Time) ([]Baseli
 	var out []BaselineBucket
 	for rows.Next() {
 		var b BaselineBucket
-		var avgSq float64
-		if err := rows.Scan(&b.Bucket, &b.Mean, &avgSq, &b.Count); err != nil {
+		var sumX, sumX2 float64
+		if err := rows.Scan(&b.Bucket, &sumX, &sumX2, &b.Count); err != nil {
 			continue
 		}
-		variance := avgSq - b.Mean*b.Mean
+		if b.Count <= 0 {
+			continue
+		}
+		b.Mean = sumX / float64(b.Count)
+		variance := sumX2/float64(b.Count) - b.Mean*b.Mean
 		if variance < 0 {
 			variance = 0 // 浮点误差兜底
 		}
 		b.Stddev = math.Sqrt(variance)
 		out = append(out, b)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // DiskDailyPoint 某挂载点某天的平均使用率。
@@ -458,16 +534,23 @@ type DiskDailyPoint struct {
 }
 
 // GetDiskDailyAverages 返回磁盘使用率按"挂载点×天"的日均值，用于容量增长预测。
+// 同时读取 raw 与 1 分钟聚合表——降采样后 raw 只保留 1 小时，仅查 raw 无法得到多天趋势。
 func (s *Storage) GetDiskDailyAverages(since time.Time) ([]DiskDailyPoint, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	sinceStr := since.UTC().Format(time.RFC3339)
 	rows, err := s.db.Query(
-		`SELECT json_extract(labels, '$.mount'), date(timestamp), AVG(value)
-		 FROM metrics
-		 WHERE name = 'disk.used_percent' AND timestamp >= ?
-		 GROUP BY 1, 2`,
-		since.UTC().Format(time.RFC3339),
+		`SELECT mount, date(timestamp), AVG(value) FROM (
+			SELECT json_extract(labels, '$.mount') AS mount, timestamp, value
+			  FROM metrics
+			 WHERE granularity='raw' AND name = 'disk.used_percent' AND timestamp >= ?
+			UNION ALL
+			SELECT json_extract(labels, '$.mount') AS mount, timestamp, avg AS value
+			  FROM metrics_1m
+			 WHERE name = 'disk.used_percent' AND timestamp >= datetime(?)
+		) GROUP BY mount, 2`,
+		sinceStr, sinceStr,
 	)
 	if err != nil {
 		return nil, err
@@ -490,6 +573,31 @@ func (s *Storage) GetDiskDailyAverages(since time.Time) ([]DiskDailyPoint, error
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// MetricStats 指标在时间范围内的峰值与均值（SQL 聚合，不加载明细到内存）。
+type MetricStats struct {
+	Count int
+	Max   float64
+	Avg   float64
+}
+
+// GetMetricStats 用一条聚合查询计算指标峰值/均值。
+// 报表生成原先把最多 20000 行明细拉进 Go 内存只为算 max/avg，
+// 在 1G 内存的机器上是无谓的分配毛刺；聚合下推给 SQLite 完成。
+func (s *Storage) GetMetricStats(name string, since time.Time) (MetricStats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out MetricStats
+	sinceStr := since.UTC().Format(time.RFC3339)
+	err := s.db.QueryRow(`
+SELECT COUNT(*), COALESCE(MAX(value),0), COALESCE(AVG(value),0) FROM (
+	SELECT value FROM metrics WHERE granularity='raw' AND name = ? AND timestamp >= ?
+	UNION ALL
+	SELECT avg AS value FROM metrics_1m WHERE name = ? AND timestamp >= datetime(?)
+)`, name, sinceStr, name, sinceStr).Scan(&out.Count, &out.Max, &out.Avg)
+	return out, err
 }
 
 // --- Alerts ---
@@ -574,12 +682,43 @@ func (s *Storage) GetUnresolvedAlerts() ([]types.Alert, error) {
 	return alerts, nil
 }
 
+// GetAlertByID 按 ID 获取单条告警；不存在时返回错误。
+// 供 AI 解释（explainAlert）读取原始告警内容使用。
+func (s *Storage) GetAlertByID(id string) (*types.Alert, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var a types.Alert
+	var labelsJSON string
+	var tsStr string
+	err := s.db.QueryRow(
+		"SELECT id, level, title, message, source, rule_id, labels, timestamp FROM alerts WHERE id=?", id,
+	).Scan(&a.ID, &a.Level, &a.Title, &a.Message, &a.Source, &a.RuleID, &labelsJSON, &tsStr)
+	if err != nil {
+		return nil, fmt.Errorf("get alert: %w", err)
+	}
+	a.Timestamp, _ = time.Parse(time.RFC3339, tsStr)
+	return &a, nil
+}
+
 // ResolveAlert marks an alert as resolved.
 func (s *Storage) ResolveAlert(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec("UPDATE alerts SET resolved=1, resolved_at=? WHERE id=?", time.Now(), id)
+	_, err := s.db.Exec("UPDATE alerts SET resolved=1, resolved_at=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), id)
 	return err
+}
+
+// ResolveAlertsBySource 批量解决指定来源的未解决告警。
+// 用于攻击扫描前自动清理上一轮的旧告警，避免告警无限堆积。
+func (s *Storage) ResolveAlertsBySource(source string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec("UPDATE alerts SET resolved=1, resolved_at=? WHERE source=? AND resolved=0", time.Now().UTC().Format(time.RFC3339), source)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // GetAlertsByTimeRange 返回指定时间范围内的所有告警（包括已解决的）。
@@ -775,11 +914,31 @@ func (s *Storage) SaveGuardTarget(t types.GuardTarget) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+
+	// 序列化 DependsOn / RestartPolicy / Tags —— 这些字段参与依赖链隔离与重启策略，
+	// 丢失会导致"上游宕机暂停下游监控"和退避重启失效
+	dependsOnJSON := labelsToJSON(nil)
+	if len(t.DependsOn) > 0 {
+		if data, err := json.Marshal(t.DependsOn); err == nil {
+			dependsOnJSON = string(data)
+		}
+	}
+	restartPolicyJSON := labelsToJSON(nil)
+	if data, err := json.Marshal(t.RestartPolicy); err == nil {
+		restartPolicyJSON = string(data)
+	}
+	tagsJSON := labelsToJSON(nil)
+	if len(t.Tags) > 0 {
+		if data, err := json.Marshal(t.Tags); err == nil {
+			tagsJSON = string(data)
+		}
+	}
+
 	_, err := s.db.Exec(
 		`INSERT OR REPLACE INTO guard_targets (id, name, type, command, stop_command, port, health_check, process_name, depends_on, restart_policy, enabled, tags, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Name, string(t.Type), t.Command, t.StopCommand, t.Port, t.HealthCheck, t.ProcessName,
-		labelsToJSON(nil), labelsToJSON(nil), boolToInt(t.Enabled), labelsToJSON(nil),
+		dependsOnJSON, restartPolicyJSON, boolToInt(t.Enabled), tagsJSON,
 		now, now,
 	)
 	return err
@@ -939,18 +1098,23 @@ func labelsToJSON(labels map[string]string) string {
 	if len(labels) == 0 {
 		return "{}"
 	}
-	// Simple JSON encoding
-	result := "{"
+	// 向宝塔学习：用 strings.Builder 代替 fmt.Sprintf 拼接，减少分配
+	var b strings.Builder
+	b.WriteByte('{')
 	first := true
 	for k, v := range labels {
 		if !first {
-			result += ","
+			b.WriteByte(',')
 		}
-		result += fmt.Sprintf(`"%s":"%s"`, k, v)
+		b.WriteByte('"')
+		b.WriteString(k)
+		b.WriteString(`":"`)
+		b.WriteString(v)
+		b.WriteByte('"')
 		first = false
 	}
-	result += "}"
-	return result
+	b.WriteByte('}')
+	return b.String()
 }
 
 func boolToInt(b bool) int {
@@ -989,26 +1153,37 @@ func (s *Storage) GetDBSize() int64 {
 	return info.Size()
 }
 
-// Backup creates a backup copy of the database.
+// Backup creates a consistent backup of the database.
+// 优先使用 VACUUM INTO：WAL 模式下直接拷贝主文件会丢失/错配 WAL 中未 checkpoint 的数据，
+// 得到的备份可能损坏；VACUUM INTO 输出完整一致的独立快照。
 func (s *Storage) Backup(destDir string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	src, err := os.Open(s.path)
-	if err != nil {
+	if err := os.MkdirAll(destDir, 0750); err != nil {
 		return err
 	}
-	defer src.Close()
-
 	dest := filepath.Join(destDir, fmt.Sprintf("serverguard.db.bak.%s", time.Now().Format("20060102")))
-	dst, err := os.Create(dest)
-	if err != nil {
+	_ = os.Remove(dest) // VACUUM INTO 要求目标文件不存在
+
+	if _, err := s.db.Exec("VACUUM INTO ?", dest); err != nil {
+		// 老版本 SQLite 不支持 VACUUM INTO 时回退为文件拷贝
+		src, err := os.Open(s.path)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+
+		dst, err := os.Create(dest)
+		if err != nil {
+			return err
+		}
+		defer dst.Close()
+
+		_, err = dst.ReadFrom(src)
 		return err
 	}
-	defer dst.Close()
-
-	_, err = dst.ReadFrom(src)
-	return err
+	return nil
 }
 
 // StorageDriver 存储后端类型

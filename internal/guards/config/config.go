@@ -56,7 +56,7 @@ func New(bus *eventbus.EventBus, backupDir string) *ConfigGuard {
 func (g *ConfigGuard) AddMonitoredFile(path string) error {
 	// 安全检查: 文件完整性监控排除路径
 	if safety.IsFIMExcluded(path) {
-		return fmt.Errorf("path %s is in FIM exclusion list (baota dynamic file), skipped", path)
+		return fmt.Errorf("路径 %s 在 FIM 排除列表中（宝塔动态文件），已跳过", path)
 	}
 
 	g.mu.Lock()
@@ -159,7 +159,7 @@ func (g *ConfigGuard) Rollback(ctx context.Context, path string) error {
 	lowerPath := strings.ToLower(path)
 	for _, cp := range criticalPaths {
 		if strings.HasPrefix(lowerPath, strings.ToLower(cp)) {
-			return fmt.Errorf("refused to rollback critical system path: %s (too dangerous, manual intervention required)", path)
+			return fmt.Errorf("拒绝回滚关键系统路径: %s（风险过高，需人工处理）", path)
 		}
 	}
 
@@ -168,7 +168,7 @@ func (g *ConfigGuard) Rollback(ctx context.Context, path string) error {
 	g.mu.RUnlock()
 
 	if len(history) < 2 {
-		return fmt.Errorf("no previous version to rollback to")
+		return fmt.Errorf("没有可回滚的历史版本")
 	}
 
 	// Get the previous version's backup
@@ -180,7 +180,7 @@ func (g *ConfigGuard) Rollback(ctx context.Context, path string) error {
 	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
 
 	if len(matches) == 0 {
-		return fmt.Errorf("backup file not found")
+		return fmt.Errorf("备份文件未找到")
 	}
 
 	// Read backup and restore

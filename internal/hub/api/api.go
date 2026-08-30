@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -26,37 +27,43 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
+	hostnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
 
+	"github.com/suoten/serverguard/internal/agent/anomaly"
 	"github.com/suoten/serverguard/internal/agent/conflict"
+	"github.com/suoten/serverguard/internal/agent/correlation"
 	"github.com/suoten/serverguard/internal/agent/decider"
 	"github.com/suoten/serverguard/internal/agent/forecast"
 	"github.com/suoten/serverguard/internal/agent/healthscore"
+	"github.com/suoten/serverguard/internal/agent/knowledge"
+	"github.com/suoten/serverguard/internal/agent/maintwindow"
+	"github.com/suoten/serverguard/internal/agent/netquality"
+	"github.com/suoten/serverguard/internal/agent/posture"
 	"github.com/suoten/serverguard/internal/agent/probe"
 	"github.com/suoten/serverguard/internal/agent/safety"
 	"github.com/suoten/serverguard/internal/agent/sitediscovery"
 	"github.com/suoten/serverguard/internal/baota"
 	"github.com/suoten/serverguard/internal/comm"
 	"github.com/suoten/serverguard/internal/config"
+	"github.com/suoten/serverguard/internal/guards/ai"
+	"github.com/suoten/serverguard/internal/guards/apm"
 	"github.com/suoten/serverguard/internal/guards/attackwarn"
 	"github.com/suoten/serverguard/internal/guards/cert"
+	"github.com/suoten/serverguard/internal/guards/datagovern"
+	"github.com/suoten/serverguard/internal/guards/devops"
 	"github.com/suoten/serverguard/internal/guards/serversecurity"
 	"github.com/suoten/serverguard/internal/guards/tuning"
 	"github.com/suoten/serverguard/internal/guards/vulnscan"
 	"github.com/suoten/serverguard/internal/guards/websecurity"
 	"github.com/suoten/serverguard/internal/hub/panel"
 	"github.com/suoten/serverguard/internal/hub/registry"
+	"github.com/suoten/serverguard/internal/intel"
 	"github.com/suoten/serverguard/internal/notifier"
 	"github.com/suoten/serverguard/internal/report"
 	"github.com/suoten/serverguard/internal/storage"
 	"github.com/suoten/serverguard/internal/types"
 	"github.com/suoten/serverguard/internal/version"
-	"github.com/suoten/serverguard/internal/agent/anomaly"
-	"github.com/suoten/serverguard/internal/agent/knowledge"
-	"github.com/suoten/serverguard/internal/agent/maintwindow"
-	"github.com/suoten/serverguard/internal/agent/netquality"
-	"github.com/suoten/serverguard/internal/guards/apm"
-	"github.com/suoten/serverguard/internal/intel"
 )
 
 // API implements the Hub REST API.
@@ -90,6 +97,17 @@ type API struct {
 	baotaDiscovery *baota.Discovery
 	confirmManager *decider.ConfirmManager
 
+	// 态势感知引擎（V4.x 智能调度，供 /api/posture 展示）
+	postureEngine *posture.Engine
+
+	// 登录防暴力破解：按来源 IP 统计失败次数，超限锁定一段时间。
+	// 面板监听 0.0.0.0 时 /api/login 暴露在公网，无限制的密码尝试是真实风险。
+	loginLimiter *loginLimiter
+
+	// /api/status 响应缓存（3s TTL）：面板高频轮询接口，避免多标签页放大系统调用
+	statusCache     gin.H
+	statusCacheTime time.Time
+
 	// 进程 TOP 缓存（避免每 5 秒全量扫描）
 	topProcCache     *topProcCacheData
 	topProcCacheTime time.Time
@@ -117,15 +135,69 @@ type API struct {
 	anomalyDet *anomaly.Detector
 
 	// V3.9 — APM-lite + 知识沉淀
-	nginxAnalyzer    *apm.NginxLogAnalyzer
+	nginxAnalyzer     *apm.NginxLogAnalyzer
 	slowQueryAnalyzer *apm.SlowQueryAnalyzer
-	redisAnalyzer    *apm.RedisAnalyzer
-	netQualityMon    *netquality.Monitor
-	knowledgeBase    *knowledge.KnowledgeBase
+	redisAnalyzer     *apm.RedisAnalyzer
+	netQualityMon     *netquality.Monitor
+	knowledgeBase     *knowledge.KnowledgeBase
 	windowRecommender *maintwindow.Recommender
+
+	// V4.0 — 根因链推理引擎
+	corrEngine *correlation.Engine
+
+	// V4.0 — 首跑引导向导
+	onboarding *sitediscovery.OnboardingWizard
+
+	// V4.0 — 通知双向交互
+	biNotifier *notifier.BidirectionalNotifier
+
+	// V4.0 — LLM 增强器（可选）
+	llmEnhancer *ai.LLMEnhancer
+
+	// V4.0 — DevOps 守护模块
+	devOpsGuard *devops.DevOpsGuard
+
+	// V4.1 — 数据治理守护模块
+	dataGovernGuard *datagovern.DataGovernGuard
 
 	// 威胁情报管理器
 	intelMgr *intel.IntelManager
+
+	// ─── 异步任务缓存（防止同步阻塞导致 502）───
+
+	// 网络质量探测：异步执行 + 结果缓存
+	netProbeRunning bool                      // 是否正在探测
+	netProbeResult  *netquality.QualityReport // 最近一次探测结果
+	netProbeTime    time.Time                 // 最近一次探测完成时间
+	netProbeErr     string                    // 最近一次探测错误信息
+
+	// 大文件扫描：异步执行 + 结果缓存
+	fileScanRunning bool             // 是否正在扫描
+	fileScanResult  *largeFilesCache // 最近一次扫描结果
+	fileScanTime    time.Time        // 最近一次扫描完成时间
+	fileScanErr     string           // 最近一次扫描错误信息
+
+	// LLM 异步任务缓存（防止同步阻塞导致 502）
+	// LLM 调用最多 30s，而 Hub WriteTimeout 也是 30s，同步调用必然 502
+	llmIncidentRunning bool      // explainIncident 是否正在执行
+	llmIncidentID      string    // 正在解释的事件 ID
+	llmIncidentResult  string    // 最近一次解释结果
+	llmIncidentTime    time.Time // 最近一次解释完成时间
+
+	llmReportRunning bool      // generateWeeklyReport 是否正在执行
+	llmReportResult  string    // 最近一次周报结果
+	llmReportTime    time.Time // 最近一次周报完成时间
+
+	llmTestRunning bool      // testLLM 是否正在执行
+	llmTestResult  string    // 最近一次测试结果
+	llmTestTime    time.Time // 最近一次测试完成时间
+
+	// 安全扫描状态跟踪（让前端知道扫描是否在进行中）
+	scanMu         sync.Mutex
+	scanRunning    map[string]bool      // 各扫描器是否正在运行
+	scanLastResult map[string]int       // 各扫描器最近一次发现的数量
+	scanLastTime   map[string]time.Time // 各扫描器最近一次完成时间
+	scanLastError  map[string]string    // 各扫描器最近一次错误信息
 }
 
 type AuthConfig struct {
@@ -154,6 +226,11 @@ func New(store *storage.Storage, sm *safety.SafetyManager, auth AuthConfig, cfg 
 		siteDiscover:   sd,
 		certGuard:      cg,
 		baotaDiscovery: bt,
+		loginLimiter:   newLoginLimiter(),
+		scanRunning:    make(map[string]bool),
+		scanLastResult: make(map[string]int),
+		scanLastTime:   make(map[string]time.Time),
+		scanLastError:  make(map[string]string),
 	}
 
 	api.setupRoutes()
@@ -173,6 +250,27 @@ func (a *API) SetSecurityScanners(webSec *websecurity.WebSecurityGuard, vulnScan
 	a.serverSecGuard = serverSec
 	a.attackWarnGuard = attackWarn
 	a.tuningAdvisor = tuningAdv
+}
+
+// RecordAutoScanStart 记录自动扫描开始（由 agent 主循环调用）
+func (a *API) RecordAutoScanStart(scanner string) {
+	a.scanMu.Lock()
+	a.scanRunning[scanner] = true
+	a.scanMu.Unlock()
+}
+
+// RecordAutoScanDone 记录自动扫描完成（由 agent 主循环调用）
+func (a *API) RecordAutoScanDone(scanner string, findingCount int, errMsg string) {
+	a.scanMu.Lock()
+	a.scanRunning[scanner] = false
+	a.scanLastTime[scanner] = time.Now()
+	a.scanLastResult[scanner] = findingCount
+	if errMsg != "" {
+		a.scanLastError[scanner] = errMsg
+	} else {
+		delete(a.scanLastError, scanner)
+	}
+	a.scanMu.Unlock()
 }
 
 // SetFeedMonitor 注入 CVE Feed Monitor（安全更新提醒）
@@ -201,30 +299,55 @@ func (a *API) setupRoutes() {
 	})
 
 	// Serve embedded web panel (Vue SPA)
+	// 向宝塔学习：静态文件用 http.FileServer 直接服务，不 ReadAll 全量读入内存
+	// embed.FS 实现了 fs.FS，http.FileServer 原生支持流式发送
 	assetsFS, _ := fs.Sub(panel.DistFS, "dist/assets")
-	r.StaticFS("/assets", http.FS(assetsFS))
+	fileServer := http.FileServer(http.FS(assetsFS))
+	r.GET("/assets/*filepath", func(c *gin.Context) {
+		fp := c.Param("filepath")
+		// 检查文件是否存在
+		if _, err := assetsFS.Open(strings.TrimPrefix(fp, "/")); err != nil {
+			c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+			c.JSON(404, gin.H{"error": "asset not found", "hint": "please refresh the page"})
+			return
+		}
+		// 长缓存：hash 命名的静态资源可以永久缓存
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		http.StripPrefix("/assets", fileServer).ServeHTTP(c.Writer, c.Request)
+	})
+	// 向宝塔学习：index.html 和 favicon 只读一次缓存，不每次请求都 ReadFile
+	indexHTML, _ := panel.DistFS.ReadFile("dist/index.html")
 	r.GET("/", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
-		data, _ := panel.DistFS.ReadFile("dist/index.html")
-		c.Data(200, "text/html; charset=utf-8", data)
+		c.Data(200, "text/html; charset=utf-8", indexHTML)
 	})
 	// Serve favicon from embedded dist
+	faviconData, _ := panel.DistFS.ReadFile("dist/favicon.svg")
 	r.GET("/favicon.svg", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=86400")
-		data, _ := panel.DistFS.ReadFile("dist/favicon.svg")
-		c.Data(200, "image/svg+xml", data)
+		c.Data(200, "image/svg+xml", faviconData)
 	})
 	r.GET("/favicon.ico", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=86400")
-		data, _ := panel.DistFS.ReadFile("dist/favicon.svg")
-		c.Data(200, "image/svg+xml", data)
+		c.Data(200, "image/svg+xml", faviconData)
+	})
+	// Serve manifest.json for PWA
+	manifestData, _ := panel.DistFS.ReadFile("dist/manifest.json")
+	r.GET("/manifest.json", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+		c.Data(200, "application/json; charset=utf-8", manifestData)
+	})
+	// Serve service worker
+	swData, _ := panel.DistFS.ReadFile("dist/sw.js")
+	r.GET("/sw.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+		c.Data(200, "application/javascript; charset=utf-8", swData)
 	})
 	r.NoRoute(func(c *gin.Context) {
-		// SPA fallback: serve index.html for all non-API routes
+		// SPA fallback: serve cached index.html for all non-API routes
 		if !strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
-			data, _ := panel.DistFS.ReadFile("dist/index.html")
-			c.Data(200, "text/html; charset=utf-8", data)
+			c.Data(200, "text/html; charset=utf-8", indexHTML)
 			return
 		}
 		c.JSON(404, gin.H{"error": "not found"})
@@ -341,6 +464,7 @@ func (a *API) setupRoutes() {
 		api.POST("/findings/:id/false-positive", a.markFalsePositive)
 		api.POST("/findings/:id/fix", a.autoFixFinding)
 		api.POST("/findings/report", a.generateFindingsReport)
+		api.POST("/findings/batch-resolve", a.batchResolveFindings)
 
 		// Attack Profiles & Events (Z 模块)
 		api.GET("/attack-events", a.getAttackEvents)
@@ -393,11 +517,13 @@ func (a *API) setupRoutes() {
 		api.GET("/security-check", a.securityCheck)
 
 		// Phase 1 安全扫描触发端点 (W/X/Y/Z)
-		api.POST("/scan/websecurity", a.scanWebSecurity)
-		api.POST("/scan/vulnscan", a.scanVuln)
+api.POST("/scan/websecurity", a.scanWebSecurity)
+api.GET("/scan/websecurity/diagnose", a.diagnoseWebSecurity)
+api.POST("/scan/vulnscan", a.scanVuln)
 		api.POST("/scan/serversecurity", a.scanServerSecurity)
 		api.POST("/scan/attackwarn", a.scanAttackWarn)
 		api.GET("/scan/attackwarn/banned", a.getBannedIPs)
+		api.GET("/scan/status", a.getScanStatus)
 
 		// Security Updates (CVE Feed Monitor)
 		api.GET("/security-updates", a.getSecurityUpdates)
@@ -454,6 +580,61 @@ func (a *API) setupRoutes() {
 		api.GET("/knowledge/stats", a.getKnowledgeStats)
 		api.GET("/knowledge/search", a.searchKnowledge)
 
+		// V4.0 — 故障事件（根因链推理产物）
+		api.GET("/incidents", a.getIncidents)
+		api.GET("/incidents/:id", a.getIncidentDetail)
+		api.POST("/incidents/:id/ack", a.ackIncident)
+
+		// V4.0 — 知识库反哺（处置动作推荐 + 反复故障）
+		api.GET("/knowledge/recommend", a.getActionRecommendation)
+		api.GET("/knowledge/recurring", a.getRecurringIssues)
+
+		// V4.x — 全局态势感知：当前态势/原因/自主决策时间线
+		api.GET("/posture", a.getPosture)
+
+		// V4.0 — 首跑引导向导
+		api.GET("/onboarding/state", a.onboardingStatus)
+		api.POST("/onboarding/start", a.onboardingDetect)
+		api.POST("/onboarding/detect", a.onboardingDetect)
+		api.POST("/onboarding/import", a.onboardingImport)
+		api.POST("/onboarding/learn-mode", a.onboardingStartLearn)
+		api.POST("/onboarding/skip", a.skipOnboarding)
+
+		// V4.0 — 场景模板
+		api.GET("/scene-templates", a.getSceneTemplates)
+		api.GET("/scene-templates/:id", a.getSceneTemplate)
+		api.POST("/scene-templates/:id/apply", a.applySceneTemplate)
+
+		// V4.0 — 通知双向交互
+		api.POST("/notify/reply", a.processNotifyReply)
+		api.GET("/notify/pending", a.getPendingAlerts)
+		api.POST("/notify/pause/:shortCode", a.notifyShortCodePause)
+		api.POST("/notify/ack/:shortCode", a.notifyShortCodeAck)
+
+		// V4.0 — LLM 增强层
+		api.GET("/llm/status", a.getLLMStatus)
+		api.GET("/llm/explain-incident/:id", a.explainIncident)
+		api.GET("/llm/explain-alert/:id", a.explainAlert)
+		api.POST("/llm/config", a.saveLLMConfig)
+		api.POST("/llm/test", a.testLLM)
+		api.POST("/llm/weekly-report", a.generateWeeklyReport)
+
+		// V4.0 — 安全管理远程控制
+		api.GET("/safety/status", a.getSafetyRemoteStatus)
+		api.POST("/safety/remote-pause", a.remotePause)
+		api.POST("/safety/remote-resume", a.remoteResume)
+
+		// V4.0 — Onboarding 补充
+		api.POST("/onboarding/complete", a.onboardingComplete)
+		api.POST("/onboarding/test-notify", a.onboardingTestNotify)
+
+		// V4.0 — 知识库推荐补充
+		api.GET("/knowledge/recommendations", a.getRecommendations)
+		api.GET("/knowledge/recommend/:alertId", a.getRecommendationForAlert)
+
+		// V4.0 — 故障事件补充
+		api.GET("/incident-by-alert/:alertId", a.getIncidentByAlert)
+
 		// V3.9 — 智能变更窗口推荐
 		api.GET("/maintenance-window/recommend", a.getMaintenanceWindowRecommendation)
 
@@ -462,6 +643,48 @@ func (a *API) setupRoutes() {
 		api.POST("/report/postmortem/generate", a.generatePostmortemReport)
 		api.GET("/report/weekly", a.getWeeklyReport)
 		api.POST("/report/weekly/send", a.sendWeeklyReport)
+
+		// ─── V4.0 — 交互式运维 + DevOps 闭环 ───
+		api.GET("/devops/deployments", a.getDevOpsDeployments)
+		api.POST("/devops/deploy", a.triggerWebhookDeploy)
+		api.GET("/devops/env-drift", a.getEnvDrift)
+		api.GET("/devops/build-dirs", a.getBuildDirs)
+		api.POST("/devops/build-dirs", a.addBuildDir)
+		api.POST("/devops/build-dirs/check", a.checkBuildDirs)
+		api.GET("/devops/cron-conflicts", a.checkCronConflicts)
+		api.GET("/devops/batch-jobs", a.getBatchJobs)
+		api.POST("/devops/batch-jobs", a.addBatchJob)
+		api.POST("/devops/batch-jobs/:id/run", a.runBatchJob)
+		api.GET("/devops/transfers", a.getTransferWatches)
+		api.POST("/devops/transfers", a.addTransferWatch)
+		api.GET("/devops/api-deps", a.getAPIDeps)
+		api.POST("/devops/api-deps", a.addAPIDep)
+		api.POST("/devops/api-deps/check", a.checkAPIDeps)
+		// V4.0 — DevOps 自动发现（零配置）
+		api.GET("/devops/auto-discover", a.getDevOpsAutoDiscovery)
+
+		// ─── V4.1 — 数据治理 + 备份安全 ───
+		api.GET("/datagovern/backups", a.getBackupTasks)
+		api.POST("/datagovern/backups", a.addBackupTask)
+		api.POST("/datagovern/backups/:id/run", a.runBackup)
+		api.POST("/datagovern/sensitive-scan", a.scanSensitiveData)
+		api.POST("/datagovern/big-tables", a.checkBigTables)
+		api.POST("/datagovern/verify-backup", a.verifyBackup)
+		api.GET("/datagovern/verify-history", a.getVerificationHistory)
+		api.POST("/datagovern/deadlocks", a.huntDeadlocks)
+		api.GET("/datagovern/deadlock-history", a.getDeadlockHistory)
+		api.POST("/datagovern/conn-pool", a.diagnoseConnPool)
+		api.POST("/datagovern/cache-avalanche", a.preventCacheAvalanche)
+		api.POST("/datagovern/tsdb-anomaly", a.checkTSDBAnomaly)
+		api.POST("/datagovern/archive", a.archiveTable)
+		// V4.1 — 数据治理自动发现 + 自动巡检（零配置）
+		api.GET("/datagovern/auto-discover", a.getDataGovernAutoDiscovery)
+		api.GET("/datagovern/auto-check", a.getDataGovernAutoCheck)
+
+		// ─── 幽灵文件检测 — 已删除但句柄未释放的隐形空间杀手 ───
+		api.GET("/ghost-files", a.getGhostFiles)
+		api.POST("/ghost-files/clean", a.cleanGhostFiles)
+		api.POST("/ghost-files/scan", a.scanGhostFiles)
 	}
 }
 
@@ -476,9 +699,20 @@ func (a *API) login(c *gin.Context) {
 		return
 	}
 
+	// 登录防暴力破解：锁定期间直接拒绝，不进行密码校验
+	clientIP := c.ClientIP()
+	if !a.loginLimiter.Allow(clientIP) {
+		c.JSON(429, gin.H{"error": "失败次数过多，请 15 分钟后再试"})
+		return
+	}
+
+	loginOK := false
+
 	// 先尝试从用户数据库验证
 	if a.storage != nil {
 		if user, err := a.storage.VerifyUser(req.Username, req.Password); err == nil {
+			loginOK = true
+			a.loginLimiter.Reset(clientIP)
 			ts := time.Now().Unix()
 			expiry := ts + 86400 // 24 hours
 			msg := fmt.Sprintf("%s:%d:%d", user.Username, ts, expiry)
@@ -495,10 +729,13 @@ func (a *API) login(c *gin.Context) {
 	}
 
 	// 降级：检查配置文件中的默认管理员凭证
-	if req.Username != a.auth.Username || req.Password != a.auth.Password {
+	if !loginOK && (req.Username != a.auth.Username || req.Password != a.auth.Password) {
+		a.loginLimiter.RecordFailure(clientIP)
 		c.JSON(401, gin.H{"error": "用户名或密码错误"})
 		return
 	}
+
+	a.loginLimiter.Reset(clientIP)
 
 	// Generate HMAC-signed token with expiry
 	ts := time.Now().Unix()
@@ -511,6 +748,83 @@ func (a *API) login(c *gin.Context) {
 		"username": req.Username,
 		"expires":  expiry,
 	})
+}
+
+// loginLimiter 按 IP 的登录失败限制器（内存实现，零依赖）。
+// 规则：同一 IP 连续失败 5 次 → 锁定 15 分钟；成功登录即清零。
+const (
+	loginMaxFailures  = 5
+	loginLockDuration = 15 * time.Minute
+	loginEntryMaxIdle = 1 * time.Hour // 失败记录空闲回收时间
+)
+
+type loginFailState struct {
+	failures    int
+	lastFailure time.Time
+	lockedUntil time.Time
+}
+
+type loginLimiter struct {
+	mu    sync.Mutex
+	fails map[string]*loginFailState
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{fails: make(map[string]*loginFailState)}
+}
+
+// Allow 返回该 IP 当前是否允许尝试登录。
+func (l *loginLimiter) Allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st, ok := l.fails[ip]
+	if !ok {
+		return true
+	}
+	if !st.lockedUntil.IsZero() && time.Now().Before(st.lockedUntil) {
+		return false
+	}
+	return true
+}
+
+// RecordFailure 记录一次登录失败，达到阈值时触发锁定。
+func (l *loginLimiter) RecordFailure(ip string) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// 惰性回收：条目数超限时清理过期记录，防止 map 无限增长
+	if len(l.fails) > 1024 {
+		for k, st := range l.fails {
+			if now.Sub(st.lastFailure) > loginEntryMaxIdle {
+				delete(l.fails, k)
+			}
+		}
+	}
+
+	st, ok := l.fails[ip]
+	if !ok {
+		st = &loginFailState{}
+		l.fails[ip] = st
+	}
+	// 上次失败已超出锁定时长，重新计数
+	if !st.lockedUntil.IsZero() && now.After(st.lockedUntil) {
+		st.failures = 0
+		st.lockedUntil = time.Time{}
+	}
+	st.failures++
+	st.lastFailure = now
+	if st.failures >= loginMaxFailures {
+		st.lockedUntil = now.Add(loginLockDuration)
+		st.failures = 0
+	}
+}
+
+// Reset 登录成功后清除该 IP 的失败计数。
+func (l *loginLimiter) Reset(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.fails, ip)
 }
 
 // signToken creates an HMAC signature for the token.
@@ -747,6 +1061,59 @@ func (a *API) renewCert(c *gin.Context) {
 // --- Handlers ---
 
 func (a *API) getStatus(c *gin.Context) {
+	// 3 秒响应缓存：本端点是面板高频轮询接口，聚合了 CPU/磁盘/进程/预测等多项
+	// 系统查询。前端通常 3-5 秒轮询一次，多标签页同时打开时会放大；
+	// 缓存窗口内的重复请求直接复用上次结果，把系统调用次数压到与真实刷新率一致。
+	a.mu.Lock()
+	if a.statusCache != nil && a.statusCacheTime.After(time.Now().Add(-3*time.Second)) {
+		cached := a.statusCache
+		a.mu.Unlock()
+		c.JSON(200, cached)
+		return
+	}
+	a.mu.Unlock()
+
+	resp := a.buildStatusResponse()
+	a.mu.Lock()
+	a.statusCache = resp
+	a.statusCacheTime = time.Now()
+	a.mu.Unlock()
+
+	c.JSON(200, resp)
+}
+
+// countProcsAndZombies 轻量统计进程总数与僵尸数（仅读 /proc 目录与每 PID 一次 stat）。
+func countProcsAndZombies() (processCount, zombieCount int) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		processCount++
+		statData, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// /proc/PID/stat 格式: pid (comm) state ...（状态字段是右括号后的首字符）
+		statStr := string(statData)
+		if idx := strings.LastIndex(statStr, ")"); idx >= 0 && idx+1 < len(statStr) {
+			state := strings.TrimSpace(statStr[idx+1:])
+			if len(state) > 0 && (state[0] == 'Z' || state[0] == 'z') {
+				zombieCount++
+			}
+		}
+	}
+	return processCount, zombieCount
+}
+
+// buildStatusResponse 聚合状态响应（被 getStatus 的 TTL 缓存包裹）。
+func (a *API) buildStatusResponse() gin.H {
 	mode := a.safety.GetMode()
 
 	a.mu.RLock()
@@ -782,45 +1149,27 @@ func (a *API) getStatus(c *gin.Context) {
 
 	processCount := 0
 	zombieCount := 0
-	// 宝塔安全模式下：跳过 process.Processes() — 该调用对每个进程做 9+ syscall，
-	// 在进程数多的服务器上会产生严重 I/O 压力，可能影响宝塔面板响应。
-	// 使用轻量级 /proc 目录计数替代。
-	if a.safety != nil && a.safety.IsBaotaSafeMode() {
-		if runtime.GOOS != "windows" {
-			if entries, err := os.ReadDir("/proc"); err == nil {
-				for _, entry := range entries {
-					if entry.IsDir() {
-						if _, err := strconv.Atoi(entry.Name()); err == nil {
-							processCount++
-							// 检查是否为僵尸进程（轻量级：只读 /proc/PID/stat）
-							statData, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
-							if err == nil {
-								// /proc/PID/stat 格式: pid (comm) state ...
-								// 状态字段是第三个括号后的第一个字符
-								statStr := string(statData)
-								if idx := strings.LastIndex(statStr, ")"); idx >= 0 && idx+1 < len(statStr) {
-									state := strings.TrimSpace(statStr[idx+1:])
-									if len(state) > 0 && (state[0] == 'Z' || state[0] == 'z') {
-										zombieCount++
-									}
-								}
-							}
-						}
-					}
+	// 进程计数统一走轻量级 /proc 扫描（1 次 ReadDir + 每 PID 1 次 stat 读）。
+	// 原实现非宝塔分支用 process.Processes()+逐进程 Status()——每进程多次 open/read，
+	// 而本端点是面板高频轮询接口，等于把重扫描常驻化；宝塔分支早已改轻量，此处对齐。
+	if runtime.GOOS != "windows" {
+		processCount, zombieCount = countProcsAndZombies()
+	} else if procs, err := process.Processes(); err == nil {
+		processCount = len(procs)
+		for _, p := range procs {
+			if status, err := p.Status(); err == nil && len(status) > 0 {
+				if status[0] == "Z" || status[0] == "z" {
+					zombieCount++
 				}
 			}
 		}
-	} else {
-		if procs, err := process.Processes(); err == nil {
-			processCount = len(procs)
-			for _, p := range procs {
-				if status, err := p.Status(); err == nil && len(status) > 0 {
-					if status[0] == "Z" || status[0] == "z" {
-						zombieCount++
-					}
-				}
-			}
-		}
+	}
+
+	// Collect network IO counters
+	var netBytesSent, netBytesRecv uint64
+	if ioCounters, err := hostnet.IOCounters(false); err == nil && len(ioCounters) > 0 {
+		netBytesSent = ioCounters[0].BytesSent
+		netBytesRecv = ioCounters[0].BytesRecv
 	}
 
 	// Build disk list
@@ -858,7 +1207,7 @@ func (a *API) getStatus(c *gin.Context) {
 		}
 	}
 
-	c.JSON(200, gin.H{
+	return gin.H{
 		"status":               "online",
 		"mode":                 string(mode),
 		"emergency_stop":       a.safety.IsEmergencyStopped(),
@@ -881,17 +1230,81 @@ func (a *API) getStatus(c *gin.Context) {
 		"disks":                disks,
 		"process_count":        processCount,
 		"zombie_count":         zombieCount,
-	})
+		"net_bytes_sent":       netBytesSent,
+		"net_bytes_recv":       netBytesRecv,
+	}
 }
 
 func (a *API) getVersion(c *gin.Context) {
+	components := detectInstalledComponents()
 	c.JSON(200, gin.H{
-		"version":   version.Version,
-		"buildTime": version.BuildTime,
-		"gitCommit": version.GitCommit,
-		"goVersion": version.GoVersion,
-		"full":      version.FullVersion(),
+		"version":     version.Version,
+		"buildTime":   version.BuildTime,
+		"gitCommit":   version.GitCommit,
+		"goVersion":   version.GoVersion,
+		"full":        version.FullVersion(),
+		"components":  components,
 	})
+}
+
+// detectInstalledComponents 检测已安装的 ServerGuard 组件
+// 返回 agent、hub、sgctl 的安装路径和状态
+func detectInstalledComponents() []gin.H {
+	components := []gin.H{}
+
+	// 安装目录
+	installDir := "/opt/serverguard"
+	if runtime.GOOS == "windows" {
+		installDir = `C:\Program Files\ServerGuard`
+	}
+
+	// agent（当前进程即为 agent，必然已安装）
+	components = append(components, gin.H{
+		"name":         "serverguard-agent",
+		"display_name": "Agent",
+		"description": "\u91c7\u96c6/\u81ea\u6108\u5f15\u64ce\uff0c\u542b\u5b8c\u6574\u626b\u63cf+\u9762\u677f\u80fd\u529b",
+		"installed":   true,
+		"path":        installDir + "/serverguard-agent",
+		"running":     true,
+	})
+
+	// hub
+	hubPath := installDir + "/serverguard-hub"
+	if runtime.GOOS == "windows" {
+		hubPath = installDir + `\serverguard-hub.exe`
+	}
+	hubInstalled := false
+	if _, err := os.Stat(hubPath); err == nil {
+		hubInstalled = true
+	}
+	components = append(components, gin.H{
+		"name":         "serverguard-hub",
+		"display_name": "Hub",
+		"description": "\u591a\u670d\u52a1\u5668\u7ba1\u7406\u4e2d\u67a2\uff0c\u96c6\u4e2d\u7ba1\u7406\u591a\u53f0 Agent \u7684\u544a\u8b66\u548c\u72b6\u6001",
+		"installed":   hubInstalled,
+		"path":        hubPath,
+		"running":     false,
+	})
+
+	// sgctl
+	sgctlPath := installDir + "/sgctl"
+	if runtime.GOOS == "windows" {
+		sgctlPath = installDir + `\sgctl.exe`
+	}
+	sgctlInstalled := false
+	if _, err := os.Stat(sgctlPath); err == nil {
+		sgctlInstalled = true
+	}
+	components = append(components, gin.H{
+		"name":         "sgctl",
+		"display_name": "sgctl",
+		"description": "\u547d\u4ee4\u884c\u8fd0\u7ef4\u5de5\u5177\uff0c\u652f\u6301\u72b6\u6001\u67e5\u8be2/\u5347\u7ea7/\u8bca\u65ad/\u5bfc\u5165\u914d\u7f6e",
+		"installed":   sgctlInstalled,
+		"path":        sgctlPath,
+		"running":     false,
+	})
+
+	return components
 }
 
 func (a *API) getServers(c *gin.Context) {
@@ -2120,10 +2533,10 @@ func (a *API) autoFixFinding(c *gin.Context) {
 	// ─── 7. CORS 配置过于宽松 → 给出修复建议（不自动修改，因为不知道用户的实际域名） ───
 	if strings.Contains(title, "CORS") && strings.Contains(title, "宽松") {
 		c.JSON(200, gin.H{
-			"message": "CORS 配置需手动修改，因为系统不知道您的实际可信域名。建议将 Access-Control-Allow-Origin: * 替换为具体域名，例如: add_header Access-Control-Allow-Origin \"https://your-domain.com\" always;",
-			"id":      id,
-			"fixed":   false,
-			"manual":  true,
+			"message":     "CORS 配置需手动修改，因为系统不知道您的实际可信域名。建议将 Access-Control-Allow-Origin: * 替换为具体域名，例如: add_header Access-Control-Allow-Origin \"https://your-domain.com\" always;",
+			"id":          id,
+			"fixed":       false,
+			"manual":      true,
 			"fix_command": "将配置中的 Access-Control-Allow-Origin * 替换为您的实际域名",
 		})
 		return
@@ -2630,6 +3043,56 @@ func (a *API) generateFindingsReport(c *gin.Context) {
 	})
 }
 
+// batchResolveFindings 批量清理误报告警
+// POST /api/findings/batch-resolve
+// Body: { "scanner": "websecurity", "title_patterns": ["十六进制混淆", "短十六进制混淆", ...] }
+// 会将这些标题模式的 open 状态告警批量标记为 auto_resolved
+func (a *API) batchResolveFindings(c *gin.Context) {
+	var req struct {
+		Scanner       string   `json:"scanner"`
+		TitlePatterns []string `json:"title_patterns"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "invalid request body"})
+		return
+	}
+	if len(req.TitlePatterns) == 0 {
+		c.JSON(400, gin.H{"error": "title_patterns are required"})
+		return
+	}
+
+	resolved, err := a.storage.BatchResolveFindings(req.Scanner, req.TitlePatterns)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 记录审计日志
+	actor := "system"
+	if u, exists := c.Get("username"); exists {
+		if s, ok := u.(string); ok && s != "" {
+			actor = s
+		}
+	}
+	a.storage.SaveAudit(types.AuditEntry{
+		ID:        uuid.NewString(),
+		Timestamp: time.Now(),
+		Actor:     actor,
+		Action:    "batch_resolve_findings",
+		Target:    req.Scanner,
+		Reason:    "批量清理误报告警",
+		Result:    "success",
+		Details:   fmt.Sprintf("批量清理 %s 误报告警 %d 条", req.Scanner, resolved),
+	})
+
+	c.JSON(200, gin.H{
+		"message":        fmt.Sprintf("成功清理 %d 条误报告警", resolved),
+		"resolved_count": resolved,
+		"scanner":        req.Scanner,
+		"patterns":       req.TitlePatterns,
+	})
+}
+
 // ====== Attack Profiles & Events handlers (Z 模块) ======
 
 func (a *API) getAttackEvents(c *gin.Context) {
@@ -2684,9 +3147,11 @@ func (a *API) emergencyRollback(c *gin.Context) {
 		Reason  string `json:"reason"`
 	}
 	_ = c.ShouldBindJSON(&req)
-	if a.safety != nil {
-		a.safety.TriggerEmergencyStop(true)
-	}
+	// 注意：这里不再触发全局紧急停止（TriggerEmergencyStop）。
+	// 紧急回滚的语义是"解除 Z 模块封禁"，属于降低防护强度；
+	// 而全局急停会永久挂起所有自动扫描/修复且无自动恢复——
+	// 此前的隐藏联动导致用户点一次"紧急回滚"后所有扫描静默停摆。
+	// 需要停止全部自动动作时，应显式调用 POST /api/emergency-stop。
 	// 实际执行 Z 模块的紧急回滚：清除所有封禁规则
 	rollbackErr := "not_initialized"
 	if a.attackWarnGuard != nil {
@@ -3287,6 +3752,7 @@ func (a *API) getLicenseInfo(c *gin.Context) {
 // ====== Phase 1 安全扫描触发 handlers (W/X/Y/Z) ======
 
 // scanWebSecurity 触发 W 模块：网站安全扫描
+// 异步执行：扫描涉及大量文件遍历，同步执行会触发 Hub WriteTimeout 30s 导致 502
 func (a *API) scanWebSecurity(c *gin.Context) {
 	if a.webSecGuard == nil {
 		c.JSON(503, gin.H{"error": "web security scanner not initialized"})
@@ -3296,60 +3762,457 @@ func (a *API) scanWebSecurity(c *gin.Context) {
 		Path string `json:"path"`
 	}
 	_ = c.ShouldBindJSON(&req)
-	if req.Path == "" {
-		// Platform-aware default paths
-		if runtime.GOOS == "windows" {
-			req.Path = "C:\\inetpub\\wwwroot"
-		} else {
-			req.Path = "/var/www"
+
+	// ── 自动发现网站根目录 ──
+	// 不猜路径，而是从 Nginx/Apache/IIS 配置中提取 root / DocumentRoot。
+	// 用户可能把网站放在任意目录，硬编码路径列表永远覆盖不全。
+	type scanTarget struct {
+		Path string
+		Host string
+		Port int
+	}
+	var targets []scanTarget
+
+	if req.Path != "" {
+		// 用户手动指定了路径，直接用
+		if _, err := os.Stat(req.Path); err == nil {
+			targets = append(targets, scanTarget{Path: req.Path})
 		}
 	}
-	// If path doesn't exist, try common alternatives
-	if _, err := os.Stat(req.Path); err != nil {
-		// Try alternative paths
-		altPaths := []string{}
-		if runtime.GOOS == "windows" {
-			altPaths = []string{"C:\\inetpub\\wwwroot", "C:\\www", "."}
-		} else {
-			altPaths = []string{"/var/www", "/www/wwwroot", "/opt/app", "/usr/share/nginx/html", "."}
+
+	// 如果没有手动指定路径，用站点发现
+	if len(targets) == 0 && a.siteDiscover != nil {
+		sites := a.siteDiscover.Discover()
+		seen := make(map[string]bool)
+		for _, site := range sites {
+			webRoot := site.WebRoot
+
+			// WebRoot 为空时，用宝塔标准路径 /www/wwwroot/<domain> 回退
+			// 宝塔的 Nginx 配置可能用 include 引入 root 指令，
+			// 或用变量 root $root_path; 导致站点发现拿不到 WebRoot
+			if webRoot == "" && site.Domain != "" {
+				fallbackPaths := []string{
+					fmt.Sprintf("/www/wwwroot/%s", site.Domain),
+					fmt.Sprintf("/www/wwwroot/%s/public", site.Domain),
+					fmt.Sprintf("/var/www/%s", site.Domain),
+					fmt.Sprintf("/var/www/html/%s", site.Domain),
+					fmt.Sprintf("/home/wwwroot/%s", site.Domain),
+				}
+				for _, p := range fallbackPaths {
+					if _, err := os.Stat(p); err == nil {
+						webRoot = p
+						break
+					}
+				}
+			}
+
+if webRoot == "" {
+continue
+}
+// 排除 /www/server/ 下的非站点目录（nginx/apache/php/mysql 等服务安装目录）
+if strings.HasPrefix(webRoot, "/www/server/") {
+continue
+}
+if seen[webRoot] {
+continue
+}
+seen[webRoot] = true
+port := site.Port
+if port == 0 {
+port = 80
+}
+targets = append(targets, scanTarget{
+Path: webRoot,
+Host: site.Domain,
+Port: port,
+})
+}
+fmt.Printf("[WebSecurity] 站点发现: %d 个站点, 成功提取 %d 个 WebRoot\n", len(sites), len(targets))
+	}
+
+	// 宝塔环境补充：直接扫描宝塔站点目录下所有子目录
+	// 站点发现可能漏掉某些站点（配置文件格式不规范、include 引入等），
+	// 直接遍历宝塔站点目录可以确保不遗漏。
+	// 注意：站点根目录可能不在 /www/wwwroot（用户可能选了数据盘），
+	// 从宝塔配置中读取实际路径，同时扫描常见数据盘路径。
+	if runtime.GOOS != "windows" {
+		// 收集所有可能的站点根目录候选路径
+		wwwRootCandidates := []string{
+			"/www/wwwroot", // 宝塔默认
 		}
-		for _, p := range altPaths {
-			if _, e := os.Stat(p); e == nil {
-				req.Path = p
+
+		// 从宝塔环境检测中获取实际路径
+		// 注意：宝塔的 default_path.pl 可能返回 /www/server/nginx（Nginx 安装目录）而非站点根目录
+		// 只接受以 wwwroot 结尾的路径，排除 /www/server/ 下的服务安装目录
+		if baotaEnv := baota.DetectBaotaEnvironment(); baotaEnv != nil && baotaEnv.WebRoot != "" {
+			webRoot := baotaEnv.WebRoot
+			// 排除 /www/server/ 下的非站点目录（nginx/apache/php/mysql 等）
+			if !strings.HasPrefix(webRoot, "/www/server/") {
+				wwwRootCandidates = append(wwwRootCandidates, webRoot)
+			}
+		}
+
+		// 常见数据盘路径（用户可能把站点放在数据盘上）
+		dataDiskPaths := []string{
+			"/data/wwwroot",
+			"/data/www",
+			"/data/sites",
+			"/home/wwwroot",
+			"/mnt/wwwroot",
+			"/mnt/data/wwwroot",
+			"/srv/wwwroot",
+			"/opt/wwwroot",
+			"/web/wwwroot",
+		}
+		wwwRootCandidates = append(wwwRootCandidates, dataDiskPaths...)
+
+		seen := make(map[string]bool)
+		for _, t := range targets {
+			seen[t.Path] = true
+		}
+
+		for _, wwwRoot := range wwwRootCandidates {
+			entries, err := os.ReadDir(wwwRoot)
+			if err != nil {
+				continue
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				// 跳过非站点目录
+				if name == "default" || strings.HasPrefix(name, ".") {
+					continue
+				}
+				fullPath := filepath.Join(wwwRoot, name)
+				if seen[fullPath] {
+					continue
+				}
+				seen[fullPath] = true
+				targets = append(targets, scanTarget{
+					Path: fullPath,
+					Host: name,
+					Port: 80,
+				})
+			}
+			fmt.Printf("[WebSecurity] 扫描 %s: 新增站点目录\n", wwwRoot)
+		}
+		fmt.Printf("[WebSecurity] 宝塔/数据盘补充扫描: 总计 %d 个站点\n", len(targets))
+	}
+
+	// 如果自动发现也没找到，回退到系统常见路径（最后手段）
+	if len(targets) == 0 {
+		fallbackPaths := []string{}
+		if runtime.GOOS == "windows" {
+			fallbackPaths = []string{"C:\\inetpub\\wwwroot", "C:\\www"}
+		} else {
+			fallbackPaths = []string{"/var/www", "/usr/share/nginx/html", "/srv/http", "/opt/app"}
+		}
+		for _, p := range fallbackPaths {
+			if _, err := os.Stat(p); err == nil {
+				targets = append(targets, scanTarget{Path: p})
 				break
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
-	defer cancel()
-	target := types.ScanTarget{Type: "website", Path: req.Path}
-	findings, err := a.webSecGuard.Scan(ctx, target)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+
+	if len(targets) == 0 {
+		c.JSON(400, gin.H{"error": "未找到网站根目录。请手动指定扫描路径，或确保 Nginx/Apache 配置中包含 root/DocumentRoot 指令。"})
 		return
 	}
-	// 保存到存储
-	for _, f := range findings {
-		_ = a.storage.SaveFinding(&storage.Finding{
-			Scanner:     f.Scanner,
-			ScannerSub:  f.ScannerSub,
-			Severity:    string(f.Severity),
-			Title:       f.Title,
-			Description: f.Description,
-			Target:      f.Target,
-			Detail:      f.Detail,
-			Suggestion:  f.Suggestion,
-			Consequence: f.Consequence,
-			Snapshot:    f.Snapshot,
-		})
-	}
-	c.JSON(200, gin.H{
-		"message":  fmt.Sprintf("网站安全扫描完成，扫描路径 %s，发现 %d 个安全问题", req.Path, len(findings)),
-		"findings": findings,
+
+	fmt.Printf("[WebSecurity] 扫描启动: %d 个站点目标\n", len(targets))
+
+	// 异步执行扫描，避免 502
+	a.scanMu.Lock()
+	a.scanRunning["websecurity"] = true
+	a.scanMu.Unlock()
+	go func(scanTargets []scanTarget) {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[WebSecurity] scan panicked: %v\n", r)
+				a.scanMu.Lock()
+				a.scanRunning["websecurity"] = false
+				a.scanLastError["websecurity"] = fmt.Sprintf("panic: %v", r)
+				a.scanLastTime["websecurity"] = time.Now()
+				a.scanMu.Unlock()
+			}
+		}()
+
+		// 动态超时：根据站点数自适应
+		wTimeout := websecurity.GlobalWTimeout(len(scanTargets), false)
+		ctx, cancel := context.WithTimeout(context.Background(), wTimeout)
+		defer cancel()
+
+		// 并发数：根据站点数自适应
+		concurrency := 1
+		switch n := len(scanTargets); {
+		case n <= 20:
+			concurrency = 1
+		case n <= 100:
+			concurrency = 4
+		case n <= 300:
+			concurrency = 6
+		default:
+			concurrency = 8
+		}
+
+		// 扫描前重置去重缓存（并发模式下只调一次）
+		a.webSecGuard.ResetDedupCaches()
+
+		fmt.Printf("[WebSecurity] 扫描启动: %d 个站点，超时 %v，并发 %d\n", len(scanTargets), wTimeout, concurrency)
+
+		type siteResult struct {
+			target   scanTarget
+			findings []types.ScanFinding
+			err      error
+		}
+
+		siteCh := make(chan scanTarget, len(scanTargets))
+		resultCh := make(chan siteResult, len(scanTargets))
+
+		var wg sync.WaitGroup
+		for w := 0; w < concurrency; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for t := range siteCh {
+					target := types.ScanTarget{Type: "website", Path: t.Path, Host: t.Host, Port: t.Port}
+					findings, err := a.webSecGuard.Scan(ctx, target)
+					resultCh <- siteResult{target: t, findings: findings, err: err}
+				}
+			}()
+		}
+
+		for _, t := range scanTargets {
+			siteCh <- t
+		}
+		close(siteCh)
+
+		go func() {
+			wg.Wait()
+			close(resultCh)
+		}()
+
+		var allFindings []types.ScanFinding
+		processedCount := 0
+		for res := range resultCh {
+			processedCount++
+			if res.err != nil {
+				fmt.Fprintf(os.Stderr, "[WebSecurity] scan error for %s (%d/%d): %v\n", res.target.Path, processedCount, len(scanTargets), res.err)
+				continue
+			}
+			if len(res.findings) > 0 {
+				fmt.Printf("[WebSecurity] %s (%d/%d): 发现 %d 个问题\n", res.target.Path, processedCount, len(scanTargets), len(res.findings))
+			} else if processedCount <= 3 {
+				fmt.Printf("[WebSecurity] %s (%d/%d): 0 个问题（路径: %s, Host: %s）\n", res.target.Path, processedCount, len(scanTargets), res.target.Path, res.target.Host)
+			}
+			allFindings = append(allFindings, res.findings...)
+		}
+
+		a.scanMu.Lock()
+		a.scanRunning["websecurity"] = false
+		a.scanLastTime["websecurity"] = time.Now()
+		a.scanLastResult["websecurity"] = len(allFindings)
+		a.scanLastError["websecurity"] = ""
+		a.scanMu.Unlock()
+
+		for _, f := range allFindings {
+			_ = a.storage.SaveFinding(&storage.Finding{
+				Scanner:     f.Scanner,
+				ScannerSub:  f.ScannerSub,
+				Severity:    string(f.Severity),
+				Title:       f.Title,
+				Description: f.Description,
+				Target:      f.Target,
+				Detail:      f.Detail,
+				Suggestion:  f.Suggestion,
+				Consequence: f.Consequence,
+				Snapshot:    f.Snapshot,
+			})
+		}
+		fmt.Printf("网站安全扫描完成（异步），扫描 %d 个站点目录，发现 %d 个安全问题\n", len(scanTargets), len(allFindings))
+	}(targets)
+	c.JSON(202, gin.H{
+		"status":  "started",
+		"message": fmt.Sprintf("网站安全扫描已启动（发现 %d 个站点），请在安全发现页面查看结果", len(targets)),
 	})
 }
 
+// diagnoseWebSecurity 诊断网站安全扫描的站点发现和子扫描器状态
+// GET /api/scan/websecurity/diagnose          → 只返回站点发现结果（快速，<1s）
+// GET /api/scan/websecurity/diagnose?scan=1   → 额外对第一个站点执行各子扫描器（慢，可能 60s+）
+func (a *API) diagnoseWebSecurity(c *gin.Context) {
+	type targetInfo struct {
+		Path string `json:"path"`
+		Host string `json:"host"`
+		Port int    `json:"port"`
+	}
+	var targets []targetInfo
+
+	// 1. 站点发现
+	siteCount := 0
+	if a.siteDiscover != nil {
+		sites := a.siteDiscover.Discover()
+		siteCount = len(sites)
+		seen := make(map[string]bool)
+		for _, site := range sites {
+			webRoot := site.WebRoot
+			if webRoot == "" && site.Domain != "" {
+				fallbackPaths := []string{
+					fmt.Sprintf("/www/wwwroot/%s", site.Domain),
+					fmt.Sprintf("/var/www/%s", site.Domain),
+					fmt.Sprintf("/home/wwwroot/%s", site.Domain),
+				}
+				for _, p := range fallbackPaths {
+					if _, err := os.Stat(p); err == nil {
+						webRoot = p
+						break
+					}
+				}
+			}
+if webRoot == "" || seen[webRoot] {
+continue
+}
+// 排除 /www/server/ 下的非站点目录
+if strings.HasPrefix(webRoot, "/www/server/") {
+continue
+}
+seen[webRoot] = true
+			port := site.Port
+			if port == 0 {
+				port = 80
+			}
+			targets = append(targets, targetInfo{Path: webRoot, Host: site.Domain, Port: port})
+		}
+	}
+
+	// 2. 宝塔环境 + 数据盘路径补充
+	if runtime.GOOS != "windows" {
+		wwwRootCandidates := []string{"/www/wwwroot"}
+		if baotaEnv := baota.DetectBaotaEnvironment(); baotaEnv != nil && baotaEnv.WebRoot != "" {
+			if !strings.HasPrefix(baotaEnv.WebRoot, "/www/server/") {
+				wwwRootCandidates = append(wwwRootCandidates, baotaEnv.WebRoot)
+			}
+		}
+		dataDiskPaths := []string{
+			"/data/wwwroot", "/data/www", "/data/sites",
+			"/home/wwwroot", "/mnt/wwwroot", "/mnt/data/wwwroot",
+			"/srv/wwwroot", "/opt/wwwroot", "/web/wwwroot",
+		}
+		wwwRootCandidates = append(wwwRootCandidates, dataDiskPaths...)
+
+		seen := make(map[string]bool)
+		for _, t := range targets {
+			seen[t.Path] = true
+		}
+		for _, wwwRoot := range wwwRootCandidates {
+			entries, err := os.ReadDir(wwwRoot)
+			if err != nil {
+				continue
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				if name == "default" || strings.HasPrefix(name, ".") {
+					continue
+				}
+				fullPath := filepath.Join(wwwRoot, name)
+				if seen[fullPath] {
+					continue
+				}
+				seen[fullPath] = true
+				targets = append(targets, targetInfo{Path: fullPath, Host: name, Port: 80})
+			}
+		}
+	}
+
+	// 3. 宝塔环境信息
+	baotaInfo := gin.H{"detected": false}
+	if baotaEnv := baota.DetectBaotaEnvironment(); baotaEnv != nil {
+		baotaInfo = gin.H{
+			"detected":  baotaEnv.IsBaota,
+			"web_root":  baotaEnv.WebRoot,
+			"signals":   baotaEnv.Signals,
+			"version":   baotaEnv.Version,
+			"panelType": baotaEnv.PanelType,
+		}
+	}
+
+	// 4. 子扫描器列表（静态信息，不执行扫描）
+	subScannerList := []gin.H{}
+	if a.webSecGuard != nil {
+		for _, s := range a.webSecGuard.Scanners() {
+			subScannerList = append(subScannerList, gin.H{
+				"sub":  s.SubScanner(),
+				"name": s.Name(),
+			})
+		}
+	}
+
+	result := gin.H{
+		"site_discovery_count": siteCount,
+		"targets":              targets,
+		"target_count":         len(targets),
+		"baota":                baotaInfo,
+		"sub_scanners":         subScannerList,
+		"os":                   runtime.GOOS + "/" + runtime.GOARCH,
+	}
+
+	// 5. 仅当 ?scan=1 时对第一个站点执行扫描（慢操作）
+	//    每个子扫描器独立 10s 超时，避免整体超时
+	doScan := c.Query("scan") == "1"
+	if doScan && len(targets) > 0 && a.webSecGuard != nil {
+		t := targets[0]
+		target := types.ScanTarget{Type: "website", Path: t.Path, Host: t.Host, Port: t.Port}
+		subScannerResults := []gin.H{}
+		for _, s := range a.webSecGuard.Scanners() {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+			findings, err := s.Scan(ctx, target)
+			cancel()
+			subScannerResults = append(subScannerResults, gin.H{
+				"sub":      s.SubScanner(),
+				"name":     s.Name(),
+				"findings": len(findings),
+				"error":    errStr(err),
+				"sample":   sampleFindings(findings, 3),
+			})
+		}
+		result["sub_scanner_results"] = subScannerResults
+	}
+
+	c.JSON(200, result)
+}
+
+// errStr returns the string representation of an error, or empty string if nil.
+func errStr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// sampleFindings returns up to n sample findings for diagnostic output.
+func sampleFindings(findings []types.ScanFinding, n int) []gin.H {
+	var samples []gin.H
+	for i, f := range findings {
+		if i >= n {
+			break
+		}
+		samples = append(samples, gin.H{
+			"severity": string(f.Severity),
+			"title":   f.Title,
+			"target":  f.Target,
+		})
+	}
+	return samples
+}
+
 // scanVuln 触发 X 模块：漏洞扫描
+// 异步执行：扫描涉及大量文件遍历，同步执行会触发 Hub WriteTimeout 30s 导致 502
 func (a *API) scanVuln(c *gin.Context) {
 	if a.vulnScanGuard == nil {
 		c.JSON(503, gin.H{"error": "vuln scanner not initialized"})
@@ -3359,11 +4222,22 @@ func (a *API) scanVuln(c *gin.Context) {
 		WebRoots []string `json:"web_roots"`
 	}
 	_ = c.ShouldBindJSON(&req)
+	if len(req.WebRoots) == 0 && a.siteDiscover != nil {
+		// 自动发现网站根目录
+		sites := a.siteDiscover.Discover()
+		seen := make(map[string]bool)
+		for _, site := range sites {
+			if site.WebRoot != "" && !seen[site.WebRoot] {
+				seen[site.WebRoot] = true
+				req.WebRoots = append(req.WebRoots, site.WebRoot)
+			}
+		}
+	}
 	if len(req.WebRoots) == 0 {
 		if runtime.GOOS == "windows" {
 			req.WebRoots = []string{"C:\\inetpub\\wwwroot", "C:\\www", "."}
 		} else {
-			req.WebRoots = []string{"/var/www", "/opt/app", "/www/wwwroot"}
+			req.WebRoots = []string{"/var/www", "/opt/app"}
 		}
 	}
 	// Filter to only existing paths
@@ -3376,63 +4250,118 @@ func (a *API) scanVuln(c *gin.Context) {
 	if len(validRoots) == 0 {
 		validRoots = []string{"."}
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Minute)
-	defer cancel()
-	findings, err := a.vulnScanGuard.Scan(ctx, validRoots)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	for _, f := range findings {
-		_ = a.storage.SaveFinding(&storage.Finding{
-			Scanner:     f.Scanner,
-			ScannerSub:  f.ScannerSub,
-			Severity:    string(f.Severity),
-			Title:       f.Title,
-			Description: f.Description,
-			Target:      f.Target,
-			Detail:      f.Detail,
-			Suggestion:  f.Suggestion,
-			Consequence: f.Consequence,
-			Snapshot:    f.Snapshot,
-		})
-	}
-	c.JSON(200, gin.H{
-		"message":  fmt.Sprintf("漏洞扫描完成，发现 %d 个漏洞", len(findings)),
-		"findings": findings,
+	// 异步执行扫描，避免 502
+	a.scanMu.Lock()
+	a.scanRunning["vulnscan"] = true
+	a.scanMu.Unlock()
+	go func(roots []string) {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[VulnScan] scan panicked: %v\n", r)
+				a.scanMu.Lock()
+				a.scanRunning["vulnscan"] = false
+				a.scanLastError["vulnscan"] = fmt.Sprintf("panic: %v", r)
+				a.scanLastTime["vulnscan"] = time.Now()
+				a.scanMu.Unlock()
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		findings, err := a.vulnScanGuard.Scan(ctx, roots)
+		a.scanMu.Lock()
+		a.scanRunning["vulnscan"] = false
+		a.scanLastTime["vulnscan"] = time.Now()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[VulnScan] scan error: %v\n", err)
+			a.scanLastError["vulnscan"] = err.Error()
+		} else {
+			a.scanLastResult["vulnscan"] = len(findings)
+			a.scanLastError["vulnscan"] = ""
+		}
+		a.scanMu.Unlock()
+		if err != nil {
+			return
+		}
+		for _, f := range findings {
+			_ = a.storage.SaveFinding(&storage.Finding{
+				Scanner:     f.Scanner,
+				ScannerSub:  f.ScannerSub,
+				Severity:    string(f.Severity),
+				Title:       f.Title,
+				Description: f.Description,
+				Target:      f.Target,
+				Detail:      f.Detail,
+				Suggestion:  f.Suggestion,
+				Consequence: f.Consequence,
+				Snapshot:    f.Snapshot,
+			})
+		}
+		fmt.Printf("漏洞扫描完成（异步），发现 %d 个漏洞\n", len(findings))
+	}(validRoots)
+	c.JSON(202, gin.H{
+		"status":  "started",
+		"message": "漏洞扫描已启动，请在安全发现页面查看结果",
 	})
 }
 
 // scanServerSecurity 触发 Y 模块：服务器安全扫描
+// 异步执行：扫描涉及系统配置检查，同步执行会触发 Hub WriteTimeout 30s 导致 502
 func (a *API) scanServerSecurity(c *gin.Context) {
 	if a.serverSecGuard == nil {
 		c.JSON(503, gin.H{"error": "server security scanner not initialized"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Minute)
-	defer cancel()
-	findings, err := a.serverSecGuard.Scan(ctx)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	for _, f := range findings {
-		_ = a.storage.SaveFinding(&storage.Finding{
-			Scanner:     f.Scanner,
-			ScannerSub:  f.ScannerSub,
-			Severity:    string(f.Severity),
-			Title:       f.Title,
-			Description: f.Description,
-			Target:      f.Target,
-			Detail:      f.Detail,
-			Suggestion:  f.Suggestion,
-			Consequence: f.Consequence,
-			Snapshot:    f.Snapshot,
-		})
-	}
-	c.JSON(200, gin.H{
-		"message":  fmt.Sprintf("服务器安全扫描完成，发现 %d 个安全问题", len(findings)),
-		"findings": findings,
+	// 异步执行扫描，避免 502
+	a.scanMu.Lock()
+	a.scanRunning["serversecurity"] = true
+	a.scanMu.Unlock()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[ServerSecurity] scan panicked: %v\n", r)
+				a.scanMu.Lock()
+				a.scanRunning["serversecurity"] = false
+				a.scanLastError["serversecurity"] = fmt.Sprintf("panic: %v", r)
+				a.scanLastTime["serversecurity"] = time.Now()
+				a.scanMu.Unlock()
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		findings, err := a.serverSecGuard.Scan(ctx)
+		a.scanMu.Lock()
+		a.scanRunning["serversecurity"] = false
+		a.scanLastTime["serversecurity"] = time.Now()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ServerSecurity] scan error: %v\n", err)
+			a.scanLastError["serversecurity"] = err.Error()
+		} else {
+			a.scanLastResult["serversecurity"] = len(findings)
+			a.scanLastError["serversecurity"] = ""
+		}
+		a.scanMu.Unlock()
+		if err != nil {
+			return
+		}
+		for _, f := range findings {
+			_ = a.storage.SaveFinding(&storage.Finding{
+				Scanner:     f.Scanner,
+				ScannerSub:  f.ScannerSub,
+				Severity:    string(f.Severity),
+				Title:       f.Title,
+				Description: f.Description,
+				Target:      f.Target,
+				Detail:      f.Detail,
+				Suggestion:  f.Suggestion,
+				Consequence: f.Consequence,
+				Snapshot:    f.Snapshot,
+			})
+		}
+		fmt.Printf("服务器安全扫描完成（异步），发现 %d 个安全问题\n", len(findings))
+	}()
+	c.JSON(202, gin.H{
+		"status":  "started",
+		"message": "服务器安全扫描已启动，请在安全发现页面查看结果",
 	})
 }
 
@@ -3445,7 +4374,20 @@ func (a *API) scanAttackWarn(c *gin.Context) {
 	}
 
 	// 异步执行扫描，避免前端 504 超时
+	a.scanMu.Lock()
+	a.scanRunning["attackwarn"] = true
+	a.scanMu.Unlock()
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[AttackWarn] scan panicked: %v\n", r)
+				a.scanMu.Lock()
+				a.scanRunning["attackwarn"] = false
+				a.scanLastError["attackwarn"] = fmt.Sprintf("panic: %v", r)
+				a.scanLastTime["attackwarn"] = time.Now()
+				a.scanMu.Unlock()
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
@@ -3456,7 +4398,7 @@ func (a *API) scanAttackWarn(c *gin.Context) {
 		if runtime.GOOS == "windows" {
 			logDirs = []string{"C:\\inetpub\\logs", "C:\\www\\logs"}
 		} else {
-			logDirs = []string{"/var/log/nginx", "/www/wwwlogs", "/var/log/apache2"}
+			logDirs = []string{"/var/log/nginx", "/www/wwwlogs", "/www/server/nginx/logs", "/www/server/apache/logs", "/var/log/apache2"}
 		}
 		for _, dir := range logDirs {
 			if _, err := os.Stat(dir); err == nil {
@@ -3473,6 +4415,13 @@ func (a *API) scanAttackWarn(c *gin.Context) {
 
 		// Z3: 关联分析
 		_, _ = a.attackWarnGuard.CorrelateAttacks(ctx, time.Now().AddDate(0, 0, -7))
+
+		a.scanMu.Lock()
+		a.scanRunning["attackwarn"] = false
+		a.scanLastTime["attackwarn"] = time.Now()
+		a.scanLastResult["attackwarn"] = len(allEvents)
+		a.scanLastError["attackwarn"] = ""
+		a.scanMu.Unlock()
 
 		fmt.Printf("攻击预警扫描完成（异步），发现 %d 个攻击事件\n", len(allEvents))
 	}()
@@ -3497,6 +4446,41 @@ func (a *API) getBannedIPs(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"banned": banned})
+}
+
+// getScanStatus 返回各扫描器的当前状态（是否正在运行、上次扫描结果等）
+func (a *API) getScanStatus(c *gin.Context) {
+	// 先从数据库获取各扫描器 open 状态的发现项数量（在锁外执行避免锁交叉）
+	var dbCounts map[string]int
+	if a.storage != nil {
+		dbCounts, _ = a.storage.GetFindingCountByScanner()
+	}
+
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+
+	scanners := []string{"websecurity", "vulnscan", "serversecurity", "attackwarn"}
+	result := make(map[string]interface{})
+
+	for _, s := range scanners {
+		status := map[string]interface{}{
+			"running": a.scanRunning[s],
+		}
+		if t, ok := a.scanLastTime[s]; ok && !t.IsZero() {
+			status["last_time"] = t.Format("2006-01-02 15:04:05")
+		}
+		// 使用数据库中的 open 状态发现项数量，与统计卡片保持一致
+		if cnt, ok := dbCounts[s]; ok {
+			status["last_count"] = cnt
+		} else if cnt, ok := a.scanLastResult[s]; ok {
+			status["last_count"] = cnt
+		}
+		if errMsg, ok := a.scanLastError[s]; ok && errMsg != "" {
+			status["error"] = errMsg
+		}
+		result[s] = status
+	}
+	c.JSON(200, result)
 }
 
 // getSecurityUpdates 获取安全更新状态（CVE Feed Monitor）
@@ -3549,8 +4533,19 @@ func (a *API) getTuningAdvice(c *gin.Context) {
 }
 
 // Serve starts the HTTP server.
+// Serve starts the Hub HTTP server.
+// 向宝塔学习：必须设置 HTTP 超时，防止慢客户端连接堆积导致 502
+// Gin 的 Run() 不设置任何超时，在低配服务器上慢请求会耗尽 goroutine
 func (a *API) Serve(addr string) error {
-	return a.router.Run(addr)
+	srv := &http.Server{
+		Addr:           addr,
+		Handler:        a.router,
+		ReadTimeout:    10 * time.Second, // 读请求体超时
+		WriteTimeout:   30 * time.Second, // 写响应超时（含 DB 查询时间）
+		IdleTimeout:    60 * time.Second, // 空闲连接超时（keepalive）
+		MaxHeaderBytes: 1 << 20,          // 1MB 请求头上限
+	}
+	return srv.ListenAndServe()
 }
 
 // GetRouter returns the gin router for embedding in a custom server.
@@ -3887,7 +4882,7 @@ func (a *API) getTopProcesses(c *gin.Context) {
 			memInfo, _ := p.MemoryInfo()
 			info := procInfo{PID: p.Pid, Name: name, CPUPercent: cpuPercent, MemPercent: memPercent}
 			if memInfo != nil {
-				info.MemMB = float64(memInfo.RSS) / 1024 / 1024
+				info.MemMB = math.Round(float64(memInfo.RSS)/1024/1024*100) / 100
 			}
 			topCPU = append(topCPU, info)
 			topMem = append(topMem, info)
@@ -4071,6 +5066,15 @@ type LargeFileInfo struct {
 	FileType   string    `json:"file_type"`
 }
 
+// largeFilesCache 大文件扫描结果缓存
+type largeFilesCache struct {
+	Files           []LargeFileInfo `json:"files"`
+	Total           int             `json:"total"`
+	MinSizeMB       int             `json:"min_size_mb"`
+	DeletableCount  int             `json:"deletable_count"`
+	DeletableSizeMB float64         `json:"deletable_size_mb"`
+}
+
 // classifyFileType 分类文件类型
 func classifyFileType(path string) string {
 	lower := strings.ToLower(path)
@@ -4140,7 +5144,10 @@ func classifyFileType(path string) string {
 	return "other"
 }
 
-// getLargeFiles 扫描系统中的大文件
+// getLargeFiles 扫描系统中的大文件（异步 + 缓存）
+// 磁盘扫描是 I/O 密集型操作，在低配服务器上可能超过 30s，
+// 同步执行会导致 Hub WriteTimeout 30s → 502
+// 改为：首次 GET 触发后台扫描立即返回 "scanning"，后续 GET 返回缓存结果
 func (a *API) getLargeFiles(c *gin.Context) {
 	minSizeMB := 100 // 默认 100MB
 	if s := c.Query("min_size_mb"); s != "" {
@@ -4148,19 +5155,108 @@ func (a *API) getLargeFiles(c *gin.Context) {
 			minSizeMB = v
 		}
 	}
+
+	// 检查是否有正在进行的扫描
+	a.mu.RLock()
+	running := a.fileScanRunning
+	cached := a.fileScanResult
+	cachedTime := a.fileScanTime
+	cachedErr := a.fileScanErr
+	a.mu.RUnlock()
+
+	// 如果正在扫描，返回 "scanning" 状态（附带上次缓存结果如果有）
+	if running {
+		resp := gin.H{
+			"status":  "scanning",
+			"message": "正在扫描磁盘，请稍后刷新获取结果",
+		}
+		if cached != nil {
+			resp["files"] = cached.Files
+			resp["total"] = cached.Total
+			resp["min_size_mb"] = cached.MinSizeMB
+			resp["deletable_count"] = cached.DeletableCount
+			resp["deletable_size_mb"] = cached.DeletableSizeMB
+			resp["cached_at"] = cachedTime
+		}
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+
+	// 如果有缓存且 minSizeMB 相同且缓存不超过 5 分钟，直接返回
+	if cached != nil && cached.MinSizeMB == minSizeMB && time.Since(cachedTime) < 5*time.Minute {
+		c.JSON(http.StatusOK, gin.H{
+			"status":            "cached",
+			"files":             cached.Files,
+			"total":             cached.Total,
+			"min_size_mb":       cached.MinSizeMB,
+			"deletable_count":   cached.DeletableCount,
+			"deletable_size_mb": cached.DeletableSizeMB,
+			"cached_at":         cachedTime,
+			"error":             cachedErr,
+		})
+		return
+	}
+
+	// 没有缓存或缓存过期，启动后台扫描
+	a.mu.Lock()
+	if a.fileScanRunning {
+		// 另一个请求刚启动了扫描
+		a.mu.Unlock()
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "scanning",
+			"message": "正在扫描磁盘，请稍后刷新获取结果",
+		})
+		return
+	}
+	a.fileScanRunning = true
+	a.fileScanErr = ""
+	a.mu.Unlock()
+
+	go func() {
+		defer func() {
+			a.mu.Lock()
+			a.fileScanRunning = false
+			a.fileScanTime = time.Now()
+			a.mu.Unlock()
+		}()
+
+		result := a.doLargeFileScan(minSizeMB)
+
+		a.mu.Lock()
+		a.fileScanResult = result
+		a.mu.Unlock()
+	}()
+
+	// 立即返回 "started" 状态（附带上次缓存结果如果有）
+	resp := gin.H{
+		"status":  "scanning",
+		"message": "扫描已启动，请稍后刷新获取结果",
+	}
+	if cached != nil {
+		resp["files"] = cached.Files
+		resp["total"] = cached.Total
+		resp["min_size_mb"] = cached.MinSizeMB
+		resp["deletable_count"] = cached.DeletableCount
+		resp["deletable_size_mb"] = cached.DeletableSizeMB
+		resp["cached_at"] = cachedTime
+	}
+	c.JSON(http.StatusAccepted, resp)
+}
+
+// doLargeFileScan 执行实际的大文件扫描（在后台 goroutine 中调用）
+func (a *API) doLargeFileScan(minSizeMB int) *largeFilesCache {
 	minSizeBytes := int64(minSizeMB) * 1024 * 1024
 
-	// 扫描目录列表
 	scanDirs := []string{"/var/log", "/tmp", "/var/tmp", "/www/wwwlogs", "/www/server", "/root", "/home", "/opt", "/var/lib"}
 	if runtime.GOOS == "windows" {
 		scanDirs = []string{"C:\\Users", "C:\\Program Files", "C:\\Windows\\Temp", "C:\\Temp"}
 	}
 
 	var files []LargeFileInfo
-	maxFiles := 200 // 限制返回数量
+	maxFiles := 200
 
-	// 使用带超时的 context，防止扫描时间过长导致 504
-	scanCtx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	// 使用独立 context（不依赖请求 context，因为是异步的）
+	scanCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	for _, dir := range scanDirs {
@@ -4189,13 +5285,13 @@ func (a *API) getLargeFiles(c *gin.Context) {
 		}
 	}
 
-	c.JSON(200, gin.H{
-		"files":             files,
-		"total":             len(files),
-		"min_size_mb":       minSizeMB,
-		"deletable_count":   deletableCount,
-		"deletable_size_mb": float64(deletableSize) / 1024 / 1024,
-	})
+	return &largeFilesCache{
+		Files:           files,
+		Total:           len(files),
+		MinSizeMB:       minSizeMB,
+		DeletableCount:  deletableCount,
+		DeletableSizeMB: math.Round(float64(deletableSize)/1024/1024*100) / 100,
+	}
 }
 
 // scanDirForLargeFiles 递归扫描目录中的大文件
@@ -4689,7 +5785,7 @@ func (a *API) batchDeleteLargeFiles(c *gin.Context) {
 		totalSavedBytes += info.Size()
 		deleted = append(deleted, gin.H{
 			"path":    path,
-			"size_mb": float64(info.Size()) / 1024 / 1024,
+			"size_mb": math.Round(float64(info.Size())/1024/1024*100) / 100,
 		})
 
 		a.storage.SaveAudit(types.AuditEntry{
@@ -4709,7 +5805,7 @@ func (a *API) batchDeleteLargeFiles(c *gin.Context) {
 		"failed":         failed,
 		"deleted_count":  len(deleted),
 		"failed_count":   len(failed),
-		"total_saved_mb": float64(totalSavedBytes) / 1024 / 1024,
+		"total_saved_mb": math.Round(float64(totalSavedBytes)/1024/1024*100) / 100,
 	})
 }
 
@@ -4775,7 +5871,7 @@ func (a *API) deleteLargeFile(c *gin.Context) {
 		Result:    "success",
 	})
 
-	c.JSON(200, gin.H{"message": "文件已删除", "path": req.Path, "size_mb": float64(info.Size()) / 1024 / 1024})
+	c.JSON(200, gin.H{"message": "文件已删除", "path": req.Path, "size_mb": math.Round(float64(info.Size())/1024/1024*100) / 100})
 }
 
 // ─── RBAC 用户管理 ───

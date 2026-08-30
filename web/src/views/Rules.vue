@@ -148,7 +148,7 @@
           <el-descriptions-item label="规则ID">{{ testResult.rule_id }}</el-descriptions-item>
           <el-descriptions-item label="优先级">{{ testResult.priority }}</el-descriptions-item>
           <el-descriptions-item label="告警级别">
-            <el-tag :type="alertLevelTagType(testResult.alert_level)" size="small">{{ testResult.alert_level }}</el-tag>
+            <el-tag :type="alertLevelTagType(testResult.alert_level)" size="small">{{ levelLabel(testResult.alert_level) }}</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="触发条件" :span="2">{{ testResult.trigger }}</el-descriptions-item>
           <el-descriptions-item label="冷却时间">{{ testResult.cooldown }}</el-descriptions-item>

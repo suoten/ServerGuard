@@ -9,12 +9,28 @@ Type=simple
 ExecStart=/opt/serverguard/serverguard-agent -config /opt/serverguard/config.yaml
 WorkingDirectory=/opt/serverguard
 Restart=on-failure
-RestartSec=10
+RestartSec=3
 
-# ====== 资源约束策略 ======
-# 内存：硬限制 256M，Go 软限制 200MiB（GC 更积极）
-MemoryMax=256M
-Environment=GOMEMLIMIT=200MiB
+# ====== 资源约束策略（向宝塔学习：按服务器实际配置自适应）======
+# 安装脚本会在部署时检测总内存，替换下面的 @@MEM_MAX@@ / @@MEM_HIGH@@ / @@GO_MEM_LIMIT@@ 占位符。
+#
+# 自适应策略：
+#   总内存 ≤ 512MB  → MemoryMax=128M,  MemoryHigh=96M,  GOMEMLIMIT=96MiB  （极低配 VPS）
+#   总内存 ≤ 1024MB → MemoryMax=192M,  MemoryHigh=128M, GOMEMLIMIT=128MiB （1C1G 常见配置）
+#   总内存 ≤ 2048MB → MemoryMax=256M,  MemoryHigh=192M, GOMEMLIMIT=192MiB （2C2G）
+#   总内存 > 2048MB → MemoryMax=384M,  MemoryHigh=256M, GOMEMLIMIT=256MiB （4G+ 服务器）
+#
+# 设计原则（学习宝塔的务实策略）：
+#   1. 不设固定值——512MB 的 VPS 和 4GB 的服务器用同一个 MemoryMax 是不合理的
+#   2. MemoryMax 占总内存 8-15%——足够正常运行，不会吃垮低配服务器
+#   3. GOMEMLIMIT 设为 MemoryMax 的 75%——Go GC 在硬限制之前就开始积极回收
+#   4. GOGC=50——比默认 100% 更频繁 GC，用 CPU 换内存（低配服务器内存比 CPU 更紧张）
+#   5. 不用 CPUQuota 硬限制——CPU 空闲时可用满，繁忙时 CPUWeight 自动让路
+MemoryMax=@@MEM_MAX@@
+MemoryHigh=@@MEM_HIGH@@
+MemoryHighTime=30s
+Environment=GOMEMLIMIT=@@GO_MEM_LIMIT@@
+Environment=GOGC=50
 
 # CPU：使用 CPUWeight 而非 CPUQuota
 # CPUWeight=20: 低优先级 — CPU 空闲时可用满，繁忙时自动让路给宝塔/MySQL/Nginx 等
@@ -24,12 +40,11 @@ Environment=GOMAXPROCS=2
 
 # I/O：低优先级，避免磁盘扫描影响业务
 IOWeight=10
-LimitNOFILE=1024
+LimitNOFILE=4096
 
-# OOM：优先牺牲 Agent 自己，保护服务器和宝塔
-# OOMScoreAdjust=500: 内存不足时 OOM Killer 优先杀 ServerGuard（会自动重启）
-# 而不是杀宝塔面板、MySQL、Nginx 等关键服务
-OOMScoreAdjust=500
+# OOM：内存不足时 OOM Killer 可杀 Agent（会自动重启），
+# 但不设太高优先级（100 而非 500），避免扫描峰值时被过早杀掉
+OOMScoreAdjust=100
 
 # 安全加固
 NoNewPrivileges=true

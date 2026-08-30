@@ -11,12 +11,17 @@ import (
 )
 
 // RuleEngine matches metrics against rules and triggers actions.
+// 向宝塔学习：缓存排序后的规则列表，不每次 Match 都重新排序
 type RuleEngine struct {
 	mu            sync.RWMutex
 	rules         map[string]*types.Rule
 	slidingWindow map[string]*SlidingWindow // metric key -> sliding window
 	matchTimeout  time.Duration
 	storage       StorageQuerier
+
+	// 缓存排序后的规则（AddRule/RemoveRule 时置 true 失效）
+	sortedRulesCache []*types.Rule
+	rulesDirty       bool
 }
 
 // StorageQuerier defines the interface for querying action history from storage.
@@ -56,6 +61,7 @@ func (e *RuleEngine) AddRule(rule types.Rule) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.rules[rule.ID] = &rule
+	e.rulesDirty = true // 失效缓存
 }
 
 // RemoveRule removes a rule by ID.
@@ -63,6 +69,7 @@ func (e *RuleEngine) RemoveRule(id string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.rules, id)
+	e.rulesDirty = true // 失效缓存
 }
 
 // GetRules returns all enabled rules sorted by priority (descending).
@@ -246,6 +253,7 @@ func (e *RuleEngine) checkDuration(cond types.Condition, metric types.Metric) bo
 }
 
 // updateSlidingWindows updates sliding windows with new metric values.
+// 向宝塔学习：原地清理旧条目，不每次都 make 新 slice
 func (e *RuleEngine) updateSlidingWindows(metrics []types.Metric) {
 	cleanupTime := time.Now().Add(-1 * time.Hour) // Keep 1 hour of data
 
@@ -258,14 +266,16 @@ func (e *RuleEngine) updateSlidingWindows(metrics []types.Metric) {
 			value:     m.Value,
 			timestamp: m.Timestamp,
 		})
-		// Trim old entries
-		var trimmed []windowEntry
+		// 原地清理旧条目：移动有效条目到前面，然后截断
+		// 不分配新 slice，减少 GC 压力
+		n := 0
 		for _, entry := range window.entries {
 			if entry.timestamp.After(cleanupTime) {
-				trimmed = append(trimmed, entry)
+				window.entries[n] = entry
+				n++
 			}
 		}
-		window.entries = trimmed
+		window.entries = window.entries[:n]
 		window.mu.Unlock()
 	}
 }
@@ -285,14 +295,22 @@ func (e *RuleEngine) getOrCreateSlidingWindow(key string) *SlidingWindow {
 }
 
 // getSortedRules returns rules sorted by priority.
+// 向宝塔学习：缓存排序结果，不每次都 sort
 func (e *RuleEngine) getSortedRules() []*types.Rule {
+	if !e.rulesDirty && e.sortedRulesCache != nil {
+		return e.sortedRulesCache
+	}
 	var rules []*types.Rule
 	for _, r := range e.rules {
-		rules = append(rules, r)
+		if r.Enabled {
+			rules = append(rules, r)
+		}
 	}
 	sort.Slice(rules, func(i, j int) bool {
 		return rules[i].Priority > rules[j].Priority
 	})
+	e.sortedRulesCache = rules
+	e.rulesDirty = false
 	return rules
 }
 
@@ -306,14 +324,14 @@ func (e *RuleEngine) getNeededMetrics(rule *types.Rule) []string {
 }
 
 // hasMetrics checks if any of the needed metrics are present.
+// 向宝塔学习：不每次都 make map，用线性扫描
+// metrics 通常只有 10-30 个，线性扫描比 map 分配+查询更快
 func (e *RuleEngine) hasMetrics(needed []string, have []types.Metric) bool {
-	haveSet := make(map[string]bool)
-	for _, m := range have {
-		haveSet[m.Name] = true
-	}
 	for _, n := range needed {
-		if haveSet[n] {
-			return true
+		for _, m := range have {
+			if m.Name == n {
+				return true
+			}
 		}
 	}
 	return false

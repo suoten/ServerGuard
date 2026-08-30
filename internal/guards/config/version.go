@@ -148,7 +148,7 @@ func (c *ConfigVersionManager) Rollback(filePath, commitHash string) error {
 	snapshotPath := filepath.Join(c.repoDir, "commits", commitHash+".content")
 	content, err := os.ReadFile(snapshotPath)
 	if err != nil {
-		return fmt.Errorf("snapshot not found: %w", err)
+		return fmt.Errorf("快照未找到: %w", err)
 	}
 
 	// Backup current content
@@ -226,7 +226,7 @@ func (c *ConfigVersionManager) ApproveChange(commitHash, approvedBy string) erro
 
 	approval, exists := c.approvals[commitHash]
 	if !exists {
-		return fmt.Errorf("approval not found")
+		return fmt.Errorf("审批记录未找到")
 	}
 
 	approval.Approved = true
@@ -249,7 +249,7 @@ func (c *ConfigVersionManager) ExportYAML(filePath string) ([]byte, error) {
 	if c.store != nil {
 		return c.store.ExportYAML(filePath)
 	}
-	return nil, fmt.Errorf("storage not available")
+	return nil, fmt.Errorf("存储不可用")
 }
 
 // ImportHistory imports commit history from JSON.
@@ -273,7 +273,7 @@ func (c *ConfigVersionManager) ImportYAML(data []byte) error {
 	if c.store != nil {
 		return c.store.ImportYAML(data)
 	}
-	return fmt.Errorf("storage not available")
+	return fmt.Errorf("存储不可用")
 }
 
 // computeDiff computes a simple line-by-line diff.

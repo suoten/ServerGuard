@@ -93,6 +93,8 @@ func (r *Registry) Register(agentID string, info AgentInfo) {
 }
 
 // Heartbeat updates an agent's last-seen time and metrics summary, marking it online.
+// 同时把"近期告警计数"归零——否则 RecentAlertCount 只增不减，
+// 名为 recent 实为历史累计，面板上永远显示总告警数。
 func (r *Registry) Heartbeat(agentID string, m MetricsSummary) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -100,6 +102,7 @@ func (r *Registry) Heartbeat(agentID string, m MetricsSummary) {
 	rec.Metrics = m
 	rec.Status = StatusOnline
 	rec.LastSeen = time.Now()
+	rec.RecentAlertCount = 0
 }
 
 // MarkOffline marks an agent as offline.

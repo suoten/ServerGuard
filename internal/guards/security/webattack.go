@@ -5,10 +5,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -222,18 +220,24 @@ func (g *SecurityGuard) checkSingleWebLog(ctx context.Context, logPath string) {
 }
 
 // trackCCRequest tracks request frequency per IP for CC attack detection.
+// 注意：此函数只做告警，不自动封禁。
+// 真正的 CC 判定和封禁由 attackwarn 模块的 detectCC 完成——
+// 后者采用多条件行为分析（URL集中度+Referer+UA+POST占比），不会误封正常浏览。
+// 此前此处 100 次/5分钟就直接 banIP，是管理员被误封的主要元凶之一。
 func (g *SecurityGuard) trackCCRequest(ip string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	now := time.Now()
 	window := 5 * time.Minute
-	threshold := 100 // 100 requests in 5 minutes
+	// 提高到 500 次/5分钟：正常管理员浏览宝塔面板+多站点管理不会达到此值，
+	// 真正的 CC 攻击通常远超此数。即使达到也只告警不封禁——
+	// 封禁决策由 attackwarn 的行为分析做出。
+	threshold := 500
 
 	if g.loginFailures == nil {
 		g.loginFailures = make(map[string][]time.Time)
 	}
-	// Reuse the loginFailures map for CC tracking
 	times := g.loginFailures[ip]
 	times = append(times, now)
 
@@ -249,12 +253,11 @@ func (g *SecurityGuard) trackCCRequest(ip string) {
 
 	if len(recent) >= threshold {
 		if _, banned := g.bannedIPs[ip]; !banned {
-			g.eventBus.PublishAlert(types.AlertError, "security",
-				fmt.Sprintf("CC攻击: %s", ip),
-				fmt.Sprintf("IP %s 在5分钟内发起 %d 次请求，疑似CC攻击", ip, len(recent)),
+			g.eventBus.PublishAlert(types.AlertWarning, "security",
+				fmt.Sprintf("高频访问告警: %s", ip),
+				fmt.Sprintf("IP %s 在5分钟内发起 %d 次请求（阈值 %d），需关注是否为CC攻击（封禁决策由攻击预警模块的行为分析自动判定）", ip, len(recent), threshold),
 				"cc-attack-001")
-			// 自动封禁 CC 攻击 IP
-			g.banIP(context.Background(), ip, len(recent))
+			// 不再直接 banIP——交给 attackwarn 模块的行为分析决定
 		}
 	}
 }
@@ -381,8 +384,11 @@ func extractURLFromLogLine(line string) string {
 }
 
 // autoBanAttacker 自动封禁发起 Web 攻击的恶意 IP。
-// 自动封禁对服务器本身无风险，仅阻断恶意IP的网络访问。
-// 安全检查：不封禁内网IP、白名单IP、服务器自身IP。
+// 注意：此函数不再直接执行 iptables 封禁。
+// 历史问题：单次 SQLi/XSS 特征匹配就直接 banIP，如果管理员搜索词恰好
+// 包含特征（如 "union select"），一次搜索就被封——与 CC 检测同样的误封模式。
+// 现在改为只告警，真正的封禁由 attackwarn 模块的 tryBan 节流+行为分析完成。
+// attackwarn 会综合分析该 IP 的所有行为（多类型攻击、持续攻击者、威胁情报）再决定是否封禁。
 func (g *SecurityGuard) autoBanAttacker(ctx context.Context, ip, attackType string, severity types.Severity) {
 	// 不封禁内网 IP
 	if isPrivateIP(ip) {
@@ -402,67 +408,22 @@ func (g *SecurityGuard) autoBanAttacker(ctx context.Context, ip, attackType stri
 		return
 	}
 
-	// 检查是否已被封禁
-	g.mu.RLock()
-	_, banned := g.bannedIPs[ip]
-	g.mu.RUnlock()
-	if banned {
-		return
-	}
-
-	// 根据攻击类型决定封禁时长
-	duration := 1 * time.Hour
-	switch severity {
-	case types.SeverityCritical:
-		duration = 2 * time.Hour
-	case types.SeverityHigh:
-		duration = 1 * time.Hour
-	case types.SeverityMedium:
-		duration = 30 * time.Minute
-	case types.SeverityLow:
-		duration = 10 * time.Minute
-	}
-
-	// 威胁情报增强
+	// 只告警，不直接封禁——封禁由 attackwarn 的行为分析决定
+	// 此前的单次匹配即封禁逻辑是误封的主要来源之一
 	intelNote := ""
 	g.mu.RLock()
 	iq := g.intel
 	g.mu.RUnlock()
 	if iq != nil {
 		if info := iq.CheckIP(ctx, ip); info != nil && (info.Confidence >= 50 || info.AbuseReports > 0) {
-			if duration < 24*time.Hour {
-				duration = 24 * time.Hour
-			}
 			intelNote = fmt.Sprintf("（威胁情报: 置信度=%d%% 举报=%d次）", info.Confidence, info.AbuseReports)
 		}
 	}
 
-	banReason := fmt.Sprintf("Web攻击自动封禁(%s)%s", attackType, intelNote)
-
-	// 执行封禁
-	if runtime.GOOS != "windows" {
-		cmd := exec.CommandContext(ctx, "iptables", "-I", "INPUT", "-s", ip, "-j", "DROP",
-			"-m", "comment", "--comment", "serverguard-security:web-attack")
-		if err := cmd.Run(); err != nil {
-			cmd = exec.CommandContext(ctx, "firewall-cmd", "--add-rich-rule",
-				fmt.Sprintf("rule family='ipv4' source address='%s' reject", ip))
-			cmd.Run()
-		}
-	} else {
-		cmd := exec.CommandContext(ctx, "netsh", "advfirewall", "firewall", "add", "rule",
-			"name", fmt.Sprintf("ServerGuard-WebAttack-Ban-%s", ip),
-			"dir=in", "action=block", "remoteip="+ip)
-		cmd.Run()
-	}
-
-	g.mu.Lock()
-	g.bannedIPs[ip] = time.Now().Add(duration)
-	g.mu.Unlock()
-
-	g.eventBus.PublishAlert(types.AlertError, "security",
-		fmt.Sprintf("已自动封禁攻击IP: %s", ip),
-		fmt.Sprintf("IP %s 因发起 %s 攻击被自动封禁 %s%s", ip, attackType, duration, intelNote),
+	banReason := fmt.Sprintf("Web攻击告警(%s)%s——封禁决策由攻击预警模块行为分析自动判定", attackType, intelNote)
+	g.eventBus.PublishAlert(types.AlertWarning, "security",
+		fmt.Sprintf("Web攻击告警: %s (%s)", ip, attackType),
+		banReason,
 		"web-attack-001")
-	g.recordAudit("ban_ip", ip, banReason, "success", "")
-	g.recordAction("ban_ip", ip, fmt.Sprintf("自动封禁IP %s（%s，%v）%s", ip, attackType, duration, intelNote), true, "")
+	g.recordAudit("alert", ip, banReason, "alert_only", "")
 }

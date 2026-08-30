@@ -78,7 +78,7 @@
             <!-- 日志文件列表 -->
             <div v-if="nginxStats.log_files && nginxStats.log_files.length > 0" class="section-block">
               <h4>📄 日志文件（{{ nginxStats.log_files.length }} 个）</h4>
-              <el-table :data="nginxStats.log_files" size="small" stripe>
+              <el-table :data="nginxStats.log_files?.slice((logFilePage-1)*logFileSize, logFilePage*logFileSize) || []" size="small" stripe>
                 <el-table-column label="站点" width="120">
                   <template #default="{ row }">
                     <el-tag size="small" type="info">{{ row.site }}</el-tag>
@@ -103,10 +103,12 @@
                     </el-button>
                   </template>
                 </el-table-column>
-              </el-table>
+</el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="logFilePage" v-model:page-size="logFileSize" :page-sizes="[10, 20, 50, 100]" :total="(nginxStats.log_files || []).length" layout="total, sizes, prev, pager, next" />
+</div>
             </div>
 
-            <!-- 智能洞察 -->
             <div v-if="nginxStats.insights && nginxStats.insights.length > 0" class="section-block">
               <h4>💡 智能洞察</h4>
               <el-alert
@@ -139,7 +141,7 @@
             <!-- 错误详情 -->
             <div v-if="nginxStats.error_details && nginxStats.error_details.length > 0" class="section-block">
               <h4>🔴 错误详情分析（共 {{ nginxStats.error_details.length }} 个错误 URI）</h4>
-              <el-table :data="nginxStats.error_details" size="small" stripe max-height="350">
+              <el-table :data="nginxStats.error_details?.slice((nginxErrorPage-1)*nginxErrorSize, nginxErrorPage*nginxErrorSize) || []" size="small" stripe max-height="350">
                 <el-table-column label="状态码" width="70" align="center">
                   <template #default="{ row }">
                     <el-tag :type="statusTagType(row.status_code)" size="small">{{ row.status_code }}</el-tag>
@@ -157,11 +159,14 @@
                     <span style="color: var(--sg-text-2); font-size: 12px;">{{ row.suggestion }}</span>
                   </template>
                 </el-table-column>
-              </el-table>
+</el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="nginxErrorPage" v-model:page-size="nginxErrorSize" :page-sizes="[10, 20, 50, 100]" :total="(nginxStats.error_details || []).length" layout="total, sizes, prev, pager, next" />
+</div>
             </div>
 
+            <!-- Top URI & Top IP -->
             <el-row :gutter="16">
-              <!-- Top URI -->
               <el-col :xs="24" :md="12">
                 <div class="section-block">
                   <h4>热门 URI TOP 10</h4>
@@ -246,7 +251,7 @@
               </el-col>
             </el-row>
 
-            <el-table :data="slowQueryReport.queries || []" stripe style="margin-top: 16px">
+            <el-table :data="(slowQueryReport.queries || []).slice((slowQueryPage-1)*slowQuerySize, slowQueryPage*slowQuerySize)" stripe style="margin-top: 16px">
               <el-table-column label="严重度" width="80">
                 <template #default="{ row }">
                   <el-tag :type="severityTagType(row.severity)" size="small">{{ severityLabel(row.severity) }}</el-tag>
@@ -273,7 +278,10 @@
                   <span class="suggestion-text">{{ row.suggestion }}</span>
                 </template>
               </el-table-column>
-            </el-table>
+</el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="slowQueryPage" v-model:page-size="slowQuerySize" :page-sizes="[10, 20, 50, 100]" :total="(slowQueryReport.queries || []).length" layout="total, sizes, prev, pager, next" />
+</div>
 
             <div class="analyze-time">
               分析时间: {{ formatTime(slowQueryReport.timestamp) }}
@@ -329,7 +337,7 @@
               </el-col>
             </el-row>
 
-            <el-table :data="redisReport.big_keys || []" stripe style="margin-top: 16px">
+            <el-table :data="(redisReport.big_keys || []).slice((redisBigKeyPage-1)*redisBigKeySize, redisBigKeyPage*redisBigKeySize)" stripe style="margin-top: 16px">
               <el-table-column label="严重度" width="80">
                 <template #default="{ row }">
                   <el-tag :type="severityTagType(row.severity)" size="small">{{ severityLabel(row.severity) }}</el-tag>
@@ -348,7 +356,10 @@
                   <span class="suggestion-text">{{ row.suggestion }}</span>
                 </template>
               </el-table-column>
-            </el-table>
+</el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="redisBigKeyPage" v-model:page-size="redisBigKeySize" :page-sizes="[10, 20, 50, 100]" :total="(redisReport.big_keys || []).length" layout="total, sizes, prev, pager, next" />
+</div>
 
             <div class="analyze-time">
               分析时间: {{ formatTime(redisReport.timestamp) }}
@@ -404,6 +415,16 @@ import { ref, computed, onMounted } from 'vue'
 import axios from 'axios'
 import dayjs from 'dayjs'
 import { Refresh, VideoPlay, CircleCheckFilled, CircleCloseFilled, View, CopyDocument } from '@element-plus/icons-vue'
+
+// 分页状态
+const nginxErrorPage = ref(1)
+const nginxErrorSize = ref(10)
+const slowQueryPage = ref(1)
+const slowQuerySize = ref(10)
+const redisBigKeyPage = ref(1)
+const redisBigKeySize = ref(10)
+const logFilePage = ref(1)
+const logFileSize = ref(10)
 
 const activeTab = ref('nginx')
 

@@ -144,7 +144,11 @@ func (g *LogGuard) SetConfig(maxFileSize, maxDirSize int64, maxWriteRate float64
 
 // Check performs log guard checks.
 // SAFETY: Only monitors and alerts. Never auto-rotates or deletes logs.
+// Enhanced: 自动发现 Java 应用日志 + 根分区保护
 func (g *LogGuard) Check(ctx context.Context, diskUsagePercent float64) {
+	// D0: 增强 — 自动发现 Java 应用日志目录并加入扫描路径
+	g.enrichScanPaths()
+
 	// D1: Scan and monitor log files
 	g.scanLogFiles()
 
@@ -160,11 +164,26 @@ func (g *LogGuard) Check(ctx context.Context, diskUsagePercent float64) {
 	// D5: Log content analysis — scan for error patterns
 	g.checkLogContent()
 
-	// D6: Emergency — alert only, never auto-delete
+	// D5.5: Java 应用日志暴涨检测
+	g.CheckJavaLogFlood()
+
+	// D5.6: 幽灵文件检测 — 已删除但句柄未释放的隐形空间杀手
+	// 典型场景：Java 进程 stdout/stderr 重定向的日志被删除后，进程不重启则句柄不释放
+	// 当磁盘使用率超过 80% 时主动检测和清理幽灵文件
+	g.CheckGhostFiles(diskUsagePercent)
+
+	// D6: Emergency — 多层防护策略
+	// 当磁盘使用率超过 85% 时，执行根分区保护（预防性清理→紧急清理→全力清理）
+	// 包括 copytruncate 截断 Java 日志、清理旧轮转文件、清理缓存等
+	if diskUsagePercent >= 85 {
+		protector := NewRootPartitionProtector(g.eventBus, g.safety)
+		protector.Protect(diskUsagePercent)
+	}
+
 	if diskUsagePercent >= g.emergencyThreshold {
 		g.eventBus.PublishAlert(types.AlertCritical, "log",
 			"磁盘空间紧急",
-			fmt.Sprintf("磁盘使用率 %.1f%% 超过紧急阈值，建议手动清理旧日志文件", diskUsagePercent),
+			fmt.Sprintf("磁盘使用率 %.1f%% 超过紧急阈值，已执行自动清理（copytruncate + 旧日志删除 + 缓存清理）", diskUsagePercent),
 			"emergency-cleanup-001")
 	}
 }
@@ -473,29 +492,6 @@ func (g *LogGuard) identifyApp(path string) string {
 	return ""
 }
 
-// checkLogbackConfig checks if logback/log4j configurations have proper rolling policies.
-func (g *LogGuard) checkLogbackConfig(ctx context.Context) {
-	// Scan for logback.xml files
-	patterns := []string{
-		"/www/server/panel/vhost/rewritelog/",
-		"/opt/",
-		"/app/",
-		"/usr/local/",
-	}
-
-	for _, basePath := range patterns {
-		filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
-			}
-			if strings.HasSuffix(path, "logback.xml") || strings.HasSuffix(path, "log4j2.xml") {
-				g.analyzeLogbackConfig(path)
-			}
-			return nil
-		})
-	}
-}
-
 // analyzeLogbackConfig checks if a logback config has proper rolling policies.
 func (g *LogGuard) analyzeLogbackConfig(path string) {
 	data, err := os.ReadFile(path)
@@ -558,6 +554,7 @@ func (g *LogGuard) PurgeOldLogs() {
 // defaultLogPaths returns platform-appropriate log directories.
 // IMPORTANT: Do NOT include BaoTa directories (/www/wwwlogs) — rotating those files
 // will break nginx and BaoTa panel. Only scan standard system log directories.
+// Enhanced: Java 应用日志目录会在运行时通过 EnrichedScanPaths 自动发现
 func defaultLogPaths() []string {
 	if runtime.GOOS == "windows" {
 		return []string{
@@ -567,6 +564,21 @@ func defaultLogPaths() []string {
 		}
 	}
 	return []string{"/var/log"}
+}
+
+// enrichScanPaths 增强扫描路径：自动发现 Java 应用日志目录
+// 通过 /proc 扫描 Java 进程，将其工作目录下的 logs/ 子目录加入扫描范围
+func (g *LogGuard) enrichScanPaths() {
+	g.mu.RLock()
+	currentPaths := g.scanPaths
+	g.mu.RUnlock()
+
+	// 获取增强后的路径
+	enrichedPaths := EnrichedScanPaths(currentPaths)
+
+	g.mu.Lock()
+	g.scanPaths = enrichedPaths
+	g.mu.Unlock()
 }
 
 // --- Log Content Analysis ---

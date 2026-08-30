@@ -62,6 +62,15 @@ func (u *Upgrader) SetSigningKey(key string) {
 	u.signingKey = key
 }
 
+// updateHTTPClient 带超时的更新服务器客户端（元数据检查用）。
+// 调用方的 ctx 是 6 小时一次的后台检查（无超时），http.DefaultClient 无超时——
+// 更新服务器挂起会让该 goroutine 永久卡死在当次迭代。
+var updateHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// updateDownloadClient 二进制包下载专用：Client.Timeout 覆盖整个响应体读取，
+// 30s 会掐断大包下载；这里交给 ctx 控制（15 分钟）。
+var updateDownloadClient = &http.Client{}
+
 // CheckForUpdate checks if a new version is available.
 func (u *Upgrader) CheckForUpdate(ctx context.Context, channel string) (*UpdateInfo, error) {
 	if channel == "" {
@@ -88,7 +97,7 @@ func (u *Upgrader) CheckForUpdate(ctx context.Context, channel string) (*UpdateI
 		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updateHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check for updates: %w", err)
 	}
@@ -290,12 +299,15 @@ func (u *Upgrader) migrateConfig(ctx context.Context, fromVer, toVer string) err
 }
 
 // downloadBinary downloads the new binary.
+// 使用独立的长超时客户端（二进制包下载可能耗时数分钟，但不能无限挂起）。
 func (u *Upgrader) downloadBinary(ctx context.Context, url, destPath, expectedSHA string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	dlCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(dlCtx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := updateDownloadClient.Do(req)
 	if err != nil {
 		return err
 	}

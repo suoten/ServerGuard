@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,9 +97,112 @@ func detectBaotaEnvironmentImpl() *BaotaEnv {
 		env.PanelPort = readBaotaPort(env.PanelPath)
 		env.Version = readBaotaVersion(env.PanelPath)
 		env.PanelType = detectBaotaPanelType(env.PanelPath)
+		// 读取宝塔实际的站点根目录（可能安装在数据盘上，如 /data/wwwroot）
+		env.WebRoot = readBaotaWebRoot(env.PanelPath)
 	}
 
 	return env
+}
+
+// readBaotaWebRoot 从宝塔配置中读取实际的站点根目录。
+// 宝塔的站点根目录可能不在 /www/wwwroot（用户可能选了数据盘），
+// 实际路径存储在以下位置：
+//   - /www/server/panel/data/default_path.pl  （宝塔 6.x+）
+//   - /www/server/panel/config/config.json     （宝塔 5.x）
+//   - /www/server/panel/data/sitepath.pl       （旧版本）
+// 如果都读不到，回退到 /www/wwwroot。
+func readBaotaWebRoot(panelPath string) string {
+	// 方式1: default_path.pl（宝塔 6.x+ 存储 wwwroot 路径）
+	paths := []string{
+		panelPath + "/data/default_path.pl",
+		panelPath + "/data/sitepath.pl",
+	}
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil {
+			path := strings.TrimSpace(string(data))
+			if path != "" {
+				// 验证路径确实存在
+				if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+					return path
+				}
+			}
+		}
+	}
+
+	// 方式2: 从 config/config.json 中提取 default_path
+	configFile := panelPath + "/config/config.json"
+	if data, err := os.ReadFile(configFile); err == nil {
+		content := string(data)
+		// 查找 "default_path": "/xxx/wwwroot" 格式
+		if idx := strings.Index(content, "default_path"); idx >= 0 {
+			rest := content[idx:]
+			for _, quote := range []byte{'"', '\''} {
+				quoteStr := string(quote)
+				// 找到 : 后面的引号
+				if colonIdx := strings.Index(rest, ":"); colonIdx >= 0 {
+					afterColon := rest[colonIdx+1:]
+					// 跳过空格
+					for len(afterColon) > 0 && afterColon[0] == ' ' {
+						afterColon = afterColon[1:]
+					}
+					if len(afterColon) > 0 && afterColon[0] == quote {
+						pathStart := afterColon[1:]
+						if end := strings.Index(pathStart, quoteStr); end > 0 {
+							path := pathStart[:end]
+							if path != "" {
+								if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+									return path
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 方式3: 从 Nginx 配置中提取 root 路径
+	// 宝塔的 Nginx vhost 配置文件中 root 指令指向实际站点路径
+	vhostDir := "/www/server/panel/vhost/nginx/"
+	if entries, err := os.ReadDir(vhostDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(entry.Name()))
+			if ext != ".conf" && ext != ".vhost" {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(vhostDir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			content := string(data)
+			// 查找 root /xxx/wwwroot/yyy; 格式
+			lines := strings.Split(content, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "root ") || strings.HasPrefix(line, "root\t") {
+					// 提取路径
+					pathPart := strings.TrimPrefix(line, "root")
+					pathPart = strings.TrimPrefix(pathPart, "\t")
+					pathPart = strings.TrimSpace(pathPart)
+					pathPart = strings.TrimSuffix(pathPart, ";")
+					pathPart = strings.Trim(pathPart, "\"'")
+					// 取上级目录（root 指向 /xxx/wwwroot/site，上级 /xxx/wwwroot 就是根目录）
+					if pathPart != "" && pathPart != "/" {
+						parentDir := filepath.Dir(pathPart)
+						if fi, err := os.Stat(parentDir); err == nil && fi.IsDir() {
+							return parentDir
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 回退到默认路径
+	return "/www/wwwroot"
 }
 
 // readBaotaPort 从 /www/server/panel/data/port.pl 读取面板端口。

@@ -73,7 +73,7 @@ func New(bus *eventbus.EventBus, store *storage.Storage) *SecurityGuard {
 	return &SecurityGuard{
 		eventBus:          bus,
 		storage:           store,
-		bruteThreshold:    5,
+		bruteThreshold:    30, // 从 5 提高到 30：5 次失败就封太低，管理员密码记错输几次就被封
 		bruteWindow:       5 * time.Minute,
 		banDuration:       1 * time.Hour,
 		banProgression:    true,
@@ -298,7 +298,11 @@ func (g *SecurityGuard) checkBruteForce(ctx context.Context) {
 					recent = append(recent, t)
 				}
 			}
-			g.loginFailures[ip] = recent
+			if len(recent) == 0 {
+				delete(g.loginFailures, ip) // 空条目即删，防止按攻击 IP 无限增长
+			} else {
+				g.loginFailures[ip] = recent
+			}
 
 			// Check threshold
 			if len(recent) >= g.bruteThreshold {
@@ -309,6 +313,24 @@ func (g *SecurityGuard) checkBruteForce(ctx context.Context) {
 			g.mu.Unlock()
 		}
 	}
+
+	// 周期性回收（每轮检查一次，而非每行一次）：已过期未显式解封的封禁记录、
+	// 长期无更新的失败历史。放在扫描循环外，避免暴破风暴时 O(行数×封禁数) 的锁内开销。
+	g.mu.Lock()
+	nowClean := time.Now()
+	for bip, until := range g.bannedIPs {
+		if nowClean.After(until) {
+			delete(g.bannedIPs, bip)
+		}
+	}
+	if len(g.loginFailures) > 4096 {
+		for fip, fails := range g.loginFailures {
+			if len(fails) == 0 || nowClean.Sub(fails[len(fails)-1]) > time.Hour {
+				delete(g.loginFailures, fip)
+			}
+		}
+	}
+	g.mu.Unlock()
 }
 
 // checkWindowsBruteForce checks Windows Event Log for failed logins.
@@ -376,11 +398,14 @@ func (g *SecurityGuard) banIP(ctx context.Context, ip string, failures int) {
 	}
 
 	// Progressive ban duration
+	// 注意：bruteThreshold=30，所以 failures 最小为 30
+	// failures>=50 说明暴力破解持续超过阈值将近两倍，封 24 小时
+	// failures>=30 是刚达到阈值，封 6 小时
 	if g.banProgression {
 		switch {
-		case failures >= 15:
+		case failures >= 50:
 			duration = 24 * time.Hour
-		case failures >= 10:
+		case failures >= 30:
 			duration = 6 * time.Hour
 		default:
 			duration = g.banDuration

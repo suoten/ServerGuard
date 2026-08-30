@@ -129,7 +129,13 @@ func (o *OTXClient) QueryIP(ip string) (*IPInfo, error) {
 	}
 
 	o.mu.Lock()
-	o.cache[ip] = info
+	// 上限保护：公网服务器会被扫描器用大量一次性 IP 打进来，
+	// 不设上限的 per-IP 缓存就是慢性内存泄漏
+	if len(o.cache) > 4096 {
+		o.cache = map[string]*IPInfo{ip: info} // 直接换新，保留当前条目
+	} else {
+		o.cache[ip] = info
+	}
 	o.mu.Unlock()
 
 	return info, nil

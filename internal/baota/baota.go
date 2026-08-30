@@ -374,7 +374,16 @@ func (d *Discovery) renewSSLViaAPI(ctx context.Context, domain string) error {
 			acmeErr = fmt.Errorf("续签请求成功但站点证书未更新")
 		}
 	} else if err != nil {
-		acmeErr = err
+		// 未找到 ACME 订单 → 可能是从未通过宝塔申请过证书 → 尝试首次申请
+		if strings.Contains(err.Error(), "未找到") || strings.Contains(err.Error(), "无 /acme") {
+			applyErr := d.acmeApplyCert(ctx, siteName, domain)
+			if applyErr == nil && d.certRenewed(siteName) {
+				return nil
+			}
+			acmeErr = fmt.Errorf("首次申请失败: %v（续期也不可用: %v）", applyErr, err)
+		} else {
+			acmeErr = err
+		}
 	}
 
 	// 路径 B：旧版站点级续签（宝塔 7.x，/site?action=RenewLet）
@@ -496,6 +505,50 @@ func (d *Discovery) legacyRenewLet(ctx context.Context, siteName string) error {
 	}
 	if status != 200 {
 		return fmt.Errorf("RenewLet 返回状态 %d", status)
+	}
+	return parseBtStatus(body)
+}
+
+// acmeApplyCert 通过宝塔 API 首次申请 Let's Encrypt 证书（不仅仅是续期）。
+// 宝塔面板手动点"申请证书"时调用的就是这个接口。
+// 接口: /site?action=ApplyLet （宝塔 7.x/8.x/9.x 通用）
+// 参数: siteName=站点名, domains=域名列表
+func (d *Discovery) acmeApplyCert(ctx context.Context, siteName, domain string) error {
+	form := url.Values{
+		"siteName": {siteName},
+		"domains":  {domain},
+	}
+	body, status, err := d.apiPost(ctx, d.renewClient, "/site?action=ApplyLet", form)
+	if err != nil {
+		return err
+	}
+	if status == 404 {
+		// 旧版面板可能不支持 ApplyLet，尝试 /acme?action=apply
+		return d.acmeApplyCertV2(ctx, siteName, domain)
+	}
+	if status != 200 {
+		return fmt.Errorf("ApplyLet 返回状态 %d", status)
+	}
+	return parseBtStatus(body)
+}
+
+// acmeApplyCertV2 通过宝塔 v8+/v11 ACME 模块首次申请证书。
+// 接口: /acme?action=apply
+func (d *Discovery) acmeApplyCertV2(ctx context.Context, siteName, domain string) error {
+	form := url.Values{
+		"siteName": {siteName},
+		"domains":  {domain},
+		"auto":     {"true"}, // 自动验证
+	}
+	body, status, err := d.apiPost(ctx, d.renewClient, "/acme?action=apply", form)
+	if err != nil {
+		return err
+	}
+	if status == 404 {
+		return fmt.Errorf("面板不支持证书申请接口（ApplyLet 和 acme/apply 均不可用）")
+	}
+	if status != 200 {
+		return fmt.Errorf("acme/apply 返回状态 %d", status)
 	}
 	return parseBtStatus(body)
 }

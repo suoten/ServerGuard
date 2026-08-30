@@ -42,9 +42,18 @@ func NewIntelChecker() *IntelChecker {
 	}
 }
 
+// negativeCacheTTL 查询失败/无情报结果的负缓存时长。
+// 短于正缓存：情报可能有变化；但必须缓存——否则同一攻击 IP 的每个事件
+// 都会重新触发外部 HTTP 调用（攻击日志里同一 IP 往往出现几十上百次）。
+const negativeCacheTTL = 1 * time.Hour
+
+// maxCacheEntries 缓存条目上限，超过时惰性清理过期项。
+// 公网服务器会被扫描器塞入大量一次性 IP，不设上限就是慢性内存泄漏。
+const maxCacheEntries = 4096
+
 // CheckIP 查询 IP 的恶意情报信息。
-// 先查本地缓存，命中且未过期直接返回；否则调用 manager.QueryIP，成功后写入缓存。
-// 查询失败 / 无源 / 缓存为空时返回 nil（不阻塞调用方）。
+// 先查本地缓存（含负缓存），命中且未过期直接返回；否则调用 manager.QueryIP，
+// 成功写入正缓存、失败写入负缓存——外部网络调用全部 fail-close。
 func (c *IntelChecker) CheckIP(ctx context.Context, ip string) *IPInfo {
 	if c == nil || c.manager == nil || ip == "" {
 		return nil
@@ -59,11 +68,22 @@ func (c *IntelChecker) CheckIP(ctx context.Context, ip string) *IPInfo {
 	}
 
 	info, err := c.manager.QueryIP(ip)
-	if err != nil || info == nil {
-		return nil
-	}
 
 	c.mu.Lock()
+	// 惰性清理：条目数超限时删除全部过期项
+	if len(c.cache) > maxCacheEntries {
+		for k, e := range c.cache {
+			if e.expiry.Before(now) {
+				delete(c.cache, k)
+			}
+		}
+	}
+	if err != nil || info == nil {
+		// 负缓存：短 TTL 内不再对同一 IP 重复发起注定失败的外部查询
+		c.cache[ip] = cacheEntry{info: nil, expiry: now.Add(negativeCacheTTL)}
+		c.mu.Unlock()
+		return nil
+	}
 	c.cache[ip] = cacheEntry{info: info, expiry: now.Add(c.ttl)}
 	c.mu.Unlock()
 

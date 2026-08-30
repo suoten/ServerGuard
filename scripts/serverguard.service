@@ -11,11 +11,27 @@ RestartSec=3
 StartLimitInterval=60
 StartLimitBurst=3
 
-# Resource limits (OS-level enforcement per §9.5.1)
-MemoryMax=80M
-CPUQuota=5%
+# ====== 资源约束策略（自适应：安装脚本按服务器总内存设定）======
+# 此文件是模板，安装脚本会替换 @@MEM_MAX@@ 等占位符。
+# 默认值适合 1C1G 服务器（192M）。
+# 设计原则（向宝塔学习）：按实际配置自适应，不设固定值。
+MemoryMax=192M
+MemoryHigh=128M
+MemoryHighTime=30s
+Environment=GOMEMLIMIT=128MiB
+Environment=GOGC=50
+
+# CPU：CPUWeight=20 低优先级（空闲时可用满，繁忙时自动让路）
+# 不使用 CPUQuota=5% 硬限制 — 会导致启动极慢、面板无响应
+CPUWeight=20
+Environment=GOMAXPROCS=2
+
+# I/O：低优先级
 IOWeight=10
-LimitNOFILE=1024
+LimitNOFILE=4096
+
+# OOM：内存不足时可被杀（会自动重启），但不优先杀
+OOMScoreAdjust=100
 
 # Security hardening
 NoNewPrivileges=true

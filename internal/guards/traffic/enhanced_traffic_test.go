@@ -15,21 +15,21 @@ func TestCCAttackDetector_New(t *testing.T) {
 	if d == nil {
 		t.Fatal("NewCCAttackDetector returned nil")
 	}
-	if d.threshold != 100 {
-		t.Errorf("expected threshold 100, got %d", d.threshold)
+	if d.threshold != 500 {
+		t.Errorf("expected threshold 500, got %d", d.threshold)
 	}
 }
 
 func TestCCAttackDetector_RecordRequest(t *testing.T) {
 	d := NewCCAttackDetector()
 
-	for i := 0; i < 99; i++ {
+	for i := 0; i < 499; i++ {
 		if d.RecordRequest("1.2.3.4", "/index") {
 			t.Error("should not trigger before threshold")
 		}
 	}
 	if !d.RecordRequest("1.2.3.4", "/index") {
-		t.Error("should trigger at threshold (100)")
+		t.Error("should trigger at threshold (500)")
 	}
 }
 
@@ -59,8 +59,8 @@ func TestCCAttackDetector_GetTopAttackers(t *testing.T) {
 	if len(attackers) != 2 {
 		t.Fatalf("expected 2 attackers, got %d", len(attackers))
 	}
-	if attackers[0].Threshold != 100 {
-		t.Errorf("expected threshold 100, got %d", attackers[0].Threshold)
+	if attackers[0].Threshold != 500 {
+		t.Errorf("expected threshold 500, got %d", attackers[0].Threshold)
 	}
 }
 
@@ -131,21 +131,21 @@ func TestPortScanDetector_New(t *testing.T) {
 	if d == nil {
 		t.Fatal("NewPortScanDetector returned nil")
 	}
-	if d.threshold != 20 {
-		t.Errorf("expected threshold 20, got %d", d.threshold)
+	if d.threshold != 50 {
+		t.Errorf("expected threshold 50, got %d", d.threshold)
 	}
 }
 
 func TestPortScanDetector_RecordPortHit(t *testing.T) {
 	d := NewPortScanDetector()
 
-	for port := 1; port < 20; port++ {
+	for port := 1; port < 50; port++ {
 		if d.RecordPortHit("1.2.3.4", port) {
 			t.Error("should not trigger before threshold")
 		}
 	}
-	if !d.RecordPortHit("1.2.3.4", 20) {
-		t.Error("should trigger at threshold (20 unique ports)")
+	if !d.RecordPortHit("1.2.3.4", 50) {
+		t.Error("should trigger at threshold (50 unique ports)")
 	}
 }
 

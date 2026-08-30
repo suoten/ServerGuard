@@ -339,6 +339,39 @@ type AuditEntry struct {
 	IPAddress string    `json:"ip_address,omitempty"`
 }
 
+// AlertRef 告警的轻量引用（事件链成员）。
+type AlertRef struct {
+	AlertID string     `json:"alert_id"`
+	Title   string     `json:"title"`
+	Source  string     `json:"source"`
+	Level   AlertLevel `json:"level"`
+	Time    time.Time  `json:"time"`
+}
+
+// ChainLink 因果链上的一条边：From 告警导致了 To 告警。
+type ChainLink struct {
+	From string `json:"from"` // 上游告警标题
+	To   string `json:"to"`   // 下游告警标题
+	Via  string `json:"via"`  // 判定依据："domain-rule"（领域规则）/"same-source"（同源连锁）
+}
+
+// Incident 故障事件：多条相关告警关联成的一条因果链。
+// 根因链推理的产物 —— 用一条带因果关系的汇总告警替代 N 条孤立告警。
+type Incident struct {
+	ID           string      `json:"id"`
+	StartedAt    time.Time   `json:"started_at"`
+	EndedAt      *time.Time  `json:"ended_at,omitempty"`
+	Status       string      `json:"status"` // open / resolved
+	RootTitle    string      `json:"root_title"`
+	RootSource   string      `json:"root_source"`
+	RootTime     time.Time   `json:"root_time"`
+	MemberAlerts []AlertRef  `json:"member_alerts"`
+	Chain        []ChainLink `json:"chain,omitempty"`
+	Actions      []string    `json:"actions,omitempty"` // 事件期间自动执行的处置
+	Summary      string      `json:"summary"`
+}
+
+
 // ServerStatus represents the status of a guarded server.
 type ServerStatus struct {
 	AgentID    string    `json:"agent_id"`

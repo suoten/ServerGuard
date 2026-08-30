@@ -9,12 +9,14 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════╗"
 echo "║        ServerGuard 一键安装脚本                  ║"
 echo "║        服务器监控 · 自动运维 · 自愈防护           ║"
+echo "║        Install & Forget. Guard & Heal.           ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -65,23 +67,34 @@ elif command -v netstat &> /dev/null; then
 fi
 
 INSTALL_DIR="/opt/serverguard"
-echo -e "${GREEN}[1/7]${NC} 安装目录: ${INSTALL_DIR}"
+echo -e "${GREEN}[1/8]${NC} 安装目录: ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
+
+# 配置保护：升级时绝不覆盖已有 config.yaml（历史事故：覆盖导致面板密码/JWT/存储路径被重置）。
+# 仅首次安装生成模板；已存在则自动备份并保留原配置。
+write_config_protected() {
+  if [ -f "${INSTALL_DIR}/config.yaml" ]; then
+    cp "${INSTALL_DIR}/config.yaml" "${INSTALL_DIR}/config.yaml.bak.$(date +%Y%m%d%H%M%S)"
+    echo -e "  ${YELLOW}[升级]${NC} 检测到现有配置，已保留原 config.yaml 并备份，未做任何修改"
+    return 0
+  fi
+  cat > "${INSTALL_DIR}/config.yaml"
+}
 
 # ── 复制二进制文件 ────────────────────────────────────
 # 发布包里二进制统一叫 serverguard-agent，dist 目录下叫带架构后缀的名字
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "${SCRIPT_DIR}/serverguard-agent" ]; then
-  echo -e "${GREEN}[2/7]${NC} 从本地复制二进制文件"
+  echo -e "${GREEN}[2/8]${NC} 从本地复制二进制文件"
   cp "${SCRIPT_DIR}/serverguard-agent" "${INSTALL_DIR}/serverguard-agent"
 elif [ -f "serverguard-agent" ]; then
-  echo -e "${GREEN}[2/7]${NC} 从当前目录复制二进制文件"
+  echo -e "${GREEN}[2/8]${NC} 从当前目录复制二进制文件"
   cp "serverguard-agent" "${INSTALL_DIR}/serverguard-agent"
 elif [ -f "${SCRIPT_DIR}/${BINARY}" ]; then
-  echo -e "${GREEN}[2/7]${NC} 从本地复制二进制文件"
+  echo -e "${GREEN}[2/8]${NC} 从本地复制二进制文件"
   cp "${SCRIPT_DIR}/${BINARY}" "${INSTALL_DIR}/serverguard-agent"
 elif [ -f "${BINARY}" ]; then
-  echo -e "${GREEN}[2/7]${NC} 从当前目录复制二进制文件"
+  echo -e "${GREEN}[2/8]${NC} 从当前目录复制二进制文件"
   cp "${BINARY}" "${INSTALL_DIR}/serverguard-agent"
 else
   echo -e "${RED}[错误]${NC} 未找到二进制文件: serverguard-agent"
@@ -94,19 +107,49 @@ fi
 
 chmod +x "${INSTALL_DIR}/serverguard-agent"
 
+# ── 复制 hub 和 sgctl 二进制（如果发布包中包含） ──────
+# hub: 多服务器管理中枢（含独立面板），sgctl: 命令行运维工具
+# 这两个组件是可选的——agent 自身已内嵌完整扫描+面板能力，
+# 但如果用户需要多服务器集中管理或 CLI 工具，也会一并安装。
+for comp in serverguard-hub sgctl; do
+  if [ -f "${SCRIPT_DIR}/${comp}" ]; then
+    cp "${SCRIPT_DIR}/${comp}" "${INSTALL_DIR}/${comp}"
+    chmod +x "${INSTALL_DIR}/${comp}"
+    echo -e "  ${GREEN}✓${NC} 已安装 ${comp}"
+  elif [ -f "${comp}" ]; then
+    cp "${comp}" "${INSTALL_DIR}/${comp}"
+    chmod +x "${INSTALL_DIR}/${comp}"
+    echo -e "  ${GREEN}✓${NC} 已安装 ${comp}"
+  fi
+done
+
 # ── 生成配置文件 ──────────────────────────────────────
-echo -e "${GREEN}[3/7]${NC} 生成配置文件"
+echo -e "${GREEN}[3/8]${NC} 生成配置文件"
 JWT_SECRET=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
 # 随机面板密码：安全产品不应有固定默认口令，安装时生成并只显示一次
 ADMIN_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
 
-# 宝塔环境下生成兼容模式配置
+# ============================================================
+# 核心设计理念：安装即生效 — 零配置自愈
+# 用户安装后不需要打开面板，以下能力自动运行：
+#   1. 磁盘 > 90% → 自动清理日志/缓存/临时文件（保留近7天）
+#   2. 日志 > 500MB → 自动轮转压缩
+#   3. SSH 暴力破解 → 自动封禁 IP
+#   4. SSL 证书到期 → 自动续期
+#   5. 僵尸进程 → 自动清理
+#   6. 宝塔面板挂了 → 自动重启
+# ============================================================
+
 if [ "$IS_BAOTA" = true ]; then
-cat > "${INSTALL_DIR}/config.yaml" << EOF
+# ── 宝塔环境：安全保护模式，但日志/磁盘自愈仍然启用 ──
+# 宝塔环境下只清理 /var/log、/tmp 等系统目录，不触碰宝塔目录
+write_config_protected << EOF
 agent:
   collect_interval: 15s
-  max_memory_mb: 200
+  max_memory_mb: 120
   max_cpu_percent: 10
+  learn_mode: true
+  learn_mode_days: 1
 web:
   enabled: true
   listen: "0.0.0.0:18090"
@@ -132,8 +175,8 @@ baota:
   safe_mode: "true"
   panel_path: "${BAOTA_PANEL_PATH}"
   use_baota_service_manager: true
-  cleanup_scope: "disabled"
-  log_rotation_scope: "disabled"
+  cleanup_scope: "system_only"
+  log_rotation_scope: "system_only"
   confirm_timeout_minutes: 5
   webshell_exclusions:
     - "/www/server/panel"
@@ -144,19 +187,24 @@ baota:
     malware_kill: true
     zombie_cleanup: true
     custom_service_restart: true
+    disk_cleanup: true
+    log_rotation: true
   confirm_actions:
     whitelist_cpu_throttle: "confirm"
     whitelist_mem_restart: "confirm"
-    disk_cleanup: "alert"
-    log_rotation: "alert"
+    disk_cleanup: "auto"
+    log_rotation: "auto"
     baota_service_restart: "confirm"
 EOF
 else
-cat > "${INSTALL_DIR}/config.yaml" << EOF
+# ── 非宝塔环境：全自愈模式，安装即生效 ──
+write_config_protected << EOF
 agent:
   collect_interval: 15s
-  max_memory_mb: 200
+  max_memory_mb: 120
   max_cpu_percent: 10
+  learn_mode: true
+  learn_mode_days: 1
 web:
   enabled: true
   listen: "0.0.0.0:18090"
@@ -179,38 +227,30 @@ safety:
 storage:
   path: "/var/lib/serverguard/serverguard.db"
 baota:
-  safe_mode: "true"
-  panel_path: "/www/server/panel"
-  use_baota_service_manager: true
-  cleanup_scope: "disabled"
-  log_rotation_scope: "disabled"
-  confirm_timeout_minutes: 5
-  webshell_exclusions:
-    - "/www/server/panel"
-    - "/www/server/panel/plugin"
+  safe_mode: "false"
   auto_actions:
     ssh_bruteforce_ban: true
     cert_renewal: true
     malware_kill: true
     zombie_cleanup: true
     custom_service_restart: true
+    disk_cleanup: true
+    log_rotation: true
   confirm_actions:
-    whitelist_cpu_throttle: "confirm"
-    whitelist_mem_restart: "confirm"
-    disk_cleanup: "confirm"
-    log_rotation: "confirm"
-    baota_service_restart: "confirm"
+    disk_cleanup: "auto"
+    log_rotation: "auto"
 EOF
 fi
 
 # 创建数据目录
 mkdir -p /var/lib/serverguard/.trash
 mkdir -p /var/lib/serverguard/config-backups
+mkdir -p /var/lib/serverguard/db-backups
 chmod 755 /var/lib/serverguard
 chmod 755 /var/lib/serverguard/.trash
 
 # ── 复制规则文件 ────────────────────────────────────────
-echo -e "${GREEN}[3.5/7]${NC} 部署安全规则文件"
+echo -e "${GREEN}[3.5/8]${NC} 部署安全规则文件"
 mkdir -p "${INSTALL_DIR}/configs/yara_rules" "${INSTALL_DIR}/configs/cis_benchmark"
 if [ -d "${SCRIPT_DIR}/configs/yara_rules" ]; then
   cp -r "${SCRIPT_DIR}/configs/yara_rules/"* "${INSTALL_DIR}/configs/yara_rules/" 2>/dev/null || true
@@ -221,8 +261,43 @@ fi
 echo -e "  ${YELLOW}YARA webshell 检测规则和 CIS Benchmark 合规规则已部署到 ${INSTALL_DIR}/configs/${NC}"
 
 # ── 安装 systemd 服务 ─────────────────────────────────
-echo -e "${GREEN}[4/7]${NC} 安装 systemd 服务"
-cat > /etc/systemd/system/serverguard-agent.service << 'EOF'
+echo -e "${GREEN}[4/8]${NC} 安装 systemd 服务"
+
+# ── 自适应内存策略（向宝塔学习：按服务器实际配置设定资源上限）──
+# 不再使用固定 768M 一刀切，而是根据总内存自适应：
+#   ≤ 512MB  → MemoryMax=128M  （极低配 VPS，只跑核心监控）
+#   ≤ 1024MB → MemoryMax=192M  （1C1G 常见配置）
+#   ≤ 2048MB → MemoryMax=256M  （2C2G）
+#   > 2048MB → MemoryMax=384M  （4G+ 服务器）
+TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
+
+if [ "$TOTAL_MEM_MB" -le 0 ]; then
+  # 检测失败，用安全默认值（192M，适合 1G 服务器）
+  MEM_MAX="192M"
+  MEM_HIGH="128M"
+  GO_MEM_LIMIT="128MiB"
+elif [ "$TOTAL_MEM_MB" -le 512 ]; then
+  MEM_MAX="128M"
+  MEM_HIGH="96M"
+  GO_MEM_LIMIT="96MiB"
+elif [ "$TOTAL_MEM_MB" -le 1024 ]; then
+  MEM_MAX="192M"
+  MEM_HIGH="128M"
+  GO_MEM_LIMIT="128MiB"
+elif [ "$TOTAL_MEM_MB" -le 2048 ]; then
+  MEM_MAX="256M"
+  MEM_HIGH="192M"
+  GO_MEM_LIMIT="192MiB"
+else
+  MEM_MAX="384M"
+  MEM_HIGH="256M"
+  GO_MEM_LIMIT="256MiB"
+fi
+
+echo -e "  ${CYAN}系统总内存: ${TOTAL_MEM_MB}MB → 资源上限: MemoryMax=${MEM_MAX}, GOMEMLIMIT=${GO_MEM_LIMIT}${NC}"
+
+cat > /etc/systemd/system/serverguard-agent.service << EOF
 [Unit]
 Description=ServerGuard Agent - Server Monitoring & Auto-Healing
 After=network-online.target
@@ -233,12 +308,19 @@ Type=simple
 ExecStart=/opt/serverguard/serverguard-agent -config /opt/serverguard/config.yaml
 WorkingDirectory=/opt/serverguard
 Restart=on-failure
-RestartSec=10
+RestartSec=3
 
-# ====== 资源约束策略 ======
-# 内存：硬限制 256M，Go 软限制 200MiB
-MemoryMax=256M
-Environment=GOMEMLIMIT=200MiB
+# ====== 资源约束策略（自适应：按服务器总内存设定）======
+# 检测到总内存 ${TOTAL_MEM_MB}MB → MemoryMax=${MEM_MAX}, MemoryHigh=${MEM_HIGH}, GOMEMLIMIT=${GO_MEM_LIMIT}
+# 设计原则（向宝塔学习）：
+#   1. MemoryMax 占总内存 8-15%，不设固定值
+#   2. GOMEMLIMIT 设为 MemoryMax 的 ~75%，Go GC 在硬限制前积极回收
+#   3. GOGC=50 — 比默认 100% 更频繁 GC，用 CPU 换内存
+MemoryMax=${MEM_MAX}
+MemoryHigh=${MEM_HIGH}
+MemoryHighTime=30s
+Environment=GOMEMLIMIT=${GO_MEM_LIMIT}
+Environment=GOGC=50
 
 # CPU：CPUWeight=20 低优先级（空闲时可用满，繁忙时自动让路）
 # 不使用 CPUQuota 硬限制 — 会导致启动极慢、面板无响应
@@ -247,10 +329,11 @@ Environment=GOMAXPROCS=2
 
 # I/O：低优先级
 IOWeight=10
-LimitNOFILE=1024
+LimitNOFILE=4096
 
-# OOM：内存不足时优先牺牲 Agent（自动重启），保护服务器和宝塔
-OOMScoreAdjust=500
+# OOM：内存不足时 OOM Killer 可杀 Agent（会自动重启），
+# 但不设太高优先级（100 而非 500），避免扫描峰值时被过早杀掉
+OOMScoreAdjust=100
 
 # 安全加固
 NoNewPrivileges=true
@@ -271,7 +354,7 @@ EOF
 systemctl daemon-reload
 
 # ── 防火墙放行 ────────────────────────────────────────
-echo -e "${GREEN}[5/7]${NC} 配置防火墙"
+echo -e "${GREEN}[5/8]${NC} 配置防火墙"
 if [ "$IS_BAOTA" = true ]; then
   # 宝塔环境下不直接修改系统防火墙，提示用户在宝塔面板中放行
   echo -e "  ${YELLOW}检测到宝塔面板，请在宝塔面板 → 安全 → 放行端口 ${LISTEN_PORT}${NC}"
@@ -293,7 +376,7 @@ else
 fi
 
 # ── 启动服务 ──────────────────────────────────────────
-echo -e "${GREEN}[6/7]${NC} 启动服务"
+echo -e "${GREEN}[6/8]${NC} 启动服务"
 
 # 先停止旧服务（如果正在运行），避免端口冲突
 if systemctl is-active --quiet serverguard-agent 2>/dev/null; then
@@ -316,9 +399,15 @@ fi
 systemctl enable serverguard-agent
 systemctl restart serverguard-agent
 
-# 等待启动（增加等待时间，因为安全模式下采集间隔较大）
-sleep 5
-echo -e "${GREEN}[7/7]${NC} 验证安装"
+# 等待启动（10 秒，让进程度过初始化阶段）
+sleep 10
+echo -e "${GREEN}[7/8]${NC} 验证安装"
+
+# 二次检查：如果第一次失败，等待重启后再检查
+if ! systemctl is-active --quiet serverguard-agent; then
+  echo -e "  ${YELLOW}服务未就绪，等待自动重启...${NC}"
+  sleep 10
+fi
 
 if systemctl is-active --quiet serverguard-agent; then
   SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -327,18 +416,47 @@ if systemctl is-active --quiet serverguard-agent; then
   fi
 
   echo ""
-  echo -e "${GREEN}╔══════════════════════════════════════════════════╗"
-  echo -e "║              ✅ 安装成功！                       ║"
-  echo -e "╠══════════════════════════════════════════════════╣"
-  echo -e "║                                                  ║"
-  echo -e "║  面板地址: http://${SERVER_IP}:${LISTEN_PORT}              "
-  echo -e "║  用户名:   admin                                 "
+  echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗"
+  echo -e "║                    ✅ 安装成功！                            ║"
+  echo -e "╠════════════════════════════════════════════════════════════╣"
+  echo -e "║                                                            ║"
+  echo -e "║  面板地址: http://${SERVER_IP}:${LISTEN_PORT}                        "
+  echo -e "║  用户名:   admin                                           ║"
   echo -e "║  密码:     ${ADMIN_PASSWORD}                              "
-  echo -e "║                                                  ║"
-  echo -e "║  ⚠️  首次登录后请立即修改密码                     "
-  echo -e "║                                                  ║"
-  echo -e "╚══════════════════════════════════════════════════╝${NC}"
+  echo -e "║                                                            ║"
+  echo -e "╚════════════════════════════════════════════════════════════╝${NC}"
   echo ""
+
+  # ── 自愈能力说明 ──
+  echo -e "${CYAN}${BOLD}─── 安装即生效：ServerGuard 已在后台为你守护 ───${NC}"
+  echo ""
+  echo -e "  ${GREEN}✓${NC} 磁盘 > 90% → 自动清理日志/缓存（保留近7天）"
+  echo -e "  ${GREEN}✓${NC} 日志 > 500MB → 自动轮转压缩"
+  echo -e "  ${GREEN}✓${NC} SSH 暴力破解 → 自动封禁 IP"
+  echo -e "  ${GREEN}✓${NC} SSL 证书到期 → 自动续期"
+  echo -e "  ${GREEN}✓${NC} 僵尸进程 → 自动清理"
+  echo -e "  ${GREEN}✓${NC} 服务崩溃 → 自动重启"
+  if [ "$IS_BAOTA" = true ]; then
+    echo -e "  ${GREEN}✓${NC} 宝塔面板挂了 → 自动重启"
+  fi
+  echo ""
+  echo -e "  ${YELLOW}首次安装有 1 天学习期（只观察不操作），之后自动开启自愈${NC}"
+  echo ""
+
+  # ── 通知渠道引导 ──
+  echo -e "${CYAN}${BOLD}─── 通知配置（重要！）───${NC}"
+  echo -e "  ${YELLOW}⚠️  你还没配通知渠道！没配通知 = 告警只能看面板 = 白装${NC}"
+  echo ""
+  echo -e "  打开面板 → 设置 → 通知配置，3 分钟完成："
+  echo -e "    1. ${CYAN}微信通知${NC}（推荐）：扫码关注 WxPusher → 输入验证码"
+  echo -e "    2. ${CYAN}钉钉/飞书${NC}：复制 Webhook URL → 粘贴"
+  echo -e "    3. ${CYAN}邮件${NC}：填写 SMTP 信息"
+  echo -e "    4. ${CYAN}Telegram${NC}：@BotFather 创建 Bot → 填入 Token"
+  echo ""
+  echo -e "  ${GREEN}配好通知后，服务器出问题你第一时间收到消息，不用盯着面板${NC}"
+  echo ""
+
+  # ── 常用命令 ──
   echo -e "${CYAN}常用命令:${NC}"
   echo -e "  systemctl status serverguard-agent   # 查看状态"
   echo -e "  systemctl restart serverguard-agent  # 重启"
@@ -349,19 +467,23 @@ if systemctl is-active --quiet serverguard-agent; then
   # 安全保护模式提示
   if [ "$IS_BAOTA" = true ]; then
     echo -e "${YELLOW}==========================================${NC}"
-    echo -e "${YELLOW}安全保护模式部署完成${NC}"
+    echo -e "${YELLOW}宝塔安全保护模式已启用${NC}"
     echo -e "${YELLOW}==========================================${NC}"
-    echo -e "  访问地址: http://${SERVER_IP}:${LISTEN_PORT}"
-    echo -e "  用户名: admin"
-    echo -e "  密码: ${ADMIN_PASSWORD}"
+    echo -e "  ${CYAN}已自动启用的能力：${NC}"
+    echo -e "    - SSH 暴力破解封禁 ✓"
+    echo -e "    - SSL 证书自动续期 ✓"
+    echo -e "    - 僵尸进程自动清理 ✓"
+    echo -e "    - 磁盘自动清理（仅系统目录，不触碰宝塔）✓"
+    echo -e "    - 日志自动轮转（仅系统日志，不触碰宝塔）✓"
+    echo -e "    - 宝塔面板挂了自动重启 ✓"
     echo ""
-    echo -e "  ${YELLOW}⚠️  重要提示：${NC}"
-    echo -e "     - 所有自动修复已降级为只告警"
-    echo -e "     - 服务守护将使用 /etc/init.d/xxx 命令"
-    echo -e "     - 磁盘清理已禁用"
-    echo -e "     - 日志轮转已禁用（不影响宝塔自身日志策略）"
-    echo -e "     - 如需关闭安全保护模式，修改 /opt/serverguard/config.yaml"
-    echo -e "       将 baota.safe_mode 改为 \"false\""
+    echo -e "  ${YELLOW}需要手动确认的操作：${NC}"
+    echo -e "    - CPU 降权（避免误杀业务进程）"
+    echo -e "    - 内存重启（避免误杀业务进程）"
+    echo -e "    - 宝塔服务重启"
+    echo ""
+    echo -e "  如需关闭安全保护模式：修改 /opt/serverguard/config.yaml"
+    echo -e "    将 baota.safe_mode 改为 \"false\""
     echo -e "${YELLOW}==========================================${NC}"
     echo ""
   fi
@@ -382,3 +504,32 @@ else
   echo -e "  2. 目录权限: ls -la /var/lib/serverguard/"
   echo -e "  3. 配置文件: cat ${INSTALL_DIR}/config.yaml"
 fi
+
+# ── 通知渠道引导（交互式，仅终端安装时）──
+echo ""
+echo -e "${GREEN}[8/8]${NC} 通知渠道引导"
+if [ -t 0 ] && [ -t 1 ]; then
+  echo -e "  ${CYAN}推荐配置微信通知，这样服务器出问题你能第一时间收到。${NC}"
+  echo -e "  ${CYAN}现在打开面板配置？(Y/n)${NC}"
+  read -r -t 10 NOTIFY_CHOICE || NOTIFY_CHOICE="n"
+  if [ "${NOTIFY_CHOICE:-n}" = "Y" ] || [ "${NOTIFY_CHOICE:-n}" = "y" ]; then
+    # 尝试用 curl 或 wget 打开浏览器
+    if command -v xdg-open &> /dev/null; then
+      xdg-open "http://${SERVER_IP:-localhost}:${LISTEN_PORT}/#/settings" 2>/dev/null || true
+    elif command -v sensible-browser &> /dev/null; then
+      sensible-browser "http://${SERVER_IP:-localhost}:${LISTEN_PORT}/#/settings" 2>/dev/null || true
+    else
+      echo -e "  ${YELLOW}请手动打开: http://${SERVER_IP:-服务器IP}:${LISTEN_PORT}/#/settings${NC}"
+    fi
+    echo -e "  ${GREEN}浏览器已打开，点击「设置」→「通知配置」${NC}"
+  else
+    echo -e "  ${YELLOW}跳过。稍后可打开面板 → 设置 → 通知配置${NC}"
+    echo -e "  ${YELLOW}面板地址: http://${SERVER_IP:-服务器IP}:${LISTEN_PORT}${NC}"
+  fi
+else
+  # 管道安装模式（如 curl | bash），跳过交互
+  echo -e "  ${YELLOW}检测到非交互模式，跳过通知引导${NC}"
+  echo -e "  ${YELLOW}稍后请打开面板 → 设置 → 通知配置${NC}"
+  echo -e "  ${YELLOW}面板地址: http://${SERVER_IP:-服务器IP}:${LISTEN_PORT}${NC}"
+fi
+echo ""

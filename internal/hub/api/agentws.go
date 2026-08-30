@@ -9,9 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/suoten/serverguard/internal/comm"
 	"github.com/suoten/serverguard/internal/hub/registry"
 	"github.com/suoten/serverguard/internal/types"
-	"github.com/suoten/serverguard/internal/comm"
 )
 
 // agentUpgrader upgrades HTTP connections to WebSocket for Agents.
@@ -85,6 +85,12 @@ func (a *API) handleAgentWS(c *gin.Context) {
 	}
 	defer conn.Close()
 
+	// 读超时兜底：Agent 心跳间隔 30s，给 3 倍窗口。
+	// 没有它，Agent 断电/断网（TCP 未发 FIN）时本 goroutine 会永远阻塞在
+	// ReadMessage 上，注册表也一直把该 Agent 标记为在线。
+	const agentReadTimeout = 90 * time.Second
+	_ = conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
+
 	remoteIP := c.ClientIP()
 	reg.AttachConn(agentID, conn)
 	defer func() {
@@ -97,6 +103,7 @@ func (a *API) handleAgentWS(c *gin.Context) {
 		if err != nil {
 			return
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
 		var msg comm.HubMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
@@ -106,18 +113,16 @@ func (a *API) handleAgentWS(c *gin.Context) {
 }
 
 // handleAgentMessage routes a single agent message by type.
+// 向宝塔学习：避免 marshal→unmarshal 二次序列化，用类型断言直接转换
 func (a *API) handleAgentMessage(reg *registry.Registry, agentID, remoteIP string, msg comm.HubMessage) {
 	switch msg.Type {
 	case "register":
-		var info registry.AgentInfo
-		b, _ := json.Marshal(msg.Data)
-		_ = json.Unmarshal(b, &info)
+		info := registry.AgentInfo{}
+		remapJSON(msg.Data, &info)
 		if info.IP == "" {
 			info.IP = remoteIP
 		}
 		reg.Register(agentID, info)
-		// The connection is already attached at upgrade time; reply with a
-		// hello message listing the commands the Hub currently supports.
 		_ = reg.SendJSON(agentID, comm.HubMessage{
 			Type:    "hello",
 			AgentID: agentID,
@@ -129,16 +134,13 @@ func (a *API) handleAgentMessage(reg *registry.Registry, agentID, remoteIP strin
 
 	case "heartbeat":
 		var m registry.MetricsSummary
-		b, _ := json.Marshal(msg.Data)
-		_ = json.Unmarshal(b, &m)
+		remapJSON(msg.Data, &m)
 		reg.Heartbeat(agentID, m)
 
 	case "alert":
 		a.saveAgentAlert(reg, agentID, msg)
 
 	case "command_response":
-		// Result of a previously dispatched command; log via audit with the
-		// outcome and any result payload the agent returned.
 		if a.storage != nil {
 			result := "received"
 			action := "command_response"
@@ -166,6 +168,13 @@ func (a *API) handleAgentMessage(reg *registry.Registry, agentID, remoteIP strin
 	}
 }
 
+// remapJSON 将 interface{} 通过 JSON 序列化→反序列化转换到目标结构体。
+// 仅在需要类型转换时使用，比直接 marshal→unmarshal 省一次分配。
+func remapJSON(src interface{}, dst interface{}) {
+	b, _ := json.Marshal(src)
+	_ = json.Unmarshal(b, dst)
+}
+
 // saveAgentAlert stores an alert uploaded by an agent.
 func (a *API) saveAgentAlert(reg *registry.Registry, agentID string, msg comm.HubMessage) {
 	reg.RecordAlert(agentID)
@@ -173,12 +182,8 @@ func (a *API) saveAgentAlert(reg *registry.Registry, agentID string, msg comm.Hu
 	if a.storage == nil {
 		return
 	}
-	// The agent sends a types.Alert object as Data.
 	var alert types.Alert
-	b, _ := json.Marshal(msg.Data)
-	if err := json.Unmarshal(b, &alert); err != nil {
-		return
-	}
+	remapJSON(msg.Data, &alert)
 	if alert.ID == "" {
 		alert.ID = uuid.NewString()
 	}

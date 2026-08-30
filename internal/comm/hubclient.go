@@ -172,6 +172,9 @@ func (c *HubClient) SendCommandResult(ctx context.Context, commandID interface{}
 }
 
 // ListenForCommands listens for commands from Hub.
+// 断线重连必须带退避休眠——原实现 ReadMessage 出错后立即进入下一轮循环，
+// 连接对象非空导致跳过 Connect 分支，直接再次 ReadMessage 又立刻出错，
+// 形成 100% CPU 的热循环（在 Hub 宕机/网络抖动时必然触发）。
 func (c *HubClient) ListenForCommands(ctx context.Context) {
 	for {
 		select {
@@ -188,19 +191,20 @@ func (c *HubClient) ListenForCommands(ctx context.Context) {
 		if !connected || conn == nil {
 			// Try to reconnect
 			if err := c.Connect(ctx); err != nil {
-				time.Sleep(c.reconnectBackoff)
-				c.increaseBackoff()
+				c.sleepBackoff(ctx)
 				continue
 			}
+			continue // 连接刚建立，回到循环顶部读取消息
 		}
 
 		// Read message from Hub
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
-			c.mu.Lock()
-			c.connected = false
-			c.mu.Unlock()
-			c.increaseBackoff()
+			// 连接已损坏：关闭并置空，退避后重连。
+			// 置空 conn 是关键——否则下一轮会直接对坏连接再次 ReadMessage，
+			// 错误立即返回形成无休眠的 CPU 忙循环。
+			c.Close()
+			c.sleepBackoff(ctx)
 			continue
 		}
 
@@ -212,6 +216,19 @@ func (c *HubClient) ListenForCommands(ctx context.Context) {
 		// Handle command
 		go c.handleCommand(ctx, msg)
 	}
+}
+
+// sleepBackoff 按当前退避时长休眠（可被 ctx 取消），并在返回前递增退避。
+func (c *HubClient) sleepBackoff(ctx context.Context) {
+	c.mu.RLock()
+	backoff := c.reconnectBackoff
+	c.mu.RUnlock()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(backoff):
+	}
+	c.increaseBackoff()
 }
 
 // handleCommand processes a command received from Hub.
@@ -279,6 +296,8 @@ func (c *HubClient) UploadAlert(ctx context.Context, alert types.Alert) {
 }
 
 // send sends a message to Hub via WebSocket.
+// 写操作带 10s 超时：Hub 假死/半开连接时无超时的 WriteMessage 会永久阻塞，
+// 该锁是全局的——一次卡死就会冻结心跳、告警上报和所有命令响应。
 func (c *HubClient) send(ctx context.Context, msg HubMessage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -288,6 +307,7 @@ func (c *HubClient) send(ctx context.Context, msg HubMessage) {
 	}
 
 	data, _ := json.Marshal(msg)
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	c.conn.WriteMessage(websocket.TextMessage, data)
 }
 

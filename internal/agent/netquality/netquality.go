@@ -3,6 +3,7 @@
 package netquality
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
@@ -88,14 +89,28 @@ func (m *Monitor) AddTarget(name, host, comment string) {
 	m.targets = append(m.targets, ProbeTarget{Name: name, Host: host, Comment: comment})
 }
 
-// Probe 执行一轮探测
-func (m *Monitor) Probe() *QualityReport {
+// 探测超时预算：网络故障（正是本模块最需要工作的场景）时，
+// ping/traceroute 可能长时间不返回，必须用 context 强制兜底，否则探测 goroutine 会堆积
+const (
+	pingTimeout  = 20 * time.Second
+	traceTimeout = 45 * time.Second
+	routeTimeout = 5 * time.Second
+)
+
+// Probe 执行一轮探测。ctx 为 nil 时使用独立超时上下文（向后兼容）。
+func (m *Monitor) Probe(ctx context.Context) *QualityReport {
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+	}
+
 	report := &QualityReport{
 		Timestamp: time.Now(),
 	}
 
 	// 探测网关
-	gatewayIP := detectGateway()
+	gatewayIP := detectGateway(ctx)
 
 	for _, target := range m.targets {
 		// 如果是网关目标且 Host 为空，使用检测到的网关 IP
@@ -117,7 +132,7 @@ func (m *Monitor) Probe() *QualityReport {
 			}
 		}
 
-		result := probeTarget(t)
+		result := probeTarget(ctx, t)
 		report.Results = append(report.Results, result)
 	}
 
@@ -139,10 +154,13 @@ func (m *Monitor) GetLastReport() *QualityReport {
 }
 
 // detectGateway 检测默认网关 IP
-func detectGateway() string {
+func detectGateway(ctx context.Context) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if runtime.GOOS == "windows" {
 		// route print
-		cmd := exec.Command("route", "print", "0.0.0.0")
+		cmd := exec.CommandContext(ctx, "route", "print", "0.0.0.0")
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			lines := strings.Split(string(output), "\n")
@@ -165,7 +183,9 @@ func detectGateway() string {
 		}
 	} else {
 		// Linux: ip route show default
-		cmd := exec.Command("ip", "route", "show", "default")
+		routeCtx, cancel := context.WithTimeout(ctx, routeTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(routeCtx, "ip", "route", "show", "default")
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			// "default via 192.168.1.1 dev eth0"
@@ -178,7 +198,7 @@ func detectGateway() string {
 			}
 		}
 		// fallback: route -n
-		cmd2 := exec.Command("route", "-n")
+		cmd2 := exec.CommandContext(routeCtx, "route", "-n")
 		output2, err := cmd2.CombinedOutput()
 		if err == nil {
 			lines := strings.Split(string(output2), "\n")
@@ -196,15 +216,17 @@ func detectGateway() string {
 }
 
 // probeTarget 探测单个目标
-func probeTarget(target ProbeTarget) ProbeResult {
+func probeTarget(ctx context.Context, target ProbeTarget) ProbeResult {
 	result := ProbeResult{
 		Target:    target.Name,
 		Host:      target.Host,
 		Timestamp: time.Now(),
 	}
 
-	// ping 探测
-	minRTT, avgRTT, maxRTT, loss, alive := pingHost(target.Host)
+	// ping 探测（带独立超时）
+	pingCtx, pingCancel := context.WithTimeout(ctx, pingTimeout)
+	minRTT, avgRTT, maxRTT, loss, alive := pingHost(pingCtx, target.Host)
+	pingCancel()
 	result.Alive = alive
 	result.RTTMin = minRTT
 	result.RTTAvg = avgRTT
@@ -214,9 +236,11 @@ func probeTarget(target ProbeTarget) ProbeResult {
 	// 抖动 = (max - min) / 2
 	result.Jitter = (maxRTT - minRTT) / 2
 
-	// traceroute 跳数（仅当存活时）
+	// traceroute 跳数（仅当存活时，带独立超时——traceroute 在丢包网络下可能极慢）
 	if alive {
-		result.Hops = traceHops(target.Host)
+		traceCtx, traceCancel := context.WithTimeout(ctx, traceTimeout)
+		result.Hops = traceHops(traceCtx, target.Host)
+		traceCancel()
 	}
 
 	// 评级和评估
@@ -350,13 +374,13 @@ func generateOverallAssessment(results []ProbeResult) string {
 	return sb.String()
 }
 
-// pingHost 执行 ping 并解析结果
-func pingHost(host string) (min, avg, max, loss float64, alive bool) {
+// pingHost 执行 ping 并解析结果（ctx 超时强制兜底）
+func pingHost(ctx context.Context, host string) (min, avg, max, loss float64, alive bool) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("ping", "-n", "4", "-w", "3000", host)
+		cmd = exec.CommandContext(ctx, "ping", "-n", "4", "-w", "3000", host)
 	} else {
-		cmd = exec.Command("ping", "-c", "4", "-W", "3", host)
+		cmd = exec.CommandContext(ctx, "ping", "-c", "4", "-W", "3", host)
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -462,16 +486,16 @@ func parseLinuxLoss(text string) float64 {
 	return 0
 }
 
-// traceHops 执行 traceroute 并返回跳数
-func traceHops(host string) int {
+// traceHops 执行 traceroute 并返回跳数（ctx 超时强制兜底）
+func traceHops(ctx context.Context, host string) int {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("tracert", "-d", "-h", "15", "-w", "1000", host)
+		cmd = exec.CommandContext(ctx, "tracert", "-d", "-h", "15", "-w", "1000", host)
 	} else {
 		if _, err := exec.LookPath("mtr"); err == nil {
-			cmd = exec.Command("mtr", "-r", "-c", "1", "-n", host)
+			cmd = exec.CommandContext(ctx, "mtr", "-r", "-c", "1", "-n", host)
 		} else if _, err := exec.LookPath("traceroute"); err == nil {
-			cmd = exec.Command("traceroute", "-n", "-w", "1", "-m", "15", host)
+			cmd = exec.CommandContext(ctx, "traceroute", "-n", "-w", "1", "-m", "15", host)
 		} else {
 			return 0
 		}

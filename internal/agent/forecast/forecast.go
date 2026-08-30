@@ -121,30 +121,48 @@ func GetForecasts(store *storage.Storage) []MountForecast {
 	return out
 }
 
-// regress 最小二乘线性回归：x = 距首点的天数，y = 日均使用率。
+// regress 稳健趋势估计：Theil–Sen 中位斜率（x = 距首点的天数，y = 日均使用率）。
+//
+// 为什么不用最小二乘：每周固定任务（备份、日志切割）造成的单日暴涨会
+// 显著拉高 OLS 斜率，导致"提前写满"误报。Theil–Sen 取所有点对斜率的
+// 中位数，天然抵抗 ≤1/3 的异常点；n≤14 天时点对最多 91 个，计算成本可忽略。
+// 截距用中位点对法（过中位 (x,y) 的中位斜率直线），同样稳健。
 func regress(mount string, pts []storage.DiskDailyPoint) MountForecast {
-	n := float64(len(pts))
 	day0, _ := time.Parse("2006-01-02", pts[0].Date)
-
-	var sumX, sumY, sumXY, sumXX float64
+	type xy struct{ x, y float64 }
+	var samples []xy
 	for _, pt := range pts {
 		d, err := time.Parse("2006-01-02", pt.Date)
 		if err != nil {
 			continue
 		}
-		x := d.Sub(day0).Hours() / 24
-		y := pt.UsedAvg
-		sumX += x
-		sumY += y
-		sumXY += x * y
-		sumXX += x * x
+		samples = append(samples, xy{x: d.Sub(day0).Hours() / 24, y: pt.UsedAvg})
 	}
-	denom := n*sumXX - sumX*sumX
-	if denom == 0 {
-		return MountForecast{Mount: mount, Current: pts[len(pts)-1].UsedAvg, DaysLeft: -1}
-	}
-	slope := (n*sumXY - sumX*sumY) / denom
+	n := len(samples)
 	current := pts[len(pts)-1].UsedAvg
+	if n < 2 {
+		return MountForecast{Mount: mount, Current: current, DaysLeft: -1}
+	}
+
+	// 所有点对的斜率 → 取中位数
+	var slopes []float64
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			dx := samples[j].x - samples[i].x
+			if dx <= 0 {
+				continue
+			}
+			slopes = append(slopes, (samples[j].y-samples[i].y)/dx)
+		}
+	}
+	if len(slopes) == 0 {
+		return MountForecast{Mount: mount, Current: current, DaysLeft: -1}
+	}
+	sort.Float64s(slopes)
+	slope := slopes[len(slopes)/2]
+	if len(slopes)%2 == 0 {
+		slope = (slopes[len(slopes)/2-1] + slopes[len(slopes)/2]) / 2
+	}
 
 	f := MountForecast{Mount: mount, Current: current, SlopePer: slope, DaysLeft: -1}
 	if slope < minSlope || current >= alertThreshold {

@@ -84,6 +84,7 @@ func (s *Storage) SetRetentionPolicy(rp RetentionPolicy) error {
 }
 
 // GetRetentionPolicy 从数据库加载保留策略，若未配置则返回默认值。
+// 同时更新缓存，避免下次 purgeOldData 再查 DB。
 func (s *Storage) GetRetentionPolicy() (RetentionPolicy, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -162,15 +163,16 @@ func (s *Storage) EnforceRetention(rp RetentionPolicy) error {
 			return fmt.Errorf("cleanup raw metrics: %w", err)
 		}
 	}
-	// 1min 聚合
+	// 1min 聚合（表内时间戳为 SQLite datetime() 格式"YYYY-MM-DD HH:MM:SS"，
+	// 与 RFC3339 字符串直接比较会因分隔符差异失序，必须用 datetime(?) 归一后比较）
 	if rp.MinMetrics > 0 {
-		if _, err := tx.Exec("DELETE FROM metrics_1m WHERE timestamp < ?", cutoff(rp.MinMetrics)); err != nil {
+		if _, err := tx.Exec("DELETE FROM metrics_1m WHERE timestamp < datetime(?)", cutoff(rp.MinMetrics)); err != nil {
 			return fmt.Errorf("cleanup 1m metrics: %w", err)
 		}
 	}
 	// 1h 聚合
 	if rp.HourMetrics > 0 {
-		if _, err := tx.Exec("DELETE FROM metrics_1h WHERE timestamp < ?", cutoff(rp.HourMetrics)); err != nil {
+		if _, err := tx.Exec("DELETE FROM metrics_1h WHERE timestamp < datetime(?)", cutoff(rp.HourMetrics)); err != nil {
 			return fmt.Errorf("cleanup 1h metrics: %w", err)
 		}
 	}

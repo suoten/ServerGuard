@@ -97,6 +97,12 @@ func (a *AbuseIPDBClient) QueryCVE(component, version string) ([]CVEInfo, error)
 
 // QueryIP 查询 IP 的恶意报告
 func (a *AbuseIPDBClient) QueryIP(ip string) (*IPInfo, error) {
+	// 无 Key 时直接跳过——否则每个未缓存 IP 都会对 AbuseIPDB 发起一次
+	// 注定 401 的外部请求（10s 超时预算），CC 攻击场景下会成倍放大延迟
+	if a.apiKey == "" {
+		return nil, fmt.Errorf("AbuseIPDB API key not configured")
+	}
+
 	a.mu.RLock()
 	if info, ok := a.cache[ip]; ok {
 		a.mu.RUnlock()

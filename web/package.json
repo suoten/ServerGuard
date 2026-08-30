@@ -1,6 +1,6 @@
 {
   "name": "serverguard-web",
-  "version": "3.0.0",
+  "version": "0.3.0",
   "description": "ServerGuard Web Panel",
   "type": "module",
   "scripts": {

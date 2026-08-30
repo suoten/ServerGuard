@@ -486,13 +486,55 @@ func (m *linuxFirewallManager) BanIP(ctx context.Context, ip string, opts BanOpt
 	if proto == "" {
 		proto = "tcp"
 	}
-	comment := fmt.Sprintf("%s:%s", prefix, opts.Reason)
+
+	// 到期时间戳编码进规则注释：exp=<unix>。
+	// Duration=0 表示永久（旧格式无 exp 字段同样视为永久，绝不会被误删）。
+	var expireUnix int64
+	if opts.Duration > 0 {
+		expireUnix = time.Now().Add(opts.Duration).Unix()
+	}
+	comment := fmt.Sprintf("%s:exp=%d:%s", prefix, expireUnix, opts.Reason)
 
 	args := []string{"-A", "INPUT", "-s", ip, "-p", proto}
 	if opts.Port > 0 {
 		args = append(args, "--dport", strconv.Itoa(opts.Port))
 	}
 	args = append(args, "-j", "DROP", "-m", "comment", "--comment", comment)
+
+	// 单次列链完成三件事：幂等检查 / 自身过期续期 / 惰性清扫他人过期规则。
+	// 封禁调用频率受 attackwarn 预算（≤30次/5分钟）约束，因此清扫收敛速度有保证，
+	// 且每次调用最多删除 5 条，绝不产生删除风暴。
+	out, lerr := exec.CommandContext(ctx, "iptables", "-L", "INPUT", "-n", "--line-numbers").Output()
+	if lerr == nil {
+		now := time.Now().Unix()
+		expiredSelf := ""
+		sweepBudget := 5
+		for _, line := range strings.Split(string(out), "\n") {
+			lineNum, src, exp, ok := parseBanRuleLine(line)
+			if !ok {
+				continue
+			}
+			stale := exp > 0 && now >= exp
+
+			switch {
+			case src == ip && !stale:
+				// 已存在生效封禁：幂等返回，杜绝重复追加导致规则堆积
+				return nil
+			case src == ip && stale:
+				// 记录待续期的自身过期规则，循环结束后删除重加
+				expiredSelf = lineNum
+			case stale && sweepBudget > 0:
+				// 顺手清理其他已过期的本工具规则（预算内）
+				sweepBudget--
+				if err := exec.CommandContext(ctx, "iptables", "-D", "INPUT", lineNum).Run(); err != nil && expiredSelf == lineNum {
+					expiredSelf = ""
+				}
+			}
+		}
+		if expiredSelf != "" {
+			_ = exec.CommandContext(ctx, "iptables", "-D", "INPUT", expiredSelf).Run()
+		}
+	}
 
 	return exec.CommandContext(ctx, "iptables", args...).Run()
 }
@@ -502,26 +544,19 @@ func (m *linuxFirewallManager) UnbanIP(ctx context.Context, ip string) error {
 	defer m.mu.Unlock()
 	// 安全删除：只删除 ServerGuard 添加的规则（通过 comment 标记识别），
 	// 不删除其他程序（如宝塔面板）为同一 IP 添加的防火墙规则。
+	// 注意：源 IP 在 --line-numbers 输出中是 fields[4]（fields[3] 是 "--" 分隔符），
+	// 历史实现取 fields[3] 导致解封永远匹配不到——此处已修正。
 	for {
-		// 列出 INPUT 链规则，查找包含 serverguard 注释且匹配该 IP 的规则
 		out, err := exec.CommandContext(ctx, "iptables", "-L", "INPUT", "-n", "--line-numbers").Output()
 		if err != nil {
 			break
 		}
 		found := false
 		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, "serverguard") {
+			lineNum, src, _, ok := parseBanRuleLine(line)
+			if !ok || src != ip {
 				continue
 			}
-			// 检查 IP 是否匹配（fields[3] 通常是 source 字段）
-			fields := strings.Fields(line)
-			if len(fields) < 4 {
-				continue
-			}
-			if fields[3] != ip && !strings.HasPrefix(fields[3], ip+"/") {
-				continue
-			}
-			lineNum := fields[0]
 			if err := exec.CommandContext(ctx, "iptables", "-D", "INPUT", lineNum).Run(); err == nil {
 				found = true
 				break // 重新列表，行号会变化
@@ -553,10 +588,11 @@ func (m *linuxFirewallManager) ListBanned(ctx context.Context) ([]BanEntry, erro
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		// [num, target, prot, "--", source, ...] —— 历史实现取 fields[3]（"--"）导致列表全是无效项
+		if len(fields) < 5 || fields[3] != "--" {
 			continue
 		}
-		ip := fields[3]
+		ip := fields[4]
 		if ip == "0.0.0.0/0" || ip == "anywhere" {
 			continue
 		}
@@ -809,7 +845,10 @@ func recreateFile(path string) error {
 }
 
 func compressFile(path string) error {
-	cmd := exec.Command("gzip", "-f", path)
+	// 超时兜底：大日志 gzip 可能耗时数分钟，但绝不能无限挂起占用 IO 与 goroutine
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gzip", "-f", path)
 	return cmd.Run()
 }
 

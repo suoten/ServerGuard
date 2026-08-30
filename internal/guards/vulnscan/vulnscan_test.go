@@ -165,13 +165,13 @@ func TestScanCMS_WithTempRoot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// ScanCMS 的新语义：只在 CMS 版本低于安全版本时才报告（检测到 CMS 本身不是漏洞）
 	tmp := t.TempDir()
-	// Create a fake WordPress signature
 	wpDir := filepath.Join(tmp, "wp-includes")
 	if err := os.MkdirAll(wpDir, 0750); err != nil {
 		t.Fatal(err)
 	}
-	versionContent := `<?php $wp_version = '6.2'; ?>`
+	versionContent := `<?php $wp_version = '5.8'; ?>`
 	if err := os.WriteFile(filepath.Join(wpDir, "version.php"), []byte(versionContent), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestScanCMS_WithTempRoot(t *testing.T) {
 		t.Errorf("ScanCMS error: %v", err)
 	}
 	if len(findings) == 0 {
-		t.Error("expected to detect WordPress in temp root")
+		t.Error("expected to detect WordPress old version in temp root")
 	}
 	foundWP := false
 	for _, f := range findings {
@@ -191,7 +191,28 @@ func TestScanCMS_WithTempRoot(t *testing.T) {
 		}
 	}
 	if !foundWP {
-		t.Error("expected WordPress finding")
+		t.Error("expected WordPress finding for version below safe threshold")
+	}
+
+	// 新版本（>= minSafeVer）不应产生发现
+	safeTmp := t.TempDir()
+	safeWpDir := filepath.Join(safeTmp, "wp-includes")
+	if err := os.MkdirAll(safeWpDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	safeContent := `<?php $wp_version = '6.2'; ?>`
+	if err := os.WriteFile(filepath.Join(safeWpDir, "version.php"), []byte(safeContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	safeFindings, err := v.ScanCMS(ctx, []string{safeTmp})
+	if err != nil {
+		t.Errorf("ScanCMS error: %v", err)
+	}
+	for _, f := range safeFindings {
+		if strings.Contains(f.Title, "wordpress") {
+			t.Errorf("up-to-date WordPress should not be reported, got: %s", f.Title)
+		}
 	}
 }
 
@@ -219,12 +240,14 @@ func TestScanDependencies_WithDepFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 新语义：依赖文件的存在本身不是漏洞，不再生成发现（降噪）。
+	// 真正的依赖漏洞检查由 npm audit / composer audit / sgctl security-check 完成。
 	findings, err := v.ScanDependencies(ctx, []string{tmp})
 	if err != nil {
 		t.Errorf("ScanDependencies error: %v", err)
 	}
-	if len(findings) == 0 {
-		t.Error("expected to detect go.mod dependency file")
+	if len(findings) != 0 {
+		t.Errorf("expected 0 findings for dependency file presence (noise reduction), got %d", len(findings))
 	}
 }
 

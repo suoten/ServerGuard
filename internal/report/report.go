@@ -24,6 +24,9 @@ type Generator struct {
 	certGuard *cert.CertGuard
 }
 
+// reportDomainExpiryDays 域名到期在巡检报告中的列出阈值（天）。
+const reportDomainExpiryDays = 60
+
 // New 创建报告生成器（各依赖均可为 nil，对应章节自动跳过）。
 func New(store *storage.Storage, scorer *healthscore.Scorer, p *probe.Probe, cg *cert.CertGuard) *Generator {
 	return &Generator{store: store, scorer: scorer, probe: p, certGuard: cg}
@@ -213,6 +216,25 @@ func (g *Generator) Generate() string {
 				fmt.Fprintf(&sb, "\n🔍 待处理安全发现：%d 项（详见面板「安全发现」页）\n", total)
 			}
 		}
+
+		// ── 域名到期清单（证书能自动续期，域名过期只能人工续费）──
+		if states := cert.GetDomainExpiryStates(g.store); len(states) > 0 {
+			var lines []string
+			for _, st := range states {
+				if st.DaysLeft <= reportDomainExpiryDays {
+					lines = append(lines, fmt.Sprintf("   · %s 剩余 %d 天", st.Domain, st.DaysLeft))
+				}
+			}
+			if len(lines) > 0 {
+				sb.WriteString(fmt.Sprintf("\n🌐 域名到期提醒（≤%d 天，请到注册商续费）：\n", reportDomainExpiryDays))
+				if len(lines) > 5 {
+					lines = lines[:5]
+					lines = append(lines, "   · ……")
+				}
+				sb.WriteString(strings.Join(lines, "\n"))
+				sb.WriteString("\n")
+			}
+		}
 	}
 
 	sb.WriteString("\n—— ServerGuard 服务器智能守护\n")
@@ -220,18 +242,11 @@ func (g *Generator) Generate() string {
 }
 
 // metricStats 返回指标在时间范围内的峰值与均值；无数据时返回 -1, -1。
+// 使用 SQL 聚合（原实现拉 2 万行明细到内存计算）。
 func (g *Generator) metricStats(name string, since time.Time) (max, avg float64) {
-	metrics, err := g.store.GetMetrics("", name, since, 20000)
-	if err != nil || len(metrics) == 0 {
+	stats, err := g.store.GetMetricStats(name, since)
+	if err != nil || stats.Count == 0 {
 		return -1, -1
 	}
-	var sum float64
-	max = metrics[0].Value
-	for _, m := range metrics {
-		if m.Value > max {
-			max = m.Value
-		}
-		sum += m.Value
-	}
-	return max, sum / float64(len(metrics))
+	return stats.Max, stats.Avg
 }

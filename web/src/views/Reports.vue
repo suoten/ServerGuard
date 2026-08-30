@@ -43,7 +43,7 @@
                   <el-descriptions :column="1" size="small" border>
                     <el-descriptions-item label="事件 ID">{{ pmReport.incident_id }}</el-descriptions-item>
                     <el-descriptions-item label="严重级别">
-                      <el-tag :type="pmSeverityType(pmReport.severity)" size="small">{{ pmReport.severity }}</el-tag>
+                      <el-tag :type="pmSeverityType(pmReport.severity)" size="small">{{ severityText(pmReport.severity) }}</el-tag>
                     </el-descriptions-item>
                     <el-descriptions-item label="开始时间">{{ formatTime(pmReport.start_time) }}</el-descriptions-item>
                     <el-descriptions-item label="结束时间">{{ formatTime(pmReport.end_time) }}</el-descriptions-item>
@@ -84,7 +84,7 @@
             <!-- 修复动作 -->
             <el-card v-if="pmReport.actions && pmReport.actions.length > 0" shadow="never" style="margin-bottom: 16px">
               <template #header><span>修复动作</span></template>
-              <el-table :data="pmReport.actions" size="small" stripe>
+              <el-table :data="(pmReport.actions || []).slice((actionPage-1)*actionSize, actionPage*actionSize)" size="small" stripe>
                 <el-table-column label="时间" width="140">
                   <template #default="{ row }">{{ formatTime(row.time) }}</template>
                 </el-table-column>
@@ -98,6 +98,9 @@
                 </el-table-column>
                 <el-table-column label="详情" prop="message" min-width="300" show-overflow-tooltip />
               </el-table>
+<div style="margin-top: 12px; display: flex; justify-content: flex-end">
+<el-pagination v-model:current-page="actionPage" v-model:page-size="actionSize" :page-sizes="[10, 20, 50, 100]" :total="(pmReport.actions || []).length" layout="total, sizes, prev, pager, next" />
+</div>
             </el-card>
 
             <!-- 经验教训 -->
@@ -175,6 +178,8 @@ const activeTab = ref('postmortem')
 const pmReport = ref<any>(null)
 const pmLoading = ref(false)
 const pmTimeRange = ref<[string, string] | null>(null)
+const actionPage = ref(1)
+const actionSize = ref(10)
 
 // ── 周报 ──
 const weeklyReport = ref<string>('')
@@ -228,6 +233,14 @@ function timelineItemType(type: string): string {
 function formatTime(ts: string): string {
   if (!ts) return '-'
   return dayjs(ts).format('YYYY-MM-DD HH:mm:ss')
+}
+
+function severityText(sev: string): string {
+  const labels: Record<string, string> = {
+    critical: '严重', fatal: '致命', error: '错误', warning: '警告', info: '提醒',
+    high: '高危', medium: '中危', low: '低危',
+  }
+  return labels[sev] || sev || '—'
 }
 
 // ── 周报 ──

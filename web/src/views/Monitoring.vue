@@ -95,13 +95,19 @@
             </el-table-column>
             <el-table-column label="延迟" width="100">
               <template #default="scope">
-                <span v-if="scope.row.up">{{ (scope.row.latency / 1000000).toFixed(0) }}ms</span>
+                <span v-if="scope.row.latency">{{ (scope.row.latency / 1000000).toFixed(0) }}ms</span>
                 <span v-else>-</span>
               </template>
             </el-table-column>
             <el-table-column label="检查" width="110">
               <template #default="scope">
                 <span style="font-size: 12px">{{ scope.row.total_checks }}次 (失败{{ scope.row.failed_checks }})</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="失败原因" width="200" show-overflow-tooltip>
+              <template #default="scope">
+                <span v-if="scope.row.last_error" style="font-size: 12px; color: #f56c6c">{{ scope.row.last_error }}</span>
+                <span v-else style="color: #67c23a">正常</span>
               </template>
             </el-table-column>
             <el-table-column label="最后检查" width="170">
