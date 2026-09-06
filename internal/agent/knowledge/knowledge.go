@@ -147,6 +147,52 @@ func (kb *KnowledgeBase) Record(entry KnowledgeEntry) {
 	}
 }
 
+// RecordIncident 记录一次已解决的故障事件（聚合式）：
+// 相同症状指纹已存在时累加次数并刷新处置经验，否则新建。
+func (kb *KnowledgeBase) RecordIncident(entry KnowledgeEntry) {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
+
+	hash := symptomHash(entry.Symptom, entry.Source)
+	db := kb.store.DB()
+
+	var existingID int64
+	var existingCount int
+	err := db.QueryRow(
+		`SELECT id, occurrence_count FROM knowledge_entries WHERE symptom_hash = ? ORDER BY last_seen DESC LIMIT 1`,
+		hash,
+	).Scan(&existingID, &existingCount)
+
+	if err == nil {
+		action := entry.Action
+		if action == "" {
+			// 保留历史有效处置，不用空值覆盖
+			_ = db.QueryRow(`SELECT action FROM knowledge_entries WHERE id = ?`, existingID).Scan(&action)
+		}
+		_, err = db.Exec(
+			`UPDATE knowledge_entries SET occurrence_count = ?, last_seen = ?, root_cause = ?, action = ?, action_result = ?, effect = ?, resolved_at = ? WHERE id = ?`,
+			existingCount+1, time.Now(), entry.RootCause, action, entry.ActionResult, entry.Effect, time.Now(), existingID,
+		)
+		if err != nil {
+			fmt.Printf("[KnowledgeBase] 更新记录失败: %v\n", err)
+		}
+		return
+	}
+
+	firstSeen := entry.FirstSeen
+	if firstSeen.IsZero() {
+		firstSeen = time.Now()
+	}
+	_, err = db.Exec(
+		`INSERT INTO knowledge_entries (symptom, root_cause, action, action_result, effect, source, severity, occurrence_count, first_seen, last_seen, resolved_at, symptom_hash) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+		entry.Symptom, entry.RootCause, entry.Action, entry.ActionResult, entry.Effect, entry.Source, entry.Severity,
+		firstSeen, time.Now(), time.Now(), hash,
+	)
+	if err != nil {
+		fmt.Printf("[KnowledgeBase] 插入记录失败: %v\n", err)
+	}
+}
+
 // FindSimilar 查找相似故障的历史解决方案
 func (kb *KnowledgeBase) FindSimilar(symptom string, source string, limit int) ([]KnowledgeEntry, error) {
 	if limit <= 0 {

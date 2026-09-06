@@ -532,8 +532,14 @@ func chainFor(all []types.ChainLink, members []types.AlertRef) []types.ChainLink
 
 // attachActionsLocked 把窗口内的自动处置动作挂到匹配的开放事件上。
 func (e *Engine) attachActionsLocked() {
-	for _, inc := range e.open {
+	for fp, inc := range e.open {
+		before := len(inc.Actions)
 		e.attachActionsToIncidentLocked(inc)
+		// 挂载了新动作的事件要落库，否则 DB 里的事件永远缺动作记录
+		if len(inc.Actions) > before && e.db != nil {
+			_ = e.db.SaveIncident(*inc)
+			_ = fp
+		}
 	}
 }
 
@@ -655,12 +661,14 @@ func (e *Engine) publishIncidentAlert(inc *types.Incident) {
 }
 
 // closeStaleIncidents 关闭沉寂事件并沉淀知识库。
+// 沉寂判定用"最后活动时间"（根因/成员/动作中最晚者）而非根因时间，
+// 避免长时间持续演进的故障被提前判定解决。
 func (e *Engine) closeStaleIncidents() {
 	e.mu.Lock()
 	var closed []*types.Incident
 	now := time.Now()
 	for fp, inc := range e.open {
-		if now.Sub(inc.RootTime) < resolveAge {
+		if now.Sub(lastIncidentActivity(inc)) < resolveAge {
 			continue
 		}
 		inc.Status = "resolved"
@@ -681,7 +689,7 @@ func (e *Engine) closeStaleIncidents() {
 			if len(inc.Actions) == 0 {
 				result = "no-action"
 			}
-			e.kb.Record(knowledge.KnowledgeEntry{
+			e.kb.RecordIncident(knowledge.KnowledgeEntry{
 				Symptom:     inc.RootTitle,
 				RootCause:   summaryChain(inc),
 				Action:      firstAction(inc.Actions),
@@ -702,6 +710,19 @@ func firstAction(actions []string) string {
 		return a
 	}
 	return ""
+}
+
+// lastIncidentActivity 返回事件最后一次有动静的时间（根因/成员取最晚）。
+// 动作描述内嵌的时间戳只有时分秒无法参与日期比较，根因与成员时间已足够
+// 表达"最后一次告警动静"。
+func lastIncidentActivity(inc *types.Incident) time.Time {
+	latest := inc.RootTime
+	for _, m := range inc.MemberAlerts {
+		if m.Time.After(latest) {
+			latest = m.Time
+		}
+	}
+	return latest
 }
 
 // summaryChain 把因果边序列化为一行文本（存知识库的根因字段）。
