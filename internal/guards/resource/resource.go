@@ -267,8 +267,9 @@ func (g *ResourceGuard) checkMemoryLeaks(procs []types.ProcessInfo) {
 // checkDiskSpace checks disk usage and cleans up when critical.
 // 安全策略 v2：多层精确防护，不再一刀切屏蔽 /tmp、/www。
 // 清理级别：Warning(80%) → 告警+列出 Top 大文件
-//           Critical(90%) → 预防性清理（7天以上的旧日志）
-//           Emergency(95%) → 紧急清理（30天以上的旧日志+临时文件+包管理器缓存）
+//
+//	Critical(90%) → 预防性清理（7天以上的旧日志）
+//	Emergency(95%) → 紧急清理（30天以上的旧日志+临时文件+包管理器缓存）
 func (g *ResourceGuard) checkDiskSpace(sysInfo *types.SystemInfo) {
 	for _, disk := range sysInfo.Disks {
 		if disk.UsedPercent >= g.diskEmergency {
@@ -375,7 +376,7 @@ func (g *ResourceGuard) preventiveDiskCleanup(mountPoint string) {
 			if err != nil || info.IsDir() {
 				return nil
 			}
-			if time.Since(info.ModTime()) > 3*24*time.Hour {
+			if winFileCleanable(info, 3*24*time.Hour) {
 				os.Remove(path)
 			}
 			return nil
@@ -441,7 +442,7 @@ func (g *ResourceGuard) emergencyDiskCleanup(mountPoint string) {
 			if err != nil || info.IsDir() {
 				return nil
 			}
-			if time.Since(info.ModTime()) > 7*24*time.Hour {
+			if winFileCleanable(info, 7*24*time.Hour) {
 				os.Remove(path)
 			}
 			return nil
@@ -971,4 +972,23 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// winCleanupExtAllowed Windows 清理的扩展名白名单——与 Linux 的
+// .gz/.1/.old/.bz2/.xz/.zip 对齐，并加入 Windows 常见临时后缀。
+// 没有这份白名单时，TEMP 目录 24h 全删会把用户正在使用的安装包、
+// 文档、数据库导出等一并删掉。
+var winCleanupExt = map[string]bool{
+	".log": true, ".gz": true, ".zip": true, ".bz2": true, ".xz": true,
+	".tmp": true, ".temp": true, ".bak": true, ".old": true, ".etl": true,
+}
+
+// winFileCleanable 判断 Windows 临时文件是否可清理：扩展名白名单 +
+// mtime 已超过 minAge（活跃文件跳过）。
+func winFileCleanable(info os.FileInfo, minAge time.Duration) bool {
+	ext := strings.ToLower(filepath.Ext(info.Name()))
+	if !winCleanupExt[ext] {
+		return false
+	}
+	return time.Since(info.ModTime()) > minAge
 }

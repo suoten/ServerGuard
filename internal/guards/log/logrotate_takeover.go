@@ -6,15 +6,17 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // LogrotateTakeoverManager logrotate 冲突让位与接管管理器。
 // 检测 logrotate 已管理某日志时跳过该文件，
 // 用户在面板选择接管时备份并注释 /etc/logrotate.d/xxx 的对应 block。
 type LogrotateTakeoverManager struct {
-	mu        sync.Mutex
-	checker   *LogRotateChecker
-	takenOver map[string]bool // 已接管的日志路径
+	mu         sync.Mutex
+	checker    *LogRotateChecker
+	takenOver  map[string]bool   // 已接管的日志路径
+	lastBackup map[string]string // 配置文件 -> 最近一次接管备份路径
 }
 
 // NewLogrotateTakeoverManager 创建 logrotate 接管管理器。
@@ -56,11 +58,13 @@ func (m *LogrotateTakeoverManager) TakeOverFromLogrotate(logPath string) error {
 		return nil
 	}
 
-	// 备份原配置
-	backupPath := configFile + ".sg.bak"
+	// 备份原配置（带时间戳）：固定 .sg.bak 文件名会在第二次接管时被
+	// "已注释版本"覆盖，原始配置从此永久丢失，Release 恢复的也是注释版
+	backupPath := configFile + ".sg.bak-" + time.Now().Format("20060102150405")
 	if err := copyFile(configFile, backupPath); err != nil {
 		return fmt.Errorf("备份 logrotate 配置失败: %w", err)
 	}
+	m.lastBackup[configFile] = backupPath
 
 	// 注释掉对应的 block
 	if err := m.commentOutBlock(configFile, block); err != nil {
@@ -86,9 +90,24 @@ func (m *LogrotateTakeoverManager) ReleaseToLogrotate(logPath string) error {
 		return nil
 	}
 
-	// 恢复备份
-	backupPath := configFile + ".sg.bak"
-	if _, err := os.Stat(backupPath); err != nil {
+	// 恢复备份：优先最近一次接管时的时间戳备份，兼容旧版固定 .sg.bak
+	backupPath := ""
+	if p, ok := m.lastBackup[configFile]; ok {
+		if _, err := os.Stat(p); err == nil {
+			backupPath = p
+		}
+	}
+	if backupPath == "" {
+		if entries, err := filepath.Glob(configFile + ".sg.bak-*"); err == nil && len(entries) > 0 {
+			backupPath = entries[len(entries)-1] // Glob 按字典序=时间序
+		}
+	}
+	if backupPath == "" {
+		if _, err := os.Stat(configFile + ".sg.bak"); err == nil {
+			backupPath = configFile + ".sg.bak"
+		}
+	}
+	if backupPath == "" {
 		// 无备份，无需恢复
 		delete(m.takenOver, logPath)
 		return nil
@@ -183,8 +202,16 @@ func (m *LogrotateTakeoverManager) commentOutBlock(configFile, block string) err
 		commentedBlock += "# " + line + "\n"
 	}
 
+	if strings.TrimSpace(block) == "" {
+		return fmt.Errorf("提取到的 logrotate block 为空（路径可能只出现在注释行），拒绝改写配置文件")
+	}
 	newContent := strings.Replace(string(content), block, commentedBlock, 1)
-	return os.WriteFile(configFile, []byte(newContent), 0644)
+	// 原子写：直接覆盖 /etc/logrotate.d/* 时写入中途崩溃会留下半个配置
+	tmp := configFile + ".sg.tmp"
+	if err := os.WriteFile(tmp, []byte(newContent), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, configFile)
 }
 
 // copyFile 复制文件。

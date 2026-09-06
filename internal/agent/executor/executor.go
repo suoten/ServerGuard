@@ -726,7 +726,7 @@ func (e *Executor) executeCleanDisk(ctx context.Context, action types.Action, ta
 				if err != nil || info.IsDir() {
 					return nil
 				}
-				if time.Since(info.ModTime()) > 24*time.Hour {
+				if winFileCleanable(info, 24*time.Hour) {
 					size := info.Size()
 					if os.Remove(path) == nil {
 						freed += size
@@ -1043,4 +1043,23 @@ func findProcessByName(name string) ([]*process.Process, error) {
 	}
 
 	return result, nil
+}
+
+// winCleanupExtAllowed Windows 清理的扩展名白名单——与 Linux 的
+// .gz/.1/.old/.bz2/.xz/.zip 对齐，并加入 Windows 常见临时后缀。
+// 没有这份白名单时，TEMP 目录 24h 全删会把用户正在使用的安装包、
+// 文档、数据库导出等一并删掉。
+var winCleanupExt = map[string]bool{
+	".log": true, ".gz": true, ".zip": true, ".bz2": true, ".xz": true,
+	".tmp": true, ".temp": true, ".bak": true, ".old": true, ".etl": true,
+}
+
+// winFileCleanable 判断 Windows 临时文件是否可清理：扩展名白名单 +
+// mtime 已超过 minAge（活跃文件跳过）。
+func winFileCleanable(info os.FileInfo, minAge time.Duration) bool {
+	ext := strings.ToLower(filepath.Ext(info.Name()))
+	if !winCleanupExt[ext] {
+		return false
+	}
+	return time.Since(info.ModTime()) > minAge
 }
