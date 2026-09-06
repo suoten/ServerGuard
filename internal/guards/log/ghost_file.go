@@ -308,6 +308,16 @@ func (c *GhostFileCleaner) CleanGhostFiles() (freed int64, before []GhostFile, a
 func (c *GhostFileCleaner) autoClean(ghosts []GhostFile) int64 {
 	freed := int64(0)
 
+	// 维护窗口/远程暂停/紧急停止期间不自动清理——
+	// 批量 SIGTERM/systemctl restart 属高危动作，运维变更中执行极易雪上加霜
+	if c.safety != nil && c.safety.ShouldPauseDangerousActions() {
+		c.publish(types.AlertWarning, "log",
+			"幽灵文件清理已跳过（维护窗口/暂停期）",
+			fmt.Sprintf("检测到 %d 个幽灵文件待清理，但当前处于维护窗口或远程暂停期，已跳过自动清理", len(ghosts)),
+			"ghost-file-paused-001")
+		return 0
+	}
+
 	// 按文件路径聚合：同一个被删文件可能被几百个进程持有（如宝塔 cron 的 curl）
 	// 逐个 kill 会导致 API 超时（172 进程 × 15 秒 = 43 分钟）
 	type pathGroup struct {
@@ -427,15 +437,32 @@ func (c *GhostFileCleaner) autoClean(ghosts []GhostFile) int64 {
 }
 
 // batchKill 批量发送信号给多个进程，然后统一等待
-// 返回成功终止的进程数
+// 返回成功终止的进程数。
+// 每个 PID 先过 CheckKillPermission（预算/熔断/紧急停止/白名单），
+// 被拒的跳过——幽灵文件清理不得绕过五层安全阀；成功后 RecordKill 记账。
 func (c *GhostFileCleaner) batchKill(pids []int32, signal string, waitSecs int) int {
 	killed := 0
-	// 同时给所有进程发信号（并行）
+	// 先整体做一遍审批，全部被拒则不动手（避免一半杀一半留的中间态）
+	approved := make([]int32, 0, len(pids))
 	for _, pid := range pids {
 		if !processExists(pid) {
 			killed++
 			continue
 		}
+		if c.safety != nil {
+			name := ghostProcName(pid)
+			if err := c.safety.CheckKillPermission(name, pid); err != nil {
+				c.publish(types.AlertWarning, "log",
+					fmt.Sprintf("幽灵文件清理被安全机制拦截: PID %d", pid),
+					fmt.Sprintf("进程 %s (PID %d) 持有幽灵文件，但安全审批拒绝终止：%v", name, pid, err),
+					"ghost-file-blocked-001")
+				continue
+			}
+		}
+		approved = append(approved, pid)
+	}
+	// 同时给所有获批进程发信号（并行）
+	for _, pid := range approved {
 		_ = exec.Command("kill", "-"+signal, fmt.Sprintf("%d", pid)).Run()
 	}
 	// 统一等待，不逐个等待
@@ -452,12 +479,23 @@ func (c *GhostFileCleaner) batchKill(pids []int32, signal string, waitSecs int) 
 		}
 	}
 	// 统计成功数
-	for _, pid := range pids {
+	for _, pid := range approved {
 		if !processExists(pid) {
 			killed++
+			if c.safety != nil {
+				c.safety.RecordKill(pid, ghostProcName(pid), true)
+			}
 		}
 	}
 	return killed
+}
+
+// ghostProcName 轻量读取 /proc/{pid}/comm（失败返回占位符）。
+func ghostProcName(pid int32) string {
+	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	return fmt.Sprintf("pid-%d", pid)
 }
 
 func min(a, b int) int {

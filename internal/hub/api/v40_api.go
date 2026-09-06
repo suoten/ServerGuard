@@ -400,8 +400,20 @@ func (a *API) applySceneTemplate(c *gin.Context) {
 	if a.configPath != "" {
 		rulesPath := filepath.Join(filepath.Dir(a.configPath), "rules.yaml")
 		var existing ruleengine.RuleFile
-		if data, err := os.ReadFile(rulesPath); err == nil {
-			_ = yaml.Unmarshal(data, &existing)
+		if data, err := os.ReadFile(rulesPath); err != nil {
+			if !os.IsNotExist(err) {
+				// 规则文件存在但读不了——绝不能带着空规则继续写，
+				// 否则用户的全部自愈规则会被模板规则覆盖清零
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": fmt.Sprintf("规则文件存在但读取失败，已中止写入（防止覆盖现有规则）: %v", err),
+				})
+				return
+			}
+		} else if err := yaml.Unmarshal(data, &existing); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": fmt.Sprintf("规则文件存在但解析失败（可能已损坏），已中止写入（防止覆盖现有规则）: %v", err),
+			})
+			return
 		}
 
 		// 构建新规则
@@ -456,8 +468,17 @@ func (a *API) applySceneTemplate(c *gin.Context) {
 		if err != nil {
 			rulesErr = fmt.Sprintf("规则序列化失败: %v", err)
 		} else {
-			if err := os.WriteFile(rulesPath, out, 0644); err != nil {
+			// 带时间戳备份原规则文件（应用前留底，可人工恢复）
+			if orig, err := os.ReadFile(rulesPath); err == nil {
+				_ = os.WriteFile(rulesPath+".bak-"+time.Now().Format("20060102150405"), orig, 0644)
+			}
+			// 原子写：临时文件 + rename，写入中途崩溃不会留下半个 rules.yaml
+			tmp := rulesPath + ".tmp-apply"
+			if err := os.WriteFile(tmp, out, 0644); err != nil {
 				rulesErr = fmt.Sprintf("规则文件写入失败: %v", err)
+			} else if err := os.Rename(tmp, rulesPath); err != nil {
+				os.Remove(tmp)
+				rulesErr = fmt.Sprintf("规则文件替换失败: %v", err)
 			} else {
 				results["rules_file"] = rulesPath
 			}

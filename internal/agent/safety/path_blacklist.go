@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ============================================================
@@ -254,15 +255,20 @@ func IsFileSafeForCleanup(path string) bool {
 }
 
 // IsFileBeingWritten 检查文件是否正在被写入。
-// 通过尝试独占打开文件来检测：如果文件被其他进程持有写锁，打开会失败。
+// 启发式：mtime 在最近 2 分钟内视为活跃文件，跳过清理。
+//
+// 注意：原实现（O_WRONLY|O_EXCL 打开）在 Linux 上是无效检查——内核对普通
+// 文件忽略 O_EXCL、root 可打开任何文件，恒返回 false，"活跃写入保护"
+// 这一层防护名存实亡。mtime 启发式虽不能 100% 捕获写入，但配合
+// "只删轮转旧文件（.gz/.1/.old）"的扩展名白名单已足够安全：
+// 轮转归档文件本就不该有进程在写。
 func IsFileBeingWritten(path string) bool {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_EXCL, 0)
+	info, err := os.Stat(path)
 	if err != nil {
-		// 文件被占用或不可写，保守认为正在被写入
+		// 文件消失/不可访问：按"正在变化"处理，让调用方跳过
 		return true
 	}
-	f.Close()
-	return false
+	return time.Since(info.ModTime()) < 2*time.Minute
 }
 
 // ============================================================

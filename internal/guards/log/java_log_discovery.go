@@ -432,10 +432,12 @@ func (c *EmergencyLogCleaner) copyTruncate(path string, currentSize int64) int64
 	return currentSize
 }
 
-// compressAndRemoveBackup 压缩并删除备份文件
+// compressAndRemoveBackup 将截断前的日志备份压缩为 .gz。
+// 修复：原实现用 defer os.Remove 把压缩备份和原始备份全部立刻删掉，
+// 而告警却声称"备份已压缩保存"——日志内容被静默永久销毁。
+// 现在压缩成功后保留 .gz 备份（可人工恢复），只删除未压缩临时文件；
+// 压缩失败时保留原始备份，绝不"既没压成又删了原文件"。
 func (c *EmergencyLogCleaner) compressAndRemoveBackup(bakPath string) {
-	defer func() { os.Remove(bakPath) }()
-
 	src, err := os.Open(bakPath)
 	if err != nil {
 		return
@@ -445,15 +447,32 @@ func (c *EmergencyLogCleaner) compressAndRemoveBackup(bakPath string) {
 	gzPath := bakPath + ".gz"
 	dst, err := os.Create(gzPath)
 	if err != nil {
+		return // 保留原始备份
+	}
+
+	gzWriter, zerr := gzip.NewWriterLevel(dst, gzip.BestSpeed)
+	if zerr != nil {
+		dst.Close()
+		os.Remove(gzPath)
 		return
 	}
-	defer dst.Close()
-
-	gzWriter, _ := gzip.NewWriterLevel(dst, gzip.BestSpeed)
-	defer gzWriter.Close()
-	defer func() { os.Remove(gzPath) }() // 紧急模式下直接删除压缩备份
-
-	io.Copy(gzWriter, src)
+	if _, err := io.Copy(gzWriter, src); err != nil {
+		gzWriter.Close()
+		dst.Close()
+		os.Remove(gzPath)
+		return // 保留原始备份
+	}
+	if err := gzWriter.Close(); err != nil {
+		dst.Close()
+		os.Remove(gzPath)
+		return
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(gzPath)
+		return
+	}
+	// 压缩成功且完整落盘：删除未压缩临时备份，保留 .gz
+	os.Remove(bakPath)
 }
 
 // emergencyLogCleanupWindows Windows 版紧急清理
