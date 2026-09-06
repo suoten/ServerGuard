@@ -105,6 +105,14 @@ const (
 	engineSource = "correlation"
 	// 同源告警连续出现视为连锁反应（如服务守护反复拉起失败）
 	sameSourceChainGap = 3 * time.Minute
+
+	// 风暴防护硬上限：缓冲条数封顶（超限丢最旧的，防止告警风暴下无界增长）
+	maxAlertsBuffered = 300
+	maxActionsBuffered = 300
+	// 单次关联参与两两配对的告警上限（O(n²) 热路径，持锁执行）
+	maxCorrelateInput = 80
+	// 事件落库节流：风暴期间同一事件的成员变化不必每次告警都落库
+	incidentSaveThrottle = 30 * time.Second
 )
 
 // Engine 根因链推理引擎。
@@ -122,6 +130,9 @@ type Engine struct {
 	ruleFeedback       map[string]*ruleStat
 	suspendedRules     map[string]time.Time // 规则名 -> 停用到期时间
 	confirmedIncidents map[string]bool      // 已计入确认的事件 ID（防重复计数）
+
+	// 事件落库节流时间戳（风暴防护）
+	lastIncidentSave time.Time
 }
 
 // ruleStat 单条因果规则的验证统计。
@@ -234,6 +245,15 @@ func (e *Engine) trimLocked() {
 		}
 	}
 	e.buf, e.act = alerts, actions
+
+	// 风暴硬上限：时间窗裁剪不够——告警风暴可在 10 分钟内积压数万条，
+	// 每条新告警都触发 O(n²) 关联会把事件总线卡死。超限丢最旧的。
+	if len(e.buf) > maxAlertsBuffered {
+		e.buf = e.buf[len(e.buf)-maxAlertsBuffered:]
+	}
+	if len(e.act) > maxActionsBuffered {
+		e.act = e.act[len(e.act)-maxActionsBuffered:]
+	}
 }
 
 // alertKey 提取告警的可匹配文本。
@@ -370,6 +390,11 @@ func (e *Engine) correlateLocked() {
 			recent = append(recent, ev)
 		}
 	}
+	// O(n²) 截断：只对最新的 maxCorrelateInput 条做两两配对（时间序保证
+	// 最新的在尾部），风暴下宁可少关联也不能卡死事件总线
+	if len(recent) > maxCorrelateInput {
+		recent = recent[len(recent)-maxCorrelateInput:]
+	}
 	groups, chain := buildChains(recent, e.suspendedRules)
 	now := time.Now()
 
@@ -419,9 +444,16 @@ func (e *Engine) correlateLocked() {
 			// 新事件：发布汇总告警（带因果链 + 知识库建议）
 			inc.Summary = e.buildSummary(inc)
 			e.publishIncidentAlert(inc)
+			if e.db != nil {
+				_ = e.db.SaveIncident(*inc)
+			}
+			continue
 		}
-		if e.db != nil {
+		// 已有事件的成员/链更新：落库节流——风暴期间同一事件每条告警都
+		// 全量落库会放大 SQLite 写压力（持锁执行），30 秒落一次足够
+		if e.db != nil && now.Sub(e.lastIncidentSave) >= incidentSaveThrottle {
 			_ = e.db.SaveIncident(*inc)
+			e.lastIncidentSave = now
 		}
 	}
 }

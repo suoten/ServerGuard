@@ -28,6 +28,9 @@ type Storage struct {
 	cachedRP   RetentionPolicy
 	rpLoaded   bool
 
+	// incidents 表 schema 是否已初始化（每实例一次，避免每次操作跑 DDL）
+	incidentSchemaReady bool
+
 	// stopCh 关闭后 maintenanceLoop 退出，Close 后不再触碰已关闭的 db
 	stopCh   chan struct{}
 	stopOnce sync.Once

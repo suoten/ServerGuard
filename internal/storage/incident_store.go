@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+
 	"time"
 
 	"github.com/google/uuid"
@@ -14,9 +15,15 @@ import (
 // incident_store 提供故障事件（Incident）的持久化。
 // 根因链推理引擎把多条相关告警关联成一条因果链，落库后供面板与复盘使用。
 
+// incidentSchemaInitCount 仅用于记录（per-instance 标志在 Storage 结构体上）。
+// schema 初始化必须 per-instance：测试/多进程场景下每个 Storage 有自己的 DB，
+// 包级 sync.Once 会导致第二个实例永远建不了表。
 func (s *Storage) ensureIncidentSchema() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.incidentSchemaReady {
+		return nil
+	}
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS incidents (
 	id TEXT PRIMARY KEY,
@@ -36,6 +43,9 @@ CREATE TABLE IF NOT EXISTS incidents (
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
 CREATE INDEX IF NOT EXISTS idx_incidents_started ON incidents(started_at DESC);
 `)
+	if err == nil {
+		s.incidentSchemaReady = true
+	}
 	return err
 }
 
