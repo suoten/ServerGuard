@@ -2,9 +2,10 @@ package security
 
 import (
 	"fmt"
-	"net"
+
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,19 +78,31 @@ func (e *EmergencyRollback) OnBanCalled(bannedIP string) {
 	}()
 }
 
-// checkSSHDisconnected 检测 SSH 活跃连接数是否为 0。
+// checkSSHDisconnected 检测是否存在来自非回环地址的活跃 SSH 会话。
+// 不能用拨 127.0.0.1:22 判断——本机回环永远可达，与封禁的外部 IP 无关，
+// 原实现因此永远检测不到失联。改用 ss 统计 22 端口的已建立外部连接。
 func (e *EmergencyRollback) checkSSHDisconnected() bool {
-	// 尝试连接 SSH 端口
-	addr := fmt.Sprintf("127.0.0.1:%d", e.sshPort)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		// SSH 端口不可达，可能失联
-		return true
+	if runtime.GOOS == "windows" {
+		return false // Windows 无 ss/proc，不做此检测（封禁走 netsh）
 	}
-	conn.Close()
-	// SSH 端口可达，但需要检查活跃连接数
-	// 简化实现：端口可达即认为未失联
-	return false
+	out, err := exec.Command("sh", "-c",
+		fmt.Sprintf("ss -tnH state established '( sport = :%d )' 2>/dev/null | awk '{print $4}'", e.sshPort)).Output()
+	if err != nil {
+		// 检测手段不可用：宁可误判"未失联"也不触发误回滚
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		peer := strings.TrimSpace(line)
+		if peer == "" {
+			continue
+		}
+		// 排除回环/本地地址（sshd 自身的测试连接等）
+		if strings.HasPrefix(peer, "127.") || strings.HasPrefix(peer, "[::1]") || strings.HasPrefix(peer, "::1") {
+			continue
+		}
+		return false // 存在活跃的外部 SSH 会话 → 未失联
+	}
+	return true // 22 端口没有任何外部已建立连接
 }
 
 // canPingGateway 检测是否可以 ping 网关。
@@ -132,17 +145,18 @@ func (e *EmergencyRollback) triggerRollback(bannedIP string) {
 }
 
 // clearAllSGRules 清除所有 ServerGuard 添加的 iptables 规则。
+// 实际规则的注释是 "serverguard-*"（小写），原实现 grep 'SG_' 永远匹配
+// 不到任何规则——紧急回滚是空操作。改为按小写标记精确删除。
 func (e *EmergencyRollback) clearAllSGRules() {
 	if runtime.GOOS == "windows" {
 		// Windows 使用防火墙规则
 		exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=ServerGuard").Run()
 		return
 	}
-	// Linux: 清除带 ServerGuard 标记的 iptables 规则
-	exec.Command("iptables", "-S").Run() // 列出规则
-	// 使用注释标记的规则可以精确删除
-	// 这里简化实现：flush INPUT 链中带 SG_ 前缀的规则
-	exec.Command("sh", "-c", "iptables -S INPUT | grep 'SG_' | while read rule; do iptables -D INPUT ${rule#-A INPUT}; done").Run()
+	// Linux: 逐条删除带 serverguard 注释的 INPUT 规则（只动自己的规则，
+	// 绝不 flush 整条链——服务器上可能有宝塔/用户自己的防火墙规则）
+	exec.Command("sh", "-c",
+		`iptables -S INPUT | grep 'serverguard' | sed 's/^-A INPUT //' | while read -r rule; do iptables -D INPUT $rule; done`).Run()
 }
 
 // detectGateway 检测默认网关 IP。

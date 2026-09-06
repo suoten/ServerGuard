@@ -22,6 +22,7 @@ import (
 	"github.com/suoten/serverguard/internal/agent/eventbus"
 	"github.com/suoten/serverguard/internal/agent/safety"
 	"github.com/suoten/serverguard/internal/intel"
+	"github.com/suoten/serverguard/internal/platform"
 	"github.com/suoten/serverguard/internal/storage"
 	"github.com/suoten/serverguard/internal/types"
 )
@@ -429,10 +430,23 @@ func (g *SecurityGuard) banIP(ctx context.Context, ip string, failures int) {
 	banReason := fmt.Sprintf("SSH暴力破解: %s 内失败 %d 次%s", g.bruteWindow, failures, intelNote)
 
 	if runtime.GOOS != "windows" {
+		// 管理员来源保护：该 IP 正有已认证登录会话时拒绝封禁（防自锁）
+		if platform.IsAdminSSHSource(ip) {
+			g.eventBus.PublishAlert(types.AlertWarning, "security",
+				fmt.Sprintf("封禁被防自锁保护拦截: %s", ip),
+				fmt.Sprintf("IP %s 触发封禁条件（%s 内失败 %d 次），但它是当前已登录管理员的活动来源，已拒绝封禁。请确认后手动处理",
+					ip, g.bruteWindow, failures),
+				"ssh-brute-admin-001")
+			g.recordAudit("ban_ip_blocked", ip, "封禁目标为管理员活动来源，防自锁保护拒绝", "blocked", "")
+			return
+		}
+
 		// 安全保护模式下 IP 封禁保持生效（不会导致服务器崩溃）
-		// Use iptables to ban (with comment tag for safe cleanup)
+		// 注释带 exp=<unix>：Agent 崩溃/重启后 platform 清扫器仍能按期清理，
+		// 否则内存到期记录丢失后封禁将永久化
+		expireUnix := time.Now().Add(duration).Unix()
 		cmd := exec.CommandContext(ctx, "iptables", "-I", "INPUT", "-s", ip, "-j", "DROP",
-			"-m", "comment", "--comment", "serverguard-security:ssh-brute")
+			"-m", "comment", "--comment", fmt.Sprintf("serverguard-security:ssh-brute:exp=%d", expireUnix))
 		if err := cmd.Run(); err != nil {
 			// Try firewalld as fallback
 			cmd = exec.CommandContext(ctx, "firewall-cmd", "--add-rich-rule",

@@ -20,6 +20,7 @@ import (
 
 	"github.com/suoten/serverguard/internal/agent/eventbus"
 	"github.com/suoten/serverguard/internal/agent/safety"
+	"github.com/suoten/serverguard/internal/platform"
 	"github.com/suoten/serverguard/internal/storage"
 	"github.com/suoten/serverguard/internal/types"
 )
@@ -811,7 +812,20 @@ func (e *Executor) executeBanIP(ctx context.Context, action types.Action, target
 	}
 
 	if runtime.GOOS != "windows" {
-		cmd := exec.CommandContext(ctx, "iptables", "-I", "INPUT", "-s", ip, "-j", "DROP")
+		// 管理员来源保护：拒绝封掉正在登录的管理员（防自锁）
+		if platform.IsAdminSSHSource(ip) {
+			result.Success = false
+			result.Error = fmt.Sprintf("refused to ban %s: active admin login source (anti-lockout)", ip)
+			e.eventBus.PublishAlert(types.AlertWarning, "executor",
+				fmt.Sprintf("IP封禁被防自锁保护拦截: %s", ip),
+				fmt.Sprintf("规则要求封禁 %s，但该 IP 是当前已登录管理员的活动来源，已拒绝。请人工确认", ip),
+				"ban-ip-admin-001")
+			return result
+		}
+		// 注释带 exp：进程崩溃后 platform 清扫器仍能按期清理，避免永久封禁
+		expireUnix := time.Now().Add(24 * time.Hour).Unix()
+		cmd := exec.CommandContext(ctx, "iptables", "-I", "INPUT", "-s", ip, "-j", "DROP",
+			"-m", "comment", "--comment", fmt.Sprintf("serverguard-executor:rule-ban:exp=%d", expireUnix))
 		if err := cmd.Run(); err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("iptables failed: %v", err)

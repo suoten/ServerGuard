@@ -478,6 +478,12 @@ func (m *linuxFirewallManager) BanIP(ctx context.Context, ip string, opts BanOpt
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// 管理员来源保护：该 IP 正有已认证的登录会话（SSH 等）时拒绝封禁。
+	// 进程崩溃后残留规则没有任何自动解封机制，封掉管理员等于把钥匙锁在门里。
+	if IsAdminSSHSource(ip) {
+		return fmt.Errorf("refusing to ban %s: 当前是该 IP 上已登录管理员的活动来源（防自锁保护），请确认后在面板手动封禁", ip)
+	}
+
 	prefix := opts.RulePrefix
 	if prefix == "" {
 		prefix = "serverguard"

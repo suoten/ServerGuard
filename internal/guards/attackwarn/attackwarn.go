@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/suoten/serverguard/internal/agent/tuning"
+	"github.com/suoten/serverguard/internal/guards/security"
 	"github.com/suoten/serverguard/internal/intel"
 	"github.com/suoten/serverguard/internal/storage"
 	"github.com/suoten/serverguard/internal/types"
@@ -42,6 +43,7 @@ type AttackWarnGuard struct {
 	escalation     *tuning.EscalationTracker    // 渐进式响应追踪（observe → block）
 	persistentIPs  map[string]bool               // 持久攻击者集合
 	handledAt      map[string]time.Time          // IP -> 上次处置时间，用于误报识别
+	rollback       *security.EmergencyRollback   // SSH 失联看门狗（封禁自锁兜底）
 	recentEvents   map[string]time.Time          // 事件去重：ip|type|url摘要 -> 上次入库时间
 	banCooldown    map[string]time.Time          // IP -> 上次实际封禁时间（冷却期内同 IP 不重复执行防火墙命令）
 	banBudget      []time.Time                   // 封禁预算滑动窗口：防止一次扫描产生数百次 iptables 调用拖垮系统
@@ -166,6 +168,10 @@ func NewAttackWarnGuard(store *storage.Storage, fwMgr FirewallManager) *AttackWa
 		banCooldown:       make(map[string]time.Time),
 		baseline:           tuning.NewBaselineEngine(),
 		escalation:         tuning.NewEscalationTracker(),
+		// SSH 失联看门狗：每次封禁后检测管理员是否被自己锁在门外。
+		// 此前只有 security 模块的封禁有看门狗，Z 模块（主力封禁路径）却没有
+		// ——封禁自锁时没有任何自动解封手段。
+		rollback: security.NewEmergencyRollback(nil),
 	}
 }
 
@@ -1780,6 +1786,10 @@ func (g *AttackWarnGuard) handleAttack(ctx context.Context, ip, attackType strin
 	if err := g.firewallMgr.BanIP(ctx, ip, duration, fmt.Sprintf("attack:%s", attackType)); err != nil {
 		g.recordAction("ban_ip", ip, fmt.Sprintf("自动封禁IP %s（%s）", labelCN, attackType), false, err)
 		return fmt.Sprintf("ban_failed:%v", err)
+	}
+	// 封禁成功后启动 SSH 失联看门狗（防自锁兜底）
+	if g.rollback != nil {
+		g.rollback.OnBanCalled(ip)
 	}
 	// 记录审计日志 + 操作日志
 	detail := fmt.Sprintf("自动封禁IP %s（%s）%s", labelCN, attackType, note)
