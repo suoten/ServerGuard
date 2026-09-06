@@ -3,6 +3,7 @@ package multi
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -33,32 +34,43 @@ type tenantClaims struct {
 }
 
 // Middleware HTTP 中间件
+// fail-closed：无 Token / 解析失败一律 401，租户隔离不能被静默绕过。
 func (m *JWTMiddleware) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			next.ServeHTTP(w, r)
+		if !strings.HasPrefix(authHeader, "Bearer ") || authHeader == "Bearer " {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
 			return
 		}
 
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 		token, err := jwt.ParseWithClaims(tokenString, &tenantClaims{}, func(t *jwt.Token) (interface{}, error) {
+			// 算法白名单：拒绝 alg=none / 算法混淆攻击
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
 			return m.jwtSecret, nil
 		})
 		if err != nil {
-			next.ServeHTTP(w, r)
+			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
 		}
 
 		claims, ok := token.Claims.(*tenantClaims)
-		if !ok || !token.Valid {
-			next.ServeHTTP(w, r)
+		if !ok || !token.Valid || claims.TenantID == "" {
+			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
 		}
 
-		// 设置 PostgreSQL session 变量
-		if m.db != nil && claims.TenantID != "" {
-			_, _ = m.db.ExecContext(r.Context(), "SET app.tenant_id = $1", claims.TenantID)
+		// 设置 PostgreSQL session 变量：SET 不支持绑定参数，
+		// 必须用 set_config()，否则 RLS 策略（current_setting('app.tenant_id')）永远取不到值
+		if m.db != nil {
+			if _, err := m.db.ExecContext(r.Context(),
+				"SELECT set_config('app.tenant_id', $1, false)", claims.TenantID); err != nil {
+				// 租户会话变量设置失败意味着 RLS 不生效，必须拒绝请求而不是放行
+				http.Error(w, `{"error":"tenant session setup failed"}`, http.StatusInternalServerError)
+				return
+			}
 		}
 
 		// 注入上下文

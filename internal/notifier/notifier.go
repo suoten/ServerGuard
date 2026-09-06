@@ -73,6 +73,10 @@ type Notifier struct {
 
 	// V4.0 — 双向通知器（可选，默认 nil）
 	biNotifier *BidirectionalNotifier
+
+	// stopCh 关闭时 backgroundLoop 退出，避免 goroutine 泄漏
+	stopCh    chan struct{}
+	stopOnce  sync.Once
 }
 
 // Channel interface for alert delivery.
@@ -107,6 +111,7 @@ func New(bus *eventbus.EventBus) *Notifier {
 		escalationMgr:  NewEscalationManager(),
 		timeZoneDelay:  NewTimeZoneDelay(),
 		corr:           newCorrelator(),
+		stopCh:         make(chan struct{}),
 	}
 
 	// Subscribe to alert events
@@ -118,6 +123,11 @@ func New(bus *eventbus.EventBus) *Notifier {
 	go n.backgroundLoop()
 
 	return n
+}
+
+// Stop 停止后台循环（幂等）。进程优雅退出或重建 Notifier 时调用。
+func (n *Notifier) Stop() {
+	n.stopOnce.Do(func() { close(n.stopCh) })
 }
 
 // AddChannel adds a notification channel.
@@ -356,7 +366,12 @@ func (n *Notifier) backgroundLoop() {
 	defer ticker.Stop()
 
 	tick := 0
-	for range ticker.C {
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-ticker.C:
+		}
 		tick++
 		now := time.Now()
 

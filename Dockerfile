@@ -5,9 +5,15 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o serverguard-agent ./cmd/serverguard-agent
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o serverguard-hub ./cmd/serverguard-hub
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o sgctl ./cmd/sgctl
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/suoten/serverguard/internal/version.GitCommit=${GIT_COMMIT} -X github.com/suoten/serverguard/internal/version.BuildTime=${BUILD_TIME}" -o serverguard-agent ./cmd/serverguard-agent
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/suoten/serverguard/internal/version.GitCommit=${GIT_COMMIT} -X github.com/suoten/serverguard/internal/version.BuildTime=${BUILD_TIME}" -o serverguard-hub ./cmd/serverguard-hub
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/suoten/serverguard/internal/version.GitCommit=${GIT_COMMIT} -X github.com/suoten/serverguard/internal/version.BuildTime=${BUILD_TIME}" -o sgctl ./cmd/sgctl
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata

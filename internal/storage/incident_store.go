@@ -158,9 +158,9 @@ func (s *Storage) ResolveStaleIncidents(maxAge time.Duration) ([]types.Incident,
 	if err := s.ensureIncidentSchema(); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// 查询与更新放在锁外：SQLite 写锁期间持 s.mu 会把其他 goroutine
+	// 的所有存储操作（告警落库/自愈记录）全部串行阻塞，DB 慢时放大为全局卡顿。
+	// s.mu 仅用于保护内存状态，而本函数纯 DB 操作，无需持锁。
 	rows, err := s.db.Query(
 		`SELECT id, started_at, ended_at, status, root_title, root_source, root_time,
 		        member_alerts, chain, actions, summary

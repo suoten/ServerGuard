@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -286,9 +287,20 @@ func (a *API) SetInsights(det *anomaly.Detector) {
 func (a *API) setupRoutes() {
 	r := a.router
 
-	// CORS
+	// CORS：使用配置白名单（cfg.Web.CORSOrigins），特殊值 "*" 保持全开放。
+	// 避免任意站点在用户浏览器持有 Token 时跨域调用 API。
+	allowedOrigins := a.cfg.Web.CORSOrigins
 	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.GetHeader("Origin")
+		if origin != "" {
+			for _, o := range allowedOrigins {
+				if o == "*" || o == origin {
+					c.Header("Access-Control-Allow-Origin", origin)
+					c.Header("Vary", "Origin")
+					break
+				}
+			}
+		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if c.Request.Method == "OPTIONS" {
@@ -363,16 +375,27 @@ func (a *API) setupRoutes() {
 	// 访问 /debug/pprof/ 查看所有可用 profile
 	// 访问 /debug/pprof/heap 查看堆内存
 	// 访问 /debug/pprof/goroutine 查看 goroutine 泄漏
-	r.GET("/debug/pprof/", gin.WrapH(http.HandlerFunc(pprof.Index)))
-	r.GET("/debug/pprof/cmdline", gin.WrapH(http.HandlerFunc(pprof.Cmdline)))
-	r.GET("/debug/pprof/profile", gin.WrapH(http.HandlerFunc(pprof.Profile)))
-	r.GET("/debug/pprof/symbol", gin.WrapH(http.HandlerFunc(pprof.Symbol)))
-	r.GET("/debug/pprof/trace", gin.WrapH(http.HandlerFunc(pprof.Trace)))
-	r.GET("/debug/pprof/allocs", gin.WrapH(pprof.Handler("allocs")))
-	r.GET("/debug/pprof/heap", gin.WrapH(pprof.Handler("heap")))
-	r.GET("/debug/pprof/goroutine", gin.WrapH(pprof.Handler("goroutine")))
-	r.GET("/debug/pprof/block", gin.WrapH(pprof.Handler("block")))
-	r.GET("/debug/pprof/mutex", gin.WrapH(pprof.Handler("mutex")))
+	// 必须置于鉴权之后：pprof 可导出内存中的 Token/密码明文，也可被用作 CPU DoS。
+	pprofHandlers := map[string]gin.HandlerFunc{
+		"/debug/pprof/":          gin.WrapH(http.HandlerFunc(pprof.Index)),
+		"/debug/pprof/cmdline":   gin.WrapH(http.HandlerFunc(pprof.Cmdline)),
+		"/debug/pprof/profile":   gin.WrapH(http.HandlerFunc(pprof.Profile)),
+		"/debug/pprof/symbol":    gin.WrapH(http.HandlerFunc(pprof.Symbol)),
+		"/debug/pprof/trace":     gin.WrapH(http.HandlerFunc(pprof.Trace)),
+		"/debug/pprof/allocs":    gin.WrapH(pprof.Handler("allocs")),
+		"/debug/pprof/heap":      gin.WrapH(pprof.Handler("heap")),
+		"/debug/pprof/goroutine": gin.WrapH(pprof.Handler("goroutine")),
+		"/debug/pprof/block":     gin.WrapH(pprof.Handler("block")),
+		"/debug/pprof/mutex":     gin.WrapH(pprof.Handler("mutex")),
+	}
+	for p, h := range pprofHandlers {
+		if a.auth.Enabled {
+			dbg := r.Group("/debug", a.authMiddleware())
+			dbg.GET(strings.TrimPrefix(p, "/debug"), h)
+		} else {
+			r.GET(p, h)
+		}
+	}
 
 	// API routes (auth required)
 	api := r.Group("/api")
@@ -728,11 +751,18 @@ func (a *API) login(c *gin.Context) {
 		}
 	}
 
-	// 降级：检查配置文件中的默认管理员凭证
-	if !loginOK && (req.Username != a.auth.Username || req.Password != a.auth.Password) {
-		a.loginLimiter.RecordFailure(clientIP)
-		c.JSON(401, gin.H{"error": "用户名或密码错误"})
-		return
+	// 降级：检查配置文件中的默认管理员凭证。
+	// 未配置密码（空）时禁止走该分支，否则 admin+空密码即可登录。
+	// 恒定时间比较，避免逐字节短路造成的时序侧信道。
+	if !loginOK {
+		userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(a.auth.Username)) == 1
+		passOK := a.auth.Password != "" &&
+			subtle.ConstantTimeCompare([]byte(req.Password), []byte(a.auth.Password)) == 1
+		if !userOK || !passOK {
+			a.loginLimiter.RecordFailure(clientIP)
+			c.JSON(401, gin.H{"error": "用户名或密码错误"})
+			return
+		}
 	}
 
 	a.loginLimiter.Reset(clientIP)
@@ -746,6 +776,7 @@ func (a *API) login(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"token":    token,
 		"username": req.Username,
+		"role":     "admin",
 		"expires":  expiry,
 	})
 }
@@ -836,7 +867,8 @@ func (a *API) signToken(msg string) string {
 
 // verifyToken verifies the HMAC signature and expiry.
 func (a *API) verifyToken(token string) bool {
-	if !strings.HasPrefix(token, "sg-") {
+	// 空 JWTSecret 时签名密钥为空字符串，任何人都可离线伪造合法 Token
+	if a.auth.JWTSecret == "" || !strings.HasPrefix(token, "sg-") {
 		return false
 	}
 	// token 格式: sg-<msg>:<sig>
@@ -878,13 +910,20 @@ func (a *API) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if !a.verifyToken(token) {
-			c.JSON(401, gin.H{"error": "令牌无效或已过期", "code": "UNAUTHORIZED"})
-			c.Abort()
-			return
+	token := strings.TrimPrefix(auth, "Bearer ")
+	if !a.verifyToken(token) {
+		c.JSON(401, gin.H{"error": "令牌无效或已过期", "code": "UNAUTHORIZED"})
+		c.Abort()
+		return
+	}
+	// 将 Token 中的用户名注入 context，供审计（如命令下发的 Actor）使用
+	if body := strings.TrimPrefix(token, "sg-"); strings.Contains(body, ":") {
+		msg := body[:strings.LastIndex(body, ":")]
+		if parts := strings.Split(msg, ":"); len(parts) >= 3 {
+			c.Set("username", parts[0])
 		}
-		c.Next()
+	}
+	c.Next()
 	}
 }
 

@@ -7,7 +7,8 @@ agent:
   data_dir: "/var/lib/serverguard"
   log_level: "info"
 
-# Hub 面板登录（改掉默认密码！）
+# Hub 面板登录
+# ⚠️ 安全启动校验：password/jwt_secret 若为空或仍为 CHANGE_ME*/admin123 等占位值，Hub 将拒绝启动
 web:
   enabled: true
   auth_enabled: true

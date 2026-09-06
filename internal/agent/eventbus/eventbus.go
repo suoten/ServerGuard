@@ -143,10 +143,15 @@ func (b *EventBus) Publish(event types.Event) {
 	select {
 	case b.queue <- event:
 	default:
-		// Queue full, drop oldest
+		// Queue full, drop oldest.
+		// 全程非阻塞：消费端被慢 handler 卡住时宁可丢新事件，
+		// 也绝不让 Publish（告警热路径）阻塞调用方。
 		select {
 		case <-b.queue:
-			b.queue <- event
+		default:
+		}
+		select {
+		case b.queue <- event:
 		default:
 		}
 	}

@@ -922,6 +922,16 @@ func (g *DataGovernGuard) CheckTSDBAnomaly(ctx context.Context) []TSDBAnomaly {
 // ArchiveTable 数据库自动归档管家
 // 读取表大小+日期字段 → 生成归档 SQL → 验证行数 → 清理 → 建视图兼容
 func (g *DataGovernGuard) ArchiveTable(ctx context.Context, dsn, database, table, dateColumn string, beforeDate string) error {
+	// 输入校验：标识符与日期来自 API 请求体，必须白名单校验并反引号引用，杜绝 SQL 注入
+	for name, ident := range map[string]string{"database": database, "table": table, "date_column": dateColumn} {
+		if err := validateSQLIdentifier(ident); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	if _, err := time.Parse("2006-01-02", beforeDate); err != nil {
+		return fmt.Errorf("before_date 必须为 YYYY-MM-DD 格式: %w", err)
+	}
+
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
@@ -930,8 +940,8 @@ func (g *DataGovernGuard) ArchiveTable(ctx context.Context, dsn, database, table
 
 	// Step 1: 查询要归档的行数
 	var rowCount int64
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s < '%s'", database, table, dateColumn, beforeDate)
-	err = db.QueryRowContext(ctx, countQuery).Scan(&rowCount)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s` WHERE `%s` < ?", database, table, dateColumn)
+	err = db.QueryRowContext(ctx, countQuery, beforeDate).Scan(&rowCount)
 	if err != nil {
 		return fmt.Errorf("查询归档行数失败: %w", err)
 	}
@@ -941,21 +951,21 @@ func (g *DataGovernGuard) ArchiveTable(ctx context.Context, dsn, database, table
 
 	// Step 2: 创建归档表
 	archiveTable := table + "_archive"
-	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s LIKE %s.%s", database, archiveTable, database, table))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s` LIKE `%s`.`%s`", database, archiveTable, database, table))
 	if err != nil {
 		return fmt.Errorf("创建归档表失败: %w", err)
 	}
 
 	// Step 3: 迁移数据
-	_, err = db.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s.%s SELECT * FROM %s.%s WHERE %s < '%s'",
-		database, archiveTable, database, table, dateColumn, beforeDate))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("INSERT INTO `%s`.`%s` SELECT * FROM `%s`.`%s` WHERE `%s` < ?",
+		database, archiveTable, database, table, dateColumn), beforeDate)
 	if err != nil {
 		return fmt.Errorf("迁移数据失败: %w", err)
 	}
 
 	// Step 4: 验证归档行数
 	var archivedCount int64
-	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", database, archiveTable)).Scan(&archivedCount)
+	err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`%s`", database, archiveTable)).Scan(&archivedCount)
 	if err != nil {
 		return fmt.Errorf("验证归档行数失败: %w", err)
 	}
@@ -964,13 +974,13 @@ func (g *DataGovernGuard) ArchiveTable(ctx context.Context, dsn, database, table
 	}
 
 	// Step 5: 清理原表旧数据
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s.%s WHERE %s < '%s'", database, table, dateColumn, beforeDate))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `%s` < ?", database, table, dateColumn), beforeDate)
 	if err != nil {
 		return fmt.Errorf("清理原表数据失败: %w", err)
 	}
 
 	// Step 6: 创建视图兼容查询
-	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s_all AS SELECT * FROM %s.%s UNION ALL SELECT * FROM %s.%s",
+	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE OR REPLACE VIEW `%s`.`%s_all` AS SELECT * FROM `%s`.`%s` UNION ALL SELECT * FROM `%s`.`%s`",
 		database, table, database, table, database, archiveTable))
 	if err != nil {
 		// 视图创建失败不影响归档
@@ -992,4 +1002,17 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+// validateSQLIdentifier 校验 MySQL 标识符（库名/表名/列名）：
+// 仅允许字母、数字、下划线、$，长度 ≤64（MySQL 标识符上限）。
+func validateSQLIdentifier(name string) error {
+	if name == "" || len(name) > 64 {
+		return fmt.Errorf("标识符为空或超过 64 字符")
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '$') {
+			return fmt.Errorf("标识符包含非法字符 %q", r)
+		}
+	}
+	return nil
 }

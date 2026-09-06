@@ -30,6 +30,7 @@ type HubClient struct {
 	maxBackoff        time.Duration
 	heartbeatInterval time.Duration
 	commandHandlers   map[string]CommandHandler
+	cmdSem            chan struct{} // 命令处理并发上限
 }
 
 // CommandHandler handles a command from Hub and may return a result payload
@@ -48,6 +49,7 @@ func NewHubClient(bus *eventbus.EventBus, hubURL, agentID, token string) *HubCli
 		maxBackoff:        300 * time.Second,
 		heartbeatInterval: 30 * time.Second,
 		commandHandlers:   make(map[string]CommandHandler),
+		cmdSem:            make(chan struct{}, 8),
 	}
 }
 
@@ -214,7 +216,32 @@ func (c *HubClient) ListenForCommands(ctx context.Context) {
 		}
 
 		// Handle command
-		go c.handleCommand(ctx, msg)
+		// 并发上限 + panic 隔离：Hub 异常刷命令或 handler 慢时不能无界堆积 goroutine
+		select {
+		case c.cmdSem <- struct{}{}:
+		default:
+			fmt.Printf("[HubClient] 命令处理并发已达上限，丢弃命令: %s\n", msg.Type)
+			c.send(ctx, HubMessage{
+				Type:    "command_response",
+				AgentID: c.agentID,
+				Data: map[string]interface{}{
+					"command_id": commandIDFromData(msg.Data),
+					"command":    msg.Type,
+					"success":    false,
+					"error":      "command handler busy, dropped",
+				},
+			})
+			return
+		}
+		go func() {
+			defer func() { <-c.cmdSem }()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "[HubClient] command handler panicked: %v\n", r)
+				}
+			}()
+			c.handleCommand(ctx, msg)
+		}()
 	}
 }
 

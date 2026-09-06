@@ -1,7 +1,10 @@
 package multi
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -182,14 +185,19 @@ func (m *TenantManager) ApplyRLSPolicies() error {
 }
 
 // GenerateAPIKey generates a new API key for a tenant.
+// 使用 crypto/rand 生成 256-bit 随机密钥，杜绝时间戳可预测问题。
 func GenerateAPIKey(tenantID string) string {
-	// In production, use crypto/rand to generate a secure key
-	return fmt.Sprintf("sg_%s_%x", tenantID, time.Now().UnixNano())
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand unavailable: %v", err))
+	}
+	return fmt.Sprintf("sg_%s_%s", tenantID, hex.EncodeToString(buf))
 }
 
 // HashAPIKey hashes an API key for storage.
+// API Key 是 256-bit 高熵随机值，SHA-256 单向哈希足够；
+// 与 GenerateAPIKey 的输出格式配套，查找时按哈希等值匹配。
 func HashAPIKey(key string) string {
-	// In production, use bcrypt or Argon2
-	// For now, simple hash
-	return fmt.Sprintf("%x", key)
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }

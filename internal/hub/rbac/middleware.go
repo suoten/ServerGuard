@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -114,12 +115,20 @@ func GetTenantID(ctx context.Context) string {
 	return ""
 }
 
-// GenerateToken 生成 JWT token
+// GenerateToken 生成 JWT token（24 小时过期，避免 Token 永久有效）
 func (m *RBACMiddleware) GenerateToken(userID string, role Role, tenantID string) (string, error) {
+	now := time.Now()
 	claims := &JWTClaims{
 		UserID:   userID,
 		Role:     role,
 		TenantID: tenantID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(24 * time.Hour)),
+			Issuer:    "serverguard-rbac",
+			Subject:   userID,
+		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(m.jwtSecret)

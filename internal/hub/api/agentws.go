@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -61,13 +62,14 @@ func (a *API) handleAgentWS(c *gin.Context) {
 	}
 
 	// Validate the shared registration token.
+	// fail-closed：未配置共享 Token 时一律拒绝，任何 Bearer 值都不能接入。
 	auth := c.GetHeader("Authorization")
 	token := strings.TrimPrefix(auth, "Bearer ")
-	if !strings.HasPrefix(auth, "Bearer ") || token == "" {
+	if !strings.HasPrefix(auth, "Bearer ") || token == "" || a.auth.JWTSecret == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing bearer token"})
 		return
 	}
-	if a.auth.JWTSecret != "" && token != a.auth.JWTSecret {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(a.auth.JWTSecret)) != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid agent token"})
 		return
 	}

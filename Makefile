@@ -1,7 +1,7 @@
 # ServerGuard Makefile
 # Build, test, and package the complete ServerGuard suite
 
-VERSION ?= 0.1.0
+VERSION ?= 0.3.0
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GO_VERSION := $(shell go version | awk '{print $$3}')
@@ -15,7 +15,8 @@ LDFLAGS := -X 'github.com/suoten/serverguard/internal/version.Version=$(VERSION)
            -X 'github.com/suoten/serverguard/internal/version.OS=$(GOOS)' \
            -X 'github.com/suoten/serverguard/internal/version.Arch=$(GOARCH)'
 
-CGO_ENABLED ?= 1
+# 项目使用纯 Go 的 modernc.org/sqlite，无需 CGO；置 0 让交叉编译不依赖 C 工具链
+CGO_ENABLED ?= 0
 
 .PHONY: all agent hub sgctl clean test vet fmt build-web install-deps
 
@@ -38,11 +39,11 @@ build: agent hub sgctl
 
 # Cross-compile for Linux amd64
 build-linux-amd64:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 $(MAKE) build
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(MAKE) build
 
 # Cross-compile for Linux arm64
 build-linux-arm64:
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 $(MAKE) build
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(MAKE) build
 
 # Build web frontend
 build-web:
@@ -77,10 +78,12 @@ install-deps:
 package: build-linux-amd64
 	mkdir -p release
 	cp bin/serverguard-agent release/
+	cp bin/serverguard-hub release/
 	cp bin/sgctl release/
-	cp scripts/install.sh release/
-	cp scripts/serverguard.service release/
-	tar -czf release/serverguard-$(VERSION)-linux-amd64.tar.gz -C release serverguard-agent sgctl install.sh serverguard.service
+	cp deploy/install.sh release/
+	cp deploy/serverguard-agent.service release/
+	cp configs/serverguard.yaml release/
+	tar -czf release/serverguard-$(VERSION)-linux-amd64.tar.gz -C release serverguard-agent serverguard-hub sgctl install.sh serverguard.service serverguard.yaml
 
 # Run agent locally
 run: agent

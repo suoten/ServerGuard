@@ -2,6 +2,7 @@ package upgrader
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -184,23 +185,43 @@ func (u *Upgrader) PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
 		if strings.HasPrefix(dlURL, "/") && u.downloadURL != "" {
 			dlURL = u.downloadURL + dlURL
 		}
+		// 只允许 http(s) 下载地址，杜绝 file:// 等协议注入
+		if !strings.HasPrefix(dlURL, "https://") && !strings.HasPrefix(dlURL, "http://") {
+			return fmt.Errorf("refusing unsafe download_url: %q", dlURL)
+		}
 		if err := u.downloadBinary(ctx, dlURL, binaryPath, info.SHA256); err != nil {
 			return fmt.Errorf("download failed: %w", err)
 		}
 	}
 
-	// Step 2: Verify SHA-256
-	if info.SHA256 != "" {
+	// Step 2: Verify SHA-256（强制：更新服务器必须提供校验和；离线本地包除外）
+	if !info.Local {
+		if info.SHA256 == "" {
+			return fmt.Errorf("update server did not provide sha256, refusing upgrade")
+		}
 		if err := u.verifySHA256(binaryPath, info.SHA256); err != nil {
 			return fmt.Errorf("SHA-256 verification failed: %w", err)
 		}
 	}
 
-	// Step 3: Verify Ed25519 signature (if key is set)
-	if info.Signature != "" && u.signingKey != "" {
-		if err := u.verifySignature(binaryPath, info.Signature); err != nil {
+	// Step 3: Verify Ed25519 signature（fail-closed：配置了公钥就必须有有效签名）
+	if u.signingKey != "" {
+		if info.Signature == "" {
+			return fmt.Errorf("update server did not provide signature, refusing upgrade")
+		}
+		pubKey, err := parseEd25519PublicKey(u.signingKey)
+		if err != nil {
+			return fmt.Errorf("invalid signing key config: %w", err)
+		}
+		if err := VerifyPackageSignature(binaryPath, info.Signature, pubKey); err != nil {
 			return fmt.Errorf("signature verification failed: %w", err)
 		}
+	} else if !info.Local {
+		// 未配置公钥时仍允许升级（兼容存量部署），但明确告警留痕
+		u.eventBus.PublishAlert(types.AlertWarning, "upgrade",
+			"升级签名校验未启用",
+			"未配置升级签名公钥（upgrader.signing_key），本次升级仅依赖 SHA-256 校验",
+			"upgrade-001")
 	}
 
 	// Step 4: Migrate config if needed
@@ -342,13 +363,28 @@ func (u *Upgrader) verifySHA256(path, expectedHash string) error {
 }
 
 // verifySignature verifies the Ed25519 signature.
+// Deprecated: PerformUpgrade now uses VerifyPackageSignature with a parsed key.
 func (u *Upgrader) verifySignature(path, signature string) error {
-	// In production, use crypto/ed25519.Verify
-	// For now, just check non-empty
-	if signature == "" {
-		return fmt.Errorf("empty signature")
+	if u.signingKey == "" {
+		return fmt.Errorf("signing key not configured")
 	}
-	return nil
+	pubKey, err := parseEd25519PublicKey(u.signingKey)
+	if err != nil {
+		return err
+	}
+	return VerifyPackageSignature(path, signature, pubKey)
+}
+
+// parseEd25519PublicKey 解析十六进制编码的 Ed25519 公钥。
+func parseEd25519PublicKey(keyHex string) (ed25519.PublicKey, error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(keyHex))
+	if err != nil {
+		return nil, fmt.Errorf("public key is not valid hex: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("public key length %d, expected %d", len(raw), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
 }
 
 // copyFile copies a file from src to dst.

@@ -27,6 +27,10 @@ type Storage struct {
 	// 向宝塔学习：缓存 retention policy，不每次维护都查 DB
 	cachedRP   RetentionPolicy
 	rpLoaded   bool
+
+	// stopCh 关闭后 maintenanceLoop 退出，Close 后不再触碰已关闭的 db
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // New creates a new Storage instance and initializes the database.
@@ -53,7 +57,7 @@ func New(path string) (*Storage, error) {
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
-	s := &Storage{db: db, path: path}
+	s := &Storage{db: db, path: path, stopCh: make(chan struct{})}
 
 	// Initialize schema
 	if err := s.initSchema(); err != nil {
@@ -67,8 +71,9 @@ func New(path string) (*Storage, error) {
 	return s, nil
 }
 
-// Close closes the database.
+// Close stops the maintenance loop and closes the database.
 func (s *Storage) Close() error {
+	s.stopOnce.Do(func() { close(s.stopCh) })
 	return s.db.Close()
 }
 
@@ -323,7 +328,12 @@ func (s *Storage) maintenanceLoop() {
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
 		s.walCheckpoint()
 		s.purgeOldData()
 	}

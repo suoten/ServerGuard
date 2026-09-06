@@ -1,4 +1,4 @@
-# ServerGuard 发布打包脚本
+﻿# ServerGuard 发布打包脚本
 # 用法: powershell -ExecutionPolicy Bypass -File make-release.ps1
 # 产出: release/serverguard-<platform>.tar.gz (每个包包含二进制+安装脚本+配置+文档)
 
@@ -60,7 +60,11 @@ foreach ($p in $platforms) {
         # to avoid PowerShell treating stderr output as a terminating error
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        & go build -ldflags="-s -w" -o $out $c.Cmd 2>&1 | Out-Null
+        $commit = (git rev-parse --short HEAD 2>$null)
+        if (-not $commit) { $commit = "unknown" }
+        $buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $verLdflags = "-s -w -X 'github.com/suoten/serverguard/internal/version.Version=$Version' -X 'github.com/suoten/serverguard/internal/version.GitCommit=$commit' -X 'github.com/suoten/serverguard/internal/version.BuildTime=$buildTime'"
+        & go build -ldflags="$verLdflags" -o $out $c.Cmd 2>&1 | Out-Null
         $buildExit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
         if ($buildExit -ne 0) {

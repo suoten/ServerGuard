@@ -25,9 +25,14 @@ import (
 
 // promMetrics GET /metrics —— Prometheus 文本暴露格式。
 func (a *API) promMetrics(c *gin.Context) {
-	// 可选访问令牌保护
+	// 可选访问令牌保护：优先 Authorization: Bearer（不进访问/代理日志），
+	// 兼容旧版 ?token= query 传参
 	if tok, err := a.storage.Get("metrics_token"); err == nil && tok != "" {
-		if c.Query("token") != tok {
+		provided := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		if provided == "" {
+			provided = c.Query("token")
+		}
+		if provided != tok {
 			c.String(http.StatusForbidden, "forbidden: invalid metrics token\n")
 			return
 		}

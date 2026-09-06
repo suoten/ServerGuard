@@ -89,6 +89,8 @@ func (e *PostKillEvaluator) Evaluate(evalID string) {
 	eval.EvalDone = true
 	preState := eval.PreKillState
 	target := eval.Target
+	// 评估已完成，从 map 中移除，避免长期运行下 pendingEvals 无界增长
+	delete(e.pendingEvals, evalID)
 	e.mu.Unlock()
 
 	// 采集当前系统状态
