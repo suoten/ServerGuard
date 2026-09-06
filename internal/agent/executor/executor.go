@@ -35,11 +35,13 @@ type Executor struct {
 
 // New creates a new Executor.
 func New(sm *safety.SafetyManager, bus *eventbus.EventBus, store *storage.Storage) *Executor {
+	eval := safety.NewPostKillEvaluator(bus)
+	eval.SetSafetyManager(sm) // Kill 后系统恶化 → 真正触发紧急停止
 	return &Executor{
 		safety:       sm,
 		eventBus:     bus,
 		storage:      store,
-		postKillEval: safety.NewPostKillEvaluator(bus),
+		postKillEval: eval,
 	}
 }
 
@@ -437,9 +439,8 @@ func (e *Executor) executeKill(ctx context.Context, action types.Action, target 
 		return result
 	}
 
-	// Kill前记录系统状态用于事后评估
-	preCPU, preAbnormal := e.getSystemState()
-	e.postKillEval.RecordPreKillState(target.ProcessName, preCPU, 500, float64(preAbnormal))
+	// Kill前记录系统状态用于事后评估（自动采集真实 CPU/可用内存/负载）
+	e.postKillEval.RecordPreKillStateAuto(target.ProcessName)
 
 	for _, p := range pids {
 		// Safety check

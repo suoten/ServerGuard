@@ -307,7 +307,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/opt/serverguard/serverguard-agent -config /opt/serverguard/config.yaml
 WorkingDirectory=/opt/serverguard
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 # ====== 资源约束策略（自适应：按服务器总内存设定）======

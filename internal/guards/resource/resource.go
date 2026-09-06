@@ -589,6 +589,15 @@ func (g *ResourceGuard) killLargestProcess() {
 	baotaDominant := baotaPID > 0 && baotaRSS >= baotaReliefMinRSS && baotaRSS >= largestRSS
 
 	if largestPID > 0 && largestRSS > 100*1024*1024 && !baotaDominant { // > 100MB
+		// 维护窗口/远程暂停期间不做 OOM Kill——运维正在变更时杀进程极易雪上加霜
+		if g.safety.ShouldPauseDangerousActions() {
+			g.eventBus.PublishAlert(types.AlertWarning, "resource",
+				"OOM防护: 处于维护窗口/暂停期，跳过自动终止",
+				fmt.Sprintf("内存严重不足（最大非白名单进程 %s PID %d，RSS %.0fMB），但当前处于维护窗口或远程暂停期，不自动终止。请尽快手动处理",
+					largestName, largestPID, float64(largestRSS)/1024/1024),
+				"oom-kill-paused-001")
+			return
+		}
 		// Double-check with safety manager
 		if err := g.safety.CheckKillPermission(largestName, largestPID); err != nil {
 			g.eventBus.PublishAlert(types.AlertWarning, "resource",
@@ -608,6 +617,9 @@ func (g *ResourceGuard) killLargestProcess() {
 
 		p := process.Process{Pid: largestPID}
 		p.Terminate()
+		// 记账：不记录则 Kill 预算/最小间隔/熔断器/自动急停对 OOM kill 全部失明，
+		// 被 kill 后又被拉起再膨胀的进程会形成无限 OOM kill 循环
+		g.safety.RecordKill(largestPID, largestName, true)
 
 		g.eventBus.PublishAlert(types.AlertCritical, "resource",
 			fmt.Sprintf("OOM防护: 已终止进程 %s (PID %d)", largestName, largestPID),

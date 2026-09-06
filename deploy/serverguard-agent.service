@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/opt/serverguard/serverguard-agent -config /opt/serverguard/config.yaml
 WorkingDirectory=/opt/serverguard
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 # ====== 资源约束策略（向宝塔学习：按服务器实际配置自适应）======

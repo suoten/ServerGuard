@@ -579,12 +579,9 @@ func (g *SecurityGuard) checkAbnormalProcesses(ctx context.Context) {
 		"sysupdate":       true,
 		"update.sh":       true,
 		"nonce":           true,
-		// DDoS bots
-		" circum": true,
-		"ddos":    true,
-		"bot":     true,
-		// Reverse shells / backdoors
-		"busybox": true, // Often used in IoT malware (only suspicious if in /tmp)
+		// 注意：不收录 "bot"/"ddos"/"busybox"/" circum" 等泛化名称 ——
+		// 合法爬虫/脚本/嵌入式 busybox 会被误杀；busybox 从 /tmp 运行的
+		// 场景已由下方"可疑目录运行"规则（含 exe 路径双重确认）覆盖。
 	}
 
 	// Suspicious working directories (malware often runs from these)
@@ -622,8 +619,10 @@ func (g *SecurityGuard) checkAbnormalProcesses(ctx context.Context) {
 				continue
 			}
 
-			// Kill the threat
-			p.Kill()
+			// 走安全审批（预算/熔断/紧急停止/白名单），不绕过五层安全阀
+			if !g.killWithApproval(name, pid, "已知恶意/挖矿进程") {
+				continue
+			}
 			g.eventBus.PublishAlert(types.AlertCritical, "security",
 				fmt.Sprintf("已清除恶意进程: %s (PID %d)", name, pid),
 				fmt.Sprintf("检测到已知恶意/挖矿进程 %s (PID %d)，已自动终止。命令行: %s，工作目录: %s", name, pid, cmdline, cwd),
@@ -648,7 +647,11 @@ func (g *SecurityGuard) checkAbnormalProcesses(ctx context.Context) {
 					if exePath, err := p.Exe(); err == nil && strings.HasPrefix(exePath, sp) {
 						// Auto-kill processes running executables from /tmp or /dev/shm
 						// (legitimate services don't run from these directories)
-						p.Kill()
+						// 走安全审批：临时目录跑构建/临时工具属合法场景，必须可被
+						// 白名单/预算/紧急停止拦住
+						if !g.killWithApproval(name, pid, "从可疑目录运行可执行文件") {
+							break
+						}
 						g.eventBus.PublishAlert(types.AlertCritical, "security",
 							fmt.Sprintf("已清除可疑进程: %s (PID %d)", name, pid),
 							fmt.Sprintf("进程 %s (PID %d) 从可疑目录 %s 运行，已自动终止。命令行: %s，可执行文件: %s",
@@ -673,6 +676,44 @@ func (g *SecurityGuard) checkAbnormalProcesses(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// killWithApproval 在杀灭威胁进程前走一遍完整安全审批：
+// CheckKillPermission（Kill 预算/熔断器/紧急停止/硬白名单/PID 保护）
+// + RecordKill（记账，让自动急停条件"1 小时 >10 次 kill"可见）。
+// 返回是否实际执行了杀灭。审批被拒时发一条 Warning 告警说明原因，
+// 避免管理员看到"检测到威胁"却不知道为什么没处理。
+func (g *SecurityGuard) killWithApproval(name string, pid int32, reason string) bool {
+	if g.safety != nil {
+		if err := g.safety.CheckKillPermission(name, pid); err != nil {
+			g.eventBus.PublishAlert(types.AlertWarning, "security",
+				fmt.Sprintf("威胁进程处理被安全机制拦截: %s (PID %d)", name, pid),
+				fmt.Sprintf("检测到%s %s (PID %d)，但安全审批拒绝了终止动作：%v。请人工确认后处理",
+					reason, name, pid, err),
+				"abnormal-process-blocked-001")
+			return false
+		}
+	}
+	if err := g.killProcess(pid); err != nil {
+		g.eventBus.PublishAlert(types.AlertWarning, "security",
+			fmt.Sprintf("终止进程失败: %s (PID %d)", name, pid),
+			fmt.Sprintf("%s：SIGKILL 发送失败：%v", reason, err),
+			"abnormal-process-001")
+		return false
+	}
+	if g.safety != nil {
+		g.safety.RecordKill(pid, name, true)
+	}
+	return true
+}
+
+// killProcess 发送 SIGKILL（Windows 上由 gopsutil Terminate 处理）。
+func (g *SecurityGuard) killProcess(pid int32) error {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return err
+	}
+	return p.Kill()
 }
 
 // isWhitelisted checks if a process is in the safety whitelist.
