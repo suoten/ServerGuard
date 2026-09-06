@@ -231,7 +231,9 @@ func (c *HubClient) ListenForCommands(ctx context.Context) {
 					"error":      "command handler busy, dropped",
 				},
 			})
-			return
+			// 必须继续读循环：return 会永久退出命令监听，
+			// 之后 Hub 的任何命令（含 guard.pause）都收不到了
+			continue
 		}
 		go func() {
 			defer func() { <-c.cmdSem }()

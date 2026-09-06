@@ -392,8 +392,12 @@ func (a *API) setupRoutes() {
 		if a.auth.Enabled {
 			dbg := r.Group("/debug", a.authMiddleware())
 			dbg.GET(strings.TrimPrefix(p, "/debug"), h)
+		} else if idx := strings.Index(p, "/debug/pprof/"); idx == 0 && p == "/debug/pprof/" {
+			// 认证关闭时不注册任何 pprof 端点（原样暴露可被未认证用户
+			// 导出内存中的 Token/密码明文，也可被用作 CPU DoS）
+			fmt.Println("[Security] auth_enabled=false，pprof 端点已禁用；如需排查请开启面板认证")
 		} else {
-			r.GET(p, h)
+			continue
 		}
 	}
 

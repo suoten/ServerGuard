@@ -693,9 +693,10 @@ func (g *CertGuard) attemptRenewal(ctx context.Context, cert types.CertInfo) {
 			"cert-renew-001")
 		g.recordAudit("renew_cert", cert.Domain, "通过ACME自动续期成功", "success", "")
 		g.recordAction("renew_cert", cert.Domain, fmt.Sprintf("ACME续期成功: %s", cert.Domain), true, "")
-		// 续期后验证：reload + HTTPS 探测
+		// 续期后验证：reload + HTTPS 探测；验证失败回滚到安装前的备份
+		// （原实现新旧路径传同一个文件，cp A A 回滚是空操作）
 		if g.postRenewal != nil {
-			g.postRenewal.ReloadAndVerify(cert.Domain, cert.CertPath, cert.CertPath)
+			g.postRenewal.ReloadAndVerify(cert.Domain, cert.CertPath, cert.CertPath+".sgbak")
 		} else {
 			g.reloadNginx(ctx)
 		}
@@ -826,8 +827,17 @@ func (g *CertGuard) tryACMEWithCA(ctx context.Context, domain, ca string) error 
 	}
 
 	// Install the certificate to BaoTa's cert directory (if BaoTa exists)
-	installCmdStr := fmt.Sprintf("%s --install-cert -d %s --key-file /www/server/panel/vhost/cert/%s/privkey.pem --fullchain-file /www/server/panel/vhost/cert/%s/fullchain.pem",
-		acmeSh, domain, domain, domain)
+	// 覆盖前备份现行证书+私钥：续期失败/验证失败时可回滚到旧证书，
+	// 否则"删了旧的又没签出新的"会让站点 HTTPS 直接挂掉
+	certDir := fmt.Sprintf("/www/server/panel/vhost/cert/%s", domain)
+	for _, f := range []string{"fullchain.pem", "privkey.pem"} {
+		src := filepath.Join(certDir, f)
+		if data, err := os.ReadFile(src); err == nil {
+			_ = os.WriteFile(src+".sgbak", data, 0600)
+		}
+	}
+	installCmdStr := fmt.Sprintf("%s --install-cert -d %s --key-file %s/privkey.pem --fullchain-file %s/fullchain.pem",
+		acmeSh, domain, certDir, certDir)
 	installCmd := exec.CommandContext(ctx, "sh", "-c", installCmdStr)
 	if _, err := installCmd.CombinedOutput(); err != nil {
 		// 安装到宝塔目录失败不是致命错误（可能不是宝塔环境），证书已在 acme.sh 默认目录
@@ -836,11 +846,24 @@ func (g *CertGuard) tryACMEWithCA(ctx context.Context, domain, ca string) error 
 				fmt.Sprintf("acme.sh 已签发证书但安装到宝塔目录失败: %v。证书已保存在 acme.sh 默认目录。", err),
 				"cert-renew-001")
 	} else {
-		// 安装成功后 reload nginx
-		reloadCmd := exec.CommandContext(ctx, "sh", "-c", "nginx -s reload 2>/dev/null || /etc/init.d/nginx reload 2>/dev/null || true")
-		reloadCmd.Run()
+		// 安装成功后 reload nginx：先 nginx -t 预检，reload 失败显式告警
+		// （原实现 `|| true` 吞掉所有错误，证书装坏了也照报成功）
+		if err := reloadNginxChecked(ctx); err != nil {
+			g.eventBus.PublishAlert(types.AlertError, "cert",
+				fmt.Sprintf("nginx reload 失败: %s", domain),
+				fmt.Sprintf("证书已安装但 nginx reload 失败: %v。旧证书备份在 %s/*.sgbak，可手动恢复", err, certDir),
+				"cert-renew-001")
+		}
 	}
 	return nil
+}
+
+// reloadNginxChecked nginx -t 预检通过后才 reload，失败返回错误供调用方告警。
+func reloadNginxChecked(ctx context.Context) error {
+	if err := exec.CommandContext(ctx, "nginx", "-t").Run(); err != nil {
+		return fmt.Errorf("nginx config test failed: %w", err)
+	}
+	return exec.CommandContext(ctx, "nginx", "-s", "reload").Run()
 }
 
 // findAcmeSh 查找 acme.sh 可执行文件路径。

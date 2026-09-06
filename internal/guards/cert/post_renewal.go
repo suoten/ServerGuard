@@ -3,6 +3,7 @@ package cert
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -102,13 +103,23 @@ func (h *PostRenewalHandler) verifyHTTPS(domain string) bool {
 }
 
 // rollbackCert 回滚到旧证书。
+// 证书与私钥必须成对恢复（只回滚证书不回滚私钥会导致证书/私钥不匹配，
+// nginx 起不来）；旧证书备份约定为 <原路径>.sgbak（安装前由 cert.go 创建）。
 func (h *PostRenewalHandler) rollbackCert(domain, newCertPath, oldCertPath string) {
 	if oldCertPath == "" {
 		return
 	}
-	// 复制旧证书回原位置
+	// 恢复旧证书
 	exec.Command("cp", oldCertPath, newCertPath).Run()
-	// 再次 reload
+	// 按宝塔目录约定恢复配对私钥：fullchain.pem ↔ privkey.pem
+	if idx := strings.LastIndex(newCertPath, "fullchain.pem"); idx > 0 {
+		keyPath := newCertPath[:idx] + "privkey.pem"
+		keyBak := keyPath + ".sgbak"
+		if _, err := os.Stat(keyBak); err == nil {
+			exec.Command("cp", keyBak, keyPath).Run()
+		}
+	}
+	// 再次 reload（回滚后 nginx -t 应当通过——恢复的是此前可用的组合）
 	h.reloadWebServer()
 }
 

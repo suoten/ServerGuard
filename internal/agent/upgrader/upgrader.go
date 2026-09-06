@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,9 +18,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/suoten/serverguard/internal/agent/eventbus"
 	"github.com/suoten/serverguard/internal/types"
 	"github.com/suoten/serverguard/internal/version"
-	"github.com/suoten/serverguard/internal/agent/eventbus"
 )
 
 // Upgrader implements §8.8: Upgrade and Version Migration.
@@ -185,9 +186,10 @@ func (u *Upgrader) PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
 		if strings.HasPrefix(dlURL, "/") && u.downloadURL != "" {
 			dlURL = u.downloadURL + dlURL
 		}
-		// 只允许 http(s) 下载地址，杜绝 file:// 等协议注入
-		if !strings.HasPrefix(dlURL, "https://") && !strings.HasPrefix(dlURL, "http://") {
-			return fmt.Errorf("refusing unsafe download_url: %q", dlURL)
+		// 只允许 https 下载（localhost/127.0.0.1 例外供测试），杜绝 file://
+		// 等协议注入；明文 http 下校验和与二进制可被同时篡改，SHA-256 形同虚设
+		if !strings.HasPrefix(dlURL, "https://") && !isLocalDownload(dlURL) {
+			return fmt.Errorf("refusing insecure download_url (http only allowed for localhost): %q", dlURL)
 		}
 		if err := u.downloadBinary(ctx, dlURL, binaryPath, info.SHA256); err != nil {
 			return fmt.Errorf("download failed: %w", err)
@@ -233,7 +235,7 @@ func (u *Upgrader) PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
 	}
 
 	// Step 5: Backup current binary (A/B switching)
-	currentBinary := filepath.Join(u.installDir, "serverguard-agent")
+	currentBinary := filepath.Join(u.installDir, agentBinaryName())
 	backupPath := filepath.Join(u.backupDir, fmt.Sprintf("serverguard-agent.%s.bak", u.currentVer))
 	if err := u.copyFile(currentBinary, backupPath); err != nil {
 		return fmt.Errorf("backup failed: %w", err)
@@ -249,8 +251,10 @@ func (u *Upgrader) PerformUpgrade(ctx context.Context, info *UpdateInfo) error {
 	}
 	// Atomic rename
 	if err := os.Rename(tmpPath, currentBinary); err != nil {
-		// Rollback
-		u.copyFile(backupPath, currentBinary)
+		// Rollback（原子恢复，绝不截断式覆盖在用二进制）
+		if rbErr := u.atomicRestore(backupPath, currentBinary); rbErr != nil {
+			return fmt.Errorf("replace failed (%v) AND rollback failed (%v) —— 请手动恢复 %s", err, rbErr, backupPath)
+		}
 		return fmt.Errorf("replace failed, rolled back: %w", err)
 	}
 
@@ -274,17 +278,16 @@ func (u *Upgrader) Rollback(ctx context.Context) error {
 
 	// Use the most recent backup
 	backupPath := backups[0]
-	currentBinary := filepath.Join(u.installDir, "serverguard-agent")
+	currentBinary := filepath.Join(u.installDir, agentBinaryName())
 
 	u.eventBus.PublishAlert(types.AlertWarning, "upgrade",
 		"开始回滚",
 		fmt.Sprintf("正在回滚到 %s", filepath.Base(backupPath)),
 		"upgrade-001")
 
-	if err := u.copyFile(backupPath, currentBinary); err != nil {
+	if err := u.atomicRestore(backupPath, currentBinary); err != nil {
 		return fmt.Errorf("rollback failed: %w", err)
 	}
-	os.Chmod(currentBinary, 0755)
 
 	u.eventBus.PublishAlert(types.AlertInfo, "upgrade",
 		"回滚完成",
@@ -437,4 +440,42 @@ func (u *Upgrader) RestartService() error {
 		return exec.Command("systemctl", "restart", "serverguard-agent").Run()
 	}
 	return exec.Command("sc", "stop", "ServerGuard").Run()
+}
+
+// agentBinaryName 返回当前平台的 Agent 二进制文件名（Windows 带 .exe）。
+func agentBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "serverguard-agent.exe"
+	}
+	return "serverguard-agent"
+}
+
+// isLocalDownload 允许对 localhost/127.0.0.1 使用明文 http（本地测试）。
+func isLocalDownload(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// atomicRestore 原子恢复：先把备份写到同目录临时文件再 rename 覆盖。
+// 直接对正在使用的二进制做截断式覆盖，写入中途崩溃会留下半写文件
+// ——systemd 拉不起来且 Agent 无力自救（变砖）。
+func (u *Upgrader) atomicRestore(src, dst string) error {
+	tmp := dst + ".restore"
+	if err := u.copyFile(src, tmp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0755); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
