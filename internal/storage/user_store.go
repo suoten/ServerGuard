@@ -196,17 +196,33 @@ func (s *Storage) GetUserCount() (int, error) {
 	return count, nil
 }
 
-// EnsureDefaultAdmin 确保默认管理员用户存在
+// EnsureDefaultAdmin 确保默认管理员用户存在。
+// 如果用户已存在但配置文件中的密码已变更（与数据库不匹配），
+// 则同步更新数据库密码，避免重启后登录报"密码错误"。
 func (s *Storage) EnsureDefaultAdmin(username, password string) error {
 	count, err := s.GetUserCount()
 	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return nil
+	if count == 0 {
+		// 创建默认管理员
+		_, err = s.CreateUser(username, password, "owner", "default")
+		return err
 	}
 
-	// 创建默认管理员
-	_, err = s.CreateUser(username, password, "owner", "default")
-	return err
+	// 用户已存在，检查密码是否需要同步
+	// 尝试用配置文件中的密码验证，如果失败说明密码已变更，需要同步
+	if _, err := s.VerifyUser(username, password); err != nil {
+		// 密码不匹配，查找用户 ID 并更新密码
+		users, err := s.ListUsers()
+		if err != nil {
+			return err
+		}
+		for _, u := range users {
+			if u.Username == username {
+				return s.UpdateUserPassword(u.ID, password)
+			}
+		}
+	}
+	return nil
 }

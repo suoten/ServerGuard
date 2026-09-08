@@ -292,6 +292,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import axios from 'axios'
+import { ElMessage } from 'element-plus'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import {
   WarningFilled, Odometer, Monitor, Bell, Search, Warning, DocumentChecked,
@@ -482,10 +483,18 @@ function onGlobalKeydown(e: KeyboardEvent) {
 }
 
 // Global axios interceptor: auto-logout on 401
+let tokenExpiredNotified = false
 axios.interceptors.response.use(
   (resp) => resp,
   (err) => {
     if (err?.response?.status === 401 && !isLoginPage.value) {
+      // 避免并发请求时重复弹窗
+      if (!tokenExpiredNotified) {
+        tokenExpiredNotified = true
+        const isExpired = err?.response?.data?.code === 'UNAUTHORIZED'
+        ElMessage.warning(isExpired ? '登录已过期，请重新登录' : '认证失败，请重新登录')
+        setTimeout(() => { tokenExpiredNotified = false }, 2000)
+      }
       localStorage.removeItem('sg_token')
       localStorage.removeItem('sg_user')
       delete axios.defaults.headers.common['Authorization']

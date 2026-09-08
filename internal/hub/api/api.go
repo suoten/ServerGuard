@@ -741,7 +741,7 @@ func (a *API) login(c *gin.Context) {
 			loginOK = true
 			a.loginLimiter.Reset(clientIP)
 			ts := time.Now().Unix()
-			expiry := ts + 86400 // 24 hours
+			expiry := ts + 86400*7 // 7 days
 			msg := fmt.Sprintf("%s:%d:%d", user.Username, ts, expiry)
 			sig := a.signToken(msg)
 			token := fmt.Sprintf("sg-%s:%s", msg, sig)
@@ -773,7 +773,7 @@ func (a *API) login(c *gin.Context) {
 
 	// Generate HMAC-signed token with expiry
 	ts := time.Now().Unix()
-	expiry := ts + 86400 // 24 hours
+	expiry := ts + 86400*7 // 7 days
 	msg := fmt.Sprintf("%s:%d:%d", req.Username, ts, expiry)
 	sig := a.signToken(msg)
 	token := fmt.Sprintf("sg-%s:%s", msg, sig)
@@ -987,9 +987,22 @@ func (a *API) saveSettings(c *gin.Context) {
 	}
 	if v, ok := req["username"].(string); ok && v != "" {
 		a.auth.Username = v
+		a.cfg.Web.Username = v
 	}
 	if v, ok := req["new_password"].(string); ok && v != "" {
 		a.auth.Password = v
+		a.cfg.Web.Password = v
+		// 同步更新数据库中的用户密码，避免配置文件与数据库密码不一致
+		// 导致重启后登录报"密码错误"
+		if a.storage != nil {
+			users, _ := a.storage.ListUsers()
+			for _, u := range users {
+				if u.Username == a.auth.Username {
+					_ = a.storage.UpdateUserPassword(u.ID, v)
+					break
+				}
+			}
+		}
 	}
 	if v, ok := req["baota_safe_mode"].(string); ok {
 		a.cfg.Baota.SafeMode = v
@@ -6045,6 +6058,17 @@ func (a *API) resetUserPassword(c *gin.Context) {
 	if err := a.storage.UpdateUserPassword(id, req.NewPassword); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
+	}
+
+	// 如果重置的是配置文件中的管理员密码，同步到配置文件
+	users, _ := a.storage.ListUsers()
+	for _, u := range users {
+		if u.ID == id && u.Username == a.auth.Username {
+			a.auth.Password = req.NewPassword
+			a.cfg.Web.Password = req.NewPassword
+			_ = a.cfg.Save(a.configPath)
+			break
+		}
 	}
 
 	confirmedBy := c.GetString("username")
