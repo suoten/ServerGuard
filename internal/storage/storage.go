@@ -15,8 +15,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/suoten/serverguard/internal/types"
 	"github.com/suoten/serverguard/internal/agent/ruleengine"
+	"github.com/suoten/serverguard/internal/types"
 )
 
 // Storage provides encrypted SQLite storage for the agent.
@@ -25,8 +25,8 @@ type Storage struct {
 	mu   sync.RWMutex
 	path string
 	// 向宝塔学习：缓存 retention policy，不每次维护都查 DB
-	cachedRP   RetentionPolicy
-	rpLoaded   bool
+	cachedRP RetentionPolicy
+	rpLoaded bool
 
 	// incidents 表 schema 是否已初始化（每实例一次，避免每次操作跑 DDL）
 	incidentSchemaReady bool
@@ -121,6 +121,7 @@ func (s *Storage) initSchema() error {
 		acked_by TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp);
+CREATE INDEX IF NOT EXISTS idx_alerts_resolved_ts ON alerts(resolved, timestamp DESC);
 	CREATE INDEX IF NOT EXISTS idx_alerts_level_resolved ON alerts(level, resolved);
 
 	-- Actions: executed actions log
@@ -670,12 +671,17 @@ func (s *Storage) GetTopRepeatedAlerts(since time.Time, minCount, limit int) ([]
 	return out, rows.Err()
 }
 
-// GetUnresolvedAlerts returns all unresolved alerts.
+// maxUnresolvedAlerts 单次返回的未解决告警上限。
+// 告警风暴时 resolved=0 可能堆积数十万行，无上限全量加载会拖垮整个进程
+// （面板 /api/alerts、健康分、报表、指标导出都会走到这里），曾导致 hub 反复假死/OOM。
+const maxUnresolvedAlerts = 500
+
+// GetUnresolvedAlerts returns the most recent unresolved alerts (capped).
 func (s *Storage) GetUnresolvedAlerts() ([]types.Alert, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query("SELECT id, level, title, message, source, rule_id, labels, timestamp FROM alerts WHERE resolved=0 ORDER BY timestamp DESC")
+	rows, err := s.db.Query("SELECT id, level, title, message, source, rule_id, labels, timestamp FROM alerts WHERE resolved=0 ORDER BY timestamp DESC LIMIT ?", maxUnresolvedAlerts)
 	if err != nil {
 		return nil, err
 	}
