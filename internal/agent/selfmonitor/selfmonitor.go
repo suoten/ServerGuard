@@ -100,6 +100,37 @@ func (s *SelfMonitor) Check() {
 			"agent-panic-001")
 	}
 
+	// 【内存泄漏修复】清理 latencyBuckets：保留最近 1000 个采样，丢弃旧数据
+	// latencyBuckets 按 10ms 粒度分桶，正常运行 5s 采集一次时每分钟新增 ~12 个桶，
+	// 一天新增 ~17000 个桶——虽然每个桶只有一个 int，但 map 的内存开销不可忽视。
+	// 每小时 Check() 被调用约 60 次（60s 周期），在此处做一次廉价清理：
+	// 只保留最大的 100 个桶（覆盖最常见的延迟范围），其余丢弃。
+	s.mu.Lock()
+	if len(s.latencyBuckets) > 100 {
+		// 找到前 100 个最常出现的桶，其余丢弃
+		type bucketEntry struct {
+			key   float64
+			count int
+		}
+		entries := make([]bucketEntry, 0, len(s.latencyBuckets))
+		for k, v := range s.latencyBuckets {
+			entries = append(entries, bucketEntry{k, v})
+		}
+		// 按 count 降序排序
+		for i := 1; i < len(entries); i++ {
+			for j := i; j > 0 && entries[j].count > entries[j-1].count; j-- {
+				entries[j], entries[j-1] = entries[j-1], entries[j]
+			}
+		}
+		// 保留前 100 个
+		newBuckets := make(map[float64]int, 100)
+		for i := 0; i < 100 && i < len(entries); i++ {
+			newBuckets[entries[i].key] = entries[i].count
+		}
+		s.latencyBuckets = newBuckets
+	}
+	s.mu.Unlock()
+
 	// Check process uptime
 	uptime := time.Since(s.startTime)
 	_ = uptime

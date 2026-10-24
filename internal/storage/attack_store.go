@@ -40,7 +40,11 @@ UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // SaveAttackEvent 保存攻击事件
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveAttackEvent(e *AttackEvent) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), attack event write skipped")
+	}
 	if e.ID == "" {
 		e.ID = uuid.New().String()
 	}
@@ -127,7 +131,11 @@ func (s *Storage) QueryBannedAttackEvents(limit int) ([]AttackEvent, error) {
 }
 
 // SaveAttackProfile 保存攻击画像
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveAttackProfile(p *AttackProfile) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), attack profile write skipped")
+	}
 	if p.ID == "" {
 		p.ID = uuid.New().String()
 	}
@@ -183,7 +191,11 @@ if err := rows.Scan(&p.ID, &p.SourceIP, &p.GeoLocation, &p.AttackTypes, &p.Total
 }
 
 // PurgeOldAttackEvents 清理过期攻击事件（默认保留 90 天，可通过参数自定义）
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) PurgeOldAttackEvents(retention ...time.Duration) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), attack events purge skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -197,7 +209,11 @@ func (s *Storage) PurgeOldAttackEvents(retention ...time.Duration) error {
 }
 
 // PurgeOldAttackProfiles 清理过期攻击画像（默认保留 1 年，可通过参数自定义）
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) PurgeOldAttackProfiles(retention ...time.Duration) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), attack profiles purge skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -212,7 +228,11 @@ func (s *Storage) PurgeOldAttackProfiles(retention ...time.Duration) error {
 
 // PurgeAttackEventsBySeverity 按严重级别差异化清理攻击事件。
 // severityRetention 映射：severity -> 保留时长。未在映射中的 severity 不清理。
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) PurgeAttackEventsBySeverity(severityRetention map[string]time.Duration) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), attack events purge by severity skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -114,6 +114,14 @@ func (d *GhostFileDetector) Detect() []GhostFile {
 				continue
 			}
 
+			// 排除 ServerGuard 自身的文件（db、WAL、SHM）
+			// 这些文件在 WAL 模式下会被频繁创建/删除/checkpoint，
+			// 产生大量幽灵文件误报，且杀掉 serverguard 进程会导致监控中断
+			originalPathForCheck := strings.TrimSuffix(target, " (deleted)")
+			if isServerGuardFile(originalPathForCheck) {
+				continue
+			}
+
 			// 去重
 			dedupKey := fmt.Sprintf("%d-%s", pid, target)
 			if seen[dedupKey] {
@@ -580,6 +588,23 @@ func processExists(pid int32) bool {
 	// /proc/{pid} 目录存在意味着进程仍存活
 	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
 	return err == nil
+}
+
+// isServerGuardFile 检查路径是否为 ServerGuard 自身的数据文件。
+// serverguard.db、serverguard.db-wal、serverguard.db-shm 在 WAL 模式下
+// 会被频繁创建/删除/checkpoint，产生大量幽灵文件误报。
+// 杀掉 serverguard 进程释放这些句柄会导致监控中断，得不偿失。
+func isServerGuardFile(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	// 匹配 serverguard.db、serverguard.db-wal、serverguard.db-shm、serverguard.db-journal 等
+	if strings.HasPrefix(base, "serverguard.db") {
+		return true
+	}
+	// 匹配 serverguard 的备份数据库文件
+	if strings.HasPrefix(base, "serverguard.db.bak.") {
+		return true
+	}
+	return false
 }
 
 // isCriticalProcess 检查是否为关键系统进程

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,6 +36,13 @@ type Storage struct {
 	// stopCh 关闭后 maintenanceLoop 退出，Close 后不再触碰已关闭的 db
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// 【磁盘满保护】写入降级标志：磁盘满时设为 true，所有写操作快速失败不阻塞
+	// 磁盘满时 SQLite 的 _busy_timeout=5000 会导致每次写入阻塞 5 秒
+	// 设为降级后，SaveMetrics/SaveAlert/SaveAction 等直接返回 error 不碰 DB
+	writeDegraded atomic.Bool
+	// 降级后定期检测磁盘恢复，恢复后自动退出降级
+	degradeCheckAt atomic.Int64 // unix timestamp of next disk check
 }
 
 // New creates a new Storage instance and initializes the database.
@@ -46,7 +55,9 @@ func New(path string) (*Storage, error) {
 	}
 
 	// Open database with WAL mode and foreign keys
-	dsn := path + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_cache_size=-2000"
+	// 启用 auto_vacuum=incremental：DELETE 后的空间不自动回收，需要 incremental_vacuum 回收
+	// 这对 metrics 等高频写入/删除的表至关重要，否则 db 文件只会增长不会缩小
+	dsn := path + "?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_cache_size=-2000&_auto_vacuum=incremental"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -68,6 +79,61 @@ func New(path string) (*Storage, error) {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
+	// 【启动加速】如果之前磁盘满导致 WAL 文件巨大（可能几 GB），
+	// 启动时立即做一次 TRUNCATE checkpoint 合并 WAL 到主库并截断 WAL 文件，
+	// 否则后续每个查询都要先回放 WAL，导致面板登录等所有操作变慢。
+	walPath := path + "-wal"
+	if walSize, e := os.Stat(walPath); e == nil && walSize.Size() > 10*1024*1024 {
+		fmt.Fprintf(os.Stderr, "[storage] WAL file is %dMB, running startup checkpoint to merge...\n", walSize.Size()/(1024*1024))
+		// TRUNCATE 模式：合并 WAL 到主库后截断 WAL 文件
+		s.mu.Lock()
+		_, ckptErr := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		s.mu.Unlock()
+		if ckptErr != nil {
+			fmt.Fprintf(os.Stderr, "[storage] startup WAL checkpoint failed: %v (will retry in maintenance loop)\n", ckptErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[storage] startup WAL checkpoint completed\n")
+		}
+	}
+
+	// 确保 auto_vacuum 已启用
+	// auto_vacuum 只能在数据库创建时或 VACUUM 时设置
+	// 对已有数据库（auto_vacuum=0），需要在后台执行一次 VACUUM 切换模式
+	// 【OOM 修复】VACUUM 需要创建临时副本，大数据库（>100MB）会导致内存超限被 OOM Kill
+	// 对于大数据库，跳过 VACUUM，改为使用 incremental_vacuum 逐步回收空间
+	var autoVacuum int
+	err = db.QueryRow("PRAGMA auto_vacuum").Scan(&autoVacuum)
+	if err == nil && autoVacuum == 0 {
+		// 检查数据库文件大小，大数据库不做 VACUUM（会 OOM）
+		var dbSize int64 = 0
+		if fi, e := os.Stat(path); e == nil {
+			dbSize = fi.Size()
+		}
+		dbSizeMB := dbSize / (1024 * 1024)
+		if dbSizeMB > 100 {
+			// 大数据库：跳过 VACUUM，只设置 auto_vacuum 模式
+			// 下次 VACUUM INTO 或手动维护时才会切换模式
+			fmt.Fprintf(os.Stderr, "[storage] auto_vacuum not enabled but DB is %dMB, skipping VACUUM to avoid OOM. auto_vacuum will activate on next VACUUM.\n", dbSizeMB)
+			db.Exec("PRAGMA auto_vacuum=incremental")
+		} else {
+			// 小数据库：在后台执行一次 VACUUM 切换模式
+			// 【启动加速】延迟 60 秒执行，让面板和采集先启动起来
+			db.Exec("PRAGMA auto_vacuum=incremental")
+			go func() {
+				time.Sleep(60 * time.Second)
+				fmt.Fprintf(os.Stderr, "[storage] auto_vacuum not enabled, running background VACUUM to switch mode (DB size: %dMB)...\n", dbSizeMB)
+				// VACUUM 是 SQLite 独占操作，不需要持 Go mutex
+				// 持锁会阻塞所有其他 DB 操作 60+ 秒导致面板登录超时
+				_, err := s.db.Exec("VACUUM")
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[storage] background VACUUM failed: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[storage] background VACUUM completed, auto_vacuum=incremental now active\n")
+				}
+			}()
+		}
+	}
+
 	// Start maintenance routines
 	go s.maintenanceLoop()
 
@@ -78,6 +144,41 @@ func New(path string) (*Storage, error) {
 func (s *Storage) Close() error {
 	s.stopOnce.Do(func() { close(s.stopCh) })
 	return s.db.Close()
+}
+
+// IsWriteDegraded 检查存储是否处于写入降级模式（磁盘满）。
+// 降级时所有写操作快速失败，避免 SQLite _busy_timeout=5000 导致 5 秒阻塞。
+func (s *Storage) IsWriteDegraded() bool {
+	// 降级时每 30 秒检测一次磁盘是否恢复
+	if s.writeDegraded.Load() {
+		now := time.Now().Unix()
+		nextCheck := s.degradeCheckAt.Load()
+		if now >= nextCheck {
+			s.degradeCheckAt.Store(now + 30) // 30 秒后再检测
+			// 尝试一次轻量写入检测磁盘是否恢复
+			// 注意：表名是 kv_store（不是 kv），原代码写错表名导致降级模式永远无法退出
+			s.mu.Lock()
+			_, err := s.db.Exec("INSERT OR IGNORE INTO kv_store (key, value, updated_at) VALUES ('_degrade_check', '1', ?)", time.Now().UTC().Format(time.RFC3339))
+			s.mu.Unlock()
+			if err == nil {
+				// 写入成功，磁盘已恢复
+				s.writeDegraded.Store(false)
+				fmt.Fprintf(os.Stderr, "[storage] 磁盘已恢复，退出写入降级模式\n")
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// SetWriteDegraded 设置写入降级模式（由外部检测到磁盘满时调用）。
+func (s *Storage) SetWriteDegraded(degraded bool) {
+	if degraded && !s.writeDegraded.Load() {
+		fmt.Fprintf(os.Stderr, "[storage] 磁盘满，进入写入降级模式（写操作快速失败不阻塞）\n")
+		s.writeDegraded.Store(true)
+		s.degradeCheckAt.Store(time.Now().Unix() + 30)
+	}
 }
 
 // DB returns the underlying *sql.DB instance.
@@ -332,15 +433,66 @@ func (s *Storage) maintenanceLoop() {
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 
+	// 首次启动时延迟执行一次清理，让旧数据尽快被回收
+	startupTimer := time.NewTimer(30 * time.Second)
+	defer startupTimer.Stop()
+
+	vacuumCounter := 0
+	started := false
+
 	for {
 		select {
 		case <-s.stopCh:
 			return
+		case <-startupTimer.C:
+			// 启动后 30 秒执行一次初始清理
+			s.walCheckpoint()
+			s.purgeOldData()
+			s.incrementalVacuum()
+			started = true
+			continue // 跳过本次后续的重复清理
 		case <-ticker.C:
+			started = true
 		}
+
+		if !started {
+			continue
+		}
+
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+
+		// 【磁盘满保护】降级时跳过所有维护操作（VACUUM/checkpoint 都是写操作）
+		if s.IsWriteDegraded() {
+			continue
+		}
+
 		s.walCheckpoint()
 		s.purgeOldData()
+
+		// 每 4 个维护周期（约 1 小时）执行一次 incremental_vacuum 回收空间
+		// DELETE 只是标记空闲页，不会缩小 db 文件
+		// incremental_vacuum 逐步回收空闲页，避免一次性 VACUUM 的长时间锁
+		vacuumCounter++
+		if vacuumCounter >= 4 {
+			s.incrementalVacuum()
+			vacuumCounter = 0
+		}
 	}
+}
+
+// incrementalVacuum 回收被 DELETE 释放的空闲页，缩小 db 文件体积。
+// 比 VACUUM 更轻量：不需要重写整个数据库，只回收空闲页。
+// 配合 PRAGMA auto_vacuum=incremental 使用。
+func (s *Storage) incrementalVacuum() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 设置每次回收的页数上限（每页 4KB，200 页 ≈ 800KB）
+	// 避免一次性回收太多页导致长时间锁库
+	s.db.Exec("PRAGMA incremental_vacuum(200)")
 }
 
 // walCheckpoint checkpoints the WAL log.
@@ -371,7 +523,15 @@ func (s *Storage) purgeOldData() {
 // --- Metrics ---
 
 // SaveMetric stores a single metric.
+// 超过 DBSizeLimit 时拒绝写入，防止 db 文件无限增长
+// 【磁盘满保护】降级模式下快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveMetric(m types.Metric) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), metric write skipped")
+	}
+	if !s.checkCanWriteMetrics() {
+		return fmt.Errorf("db size exceeds limit, metric write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
@@ -382,7 +542,17 @@ func (s *Storage) SaveMetric(m types.Metric) error {
 }
 
 // SaveMetrics stores multiple metrics in a batch.
+// 如果数据库体积超过 DBSizeLimit（200MB），拒绝写入新指标以防止膨胀。
+// 【磁盘满保护】降级模式下快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveMetrics(metrics []types.Metric) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), metrics write skipped")
+	}
+	// DB 体积检查：超过上限时拒绝写入，防止 db 文件无限增长
+	if !s.checkCanWriteMetrics() {
+		return fmt.Errorf("db size exceeds limit, metrics write skipped")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -408,40 +578,114 @@ func (s *Storage) SaveMetrics(metrics []types.Metric) error {
 	return tx.Commit()
 }
 
+// checkCanWriteMetrics 检查数据库体积是否允许继续写入 metrics。
+// 超过 DBSizeLimit 时返回 false，调用方应跳过写入。
+// 使用缓存的文件大小（每 5 分钟更新一次），避免每次写入都 os.Stat。
+var (
+	dbSizeCache      int64
+	dbSizeCacheTime  time.Time
+	dbSizeCacheMu    sync.RWMutex
+)
+
+func (s *Storage) checkCanWriteMetrics() bool {
+	dbSizeCacheMu.RLock()
+	cached := dbSizeCache
+	cacheTime := dbSizeCacheTime
+	dbSizeCacheMu.RUnlock()
+
+	// 5 分钟内使用缓存值
+	if !cacheTime.IsZero() && time.Since(cacheTime) < 5*time.Minute {
+		return cached < DBSizeLimit
+	}
+
+	// 刷新缓存
+	size := s.GetDBSize()
+	dbSizeCacheMu.Lock()
+	dbSizeCache = size
+	dbSizeCacheTime = time.Now()
+	dbSizeCacheMu.Unlock()
+
+	return size < DBSizeLimit
+}
+
 // GetMetrics retrieves metrics by type and time range.
 // mType / name 为空时表示不过滤（通配）。
 // 查询范围同时覆盖 raw 表和聚合表（metrics_1m / metrics_1h），
 // 因为降采样会把 >1h 的原始数据聚合并删除，只查 raw 会丢失历史。
+// 优化：根据时间范围只查必要的表，避免 UNION ALL 三表全扫导致超时。
 func (s *Storage) GetMetrics(mType string, name string, since time.Time, limit int) ([]types.Metric, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	sinceStr := since.UTC().Format(time.RFC3339)
+	sinceUTC := since.UTC()
+	now := time.Now().UTC()
+	duration := now.Sub(sinceUTC)
 
-	query := fmt.Sprintf(`
+	// 根据时间范围选择查询的表，避免不必要的 UNION ALL
+	// raw 保留 1h，1m 保留 7d，1h 保留 90d
+	// 查最近 1h：只查 raw
+	// 查最近 7d：查 raw + 1m
+	// 查更久：查 raw + 1m + 1h
+	typeAndName := metricsWildcardAnd("type", mType) + metricsWildcardAnd("name", name)
+
+	var query string
+	var args []interface{}
+
+	if duration <= time.Hour {
+		// 只查 raw 表
+		query = fmt.Sprintf(`
+SELECT type, name, value, unit, timestamp, labels FROM metrics
+WHERE granularity = 'raw' AND timestamp >= ?%s
+ORDER BY timestamp DESC LIMIT ?`,
+			typeAndName)
+		args = []interface{}{sinceStr}
+		args = append(args, metricsWildcardArgs(mType, name)...)
+		args = append(args, limit)
+	} else if duration <= 7*24*time.Hour {
+		// 查 raw + 1m
+		query = fmt.Sprintf(`
 SELECT type, name, value, unit, timestamp, labels FROM (
 	SELECT type, name, value, unit, timestamp, labels FROM metrics
-	WHERE granularity = 'raw' AND timestamp >= ? %s %s
+	WHERE granularity = 'raw' AND timestamp >= ?%s
 	UNION ALL
 	SELECT type, name, avg, unit, strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', timestamp), labels FROM metrics_1m
-	WHERE timestamp >= datetime(?) %s %s
+	WHERE timestamp >= datetime(?)%s
+) ORDER BY timestamp DESC LIMIT ?`,
+			typeAndName, typeAndName)
+		args = []interface{}{sinceStr}
+		args = append(args, metricsWildcardArgs(mType, name)...)
+		args = append(args, sinceStr)
+		args = append(args, metricsWildcardArgs(mType, name)...)
+		args = append(args, limit)
+	} else {
+		// 查全部三张表
+		query = fmt.Sprintf(`
+SELECT type, name, value, unit, timestamp, labels FROM (
+	SELECT type, name, value, unit, timestamp, labels FROM metrics
+	WHERE granularity = 'raw' AND timestamp >= ?%s
+	UNION ALL
+	SELECT type, name, avg, unit, strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', timestamp), labels FROM metrics_1m
+	WHERE timestamp >= datetime(?)%s
 	UNION ALL
 	SELECT type, name, avg, unit, strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', timestamp), labels FROM metrics_1h
-	WHERE timestamp >= datetime(?) %s %s
+	WHERE timestamp >= datetime(?)%s
 ) ORDER BY timestamp DESC LIMIT ?`,
-		metricsWildcardAnd("type", mType), metricsWildcardAnd("name", name),
-		metricsWildcardAnd("type", mType), metricsWildcardAnd("name", name),
-		metricsWildcardAnd("type", mType), metricsWildcardAnd("name", name))
+			typeAndName, typeAndName, typeAndName)
+		args = []interface{}{sinceStr}
+		args = append(args, metricsWildcardArgs(mType, name)...)
+		args = append(args, sinceStr)
+		args = append(args, metricsWildcardArgs(mType, name)...)
+		args = append(args, sinceStr)
+		args = append(args, metricsWildcardArgs(mType, name)...)
+		args = append(args, limit)
+	}
 
-	args := []interface{}{sinceStr}
-	args = append(args, metricsWildcardArgs(mType, name)...)
-	args = append(args, sinceStr)
-	args = append(args, metricsWildcardArgs(mType, name)...)
-	args = append(args, sinceStr)
-	args = append(args, metricsWildcardArgs(mType, name)...)
-	args = append(args, limit)
+	// 使用 5 秒查询超时，避免大数据库上单次查询拖垮整个服务
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +742,9 @@ func (s *Storage) GetMetricBaselineStats(name string, since time.Time) ([]Baseli
 	defer s.mu.RUnlock()
 
 	sinceStr := since.UTC().Format(time.RFC3339)
-	rows, err := s.db.Query(
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx,
 		`SELECT bucket, SUM(sum_x), SUM(sum_x2), SUM(cnt) FROM (
 			SELECT (CAST(strftime('%w', timestamp) AS INTEGER) * 24 + CAST(strftime('%H', timestamp) AS INTEGER)) AS bucket,
 			       SUM(value) AS sum_x, SUM(value * value) AS sum_x2, COUNT(*) AS cnt
@@ -554,7 +800,9 @@ func (s *Storage) GetDiskDailyAverages(since time.Time) ([]DiskDailyPoint, error
 	defer s.mu.RUnlock()
 
 	sinceStr := since.UTC().Format(time.RFC3339)
-	rows, err := s.db.Query(
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx,
 		`SELECT mount, date(timestamp), AVG(value) FROM (
 			SELECT json_extract(labels, '$.mount') AS mount, timestamp, value
 			  FROM metrics
@@ -599,13 +847,16 @@ type MetricStats struct {
 // GetMetricStats 用一条聚合查询计算指标峰值/均值。
 // 报表生成原先把最多 20000 行明细拉进 Go 内存只为算 max/avg，
 // 在 1G 内存的机器上是无谓的分配毛刺；聚合下推给 SQLite 完成。
+// 添加 10s 查询超时，防止大数据库上慢查询阻塞。
 func (s *Storage) GetMetricStats(name string, since time.Time) (MetricStats, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var out MetricStats
 	sinceStr := since.UTC().Format(time.RFC3339)
-	err := s.db.QueryRow(`
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := s.db.QueryRowContext(ctx, `
 SELECT COUNT(*), COALESCE(MAX(value),0), COALESCE(AVG(value),0) FROM (
 	SELECT value FROM metrics WHERE granularity='raw' AND name = ? AND timestamp >= ?
 	UNION ALL
@@ -618,6 +869,9 @@ SELECT COUNT(*), COALESCE(MAX(value),0), COALESCE(AVG(value),0) FROM (
 
 // SaveAlert stores an alert.
 func (s *Storage) SaveAlert(a types.Alert) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), alert write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
@@ -721,7 +975,11 @@ func (s *Storage) GetAlertByID(id string) (*types.Alert, error) {
 }
 
 // ResolveAlert marks an alert as resolved.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) ResolveAlert(id string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), alert resolve skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("UPDATE alerts SET resolved=1, resolved_at=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), id)
@@ -730,7 +988,11 @@ func (s *Storage) ResolveAlert(id string) error {
 
 // ResolveAlertsBySource 批量解决指定来源的未解决告警。
 // 用于攻击扫描前自动清理上一轮的旧告警，避免告警无限堆积。
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) ResolveAlertsBySource(source string) (int64, error) {
+	if s.IsWriteDegraded() {
+		return 0, fmt.Errorf("storage degraded (disk full), alerts resolve skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, err := s.db.Exec("UPDATE alerts SET resolved=1, resolved_at=? WHERE source=? AND resolved=0", time.Now().UTC().Format(time.RFC3339), source)
@@ -771,7 +1033,11 @@ func (s *Storage) GetAlertsByTimeRange(start, end time.Time, limit int) ([]types
 }
 
 // AckAlert marks an alert as acknowledged.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) AckAlert(id string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), alert ack skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("UPDATE alerts SET acknowledged=1, acked_by='api' WHERE id=?", id)
@@ -779,7 +1045,11 @@ func (s *Storage) AckAlert(id string) error {
 }
 
 // DeleteGuardTarget removes a guard target.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) DeleteGuardTarget(id string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), guard target delete skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("DELETE FROM guard_targets WHERE id=?", id)
@@ -790,6 +1060,9 @@ func (s *Storage) DeleteGuardTarget(id string) error {
 
 // SaveAction stores an action execution record.
 func (s *Storage) SaveAction(ruleID string, result types.ActionResult) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), action write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 从 Params 中提取 target
@@ -890,6 +1163,9 @@ func (s *Storage) GetActionHistoryByRule(ruleID string, since time.Time, limit i
 
 // SaveAudit stores an audit entry.
 func (s *Storage) SaveAudit(entry types.AuditEntry) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), audit write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
@@ -929,7 +1205,11 @@ func (s *Storage) GetAuditLog(since time.Time, limit int) ([]types.AuditEntry, e
 // --- Guard Targets ---
 
 // SaveGuardTarget stores or updates a guard target.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveGuardTarget(t types.GuardTarget) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), guard target write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -1006,7 +1286,11 @@ type RuleRecord struct {
 }
 
 // SaveRule stores or updates a rule.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveRule(r *RuleRecord) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), rule write skipped")
+	}
 	if r.ID == "" {
 		r.ID = uuid.New().String()
 	}
@@ -1050,7 +1334,11 @@ func (s *Storage) GetRules() ([]RuleRecord, error) {
 }
 
 // DeleteRule removes a rule.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) DeleteRule(id string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), rule delete skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("DELETE FROM rules WHERE id=?", id)
@@ -1058,7 +1346,11 @@ func (s *Storage) DeleteRule(id string) error {
 }
 
 // UpdateRuleEnabled toggles a rule's enabled state.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) UpdateRuleEnabled(id string, enabled bool) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), rule update skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("UPDATE rules SET enabled=?, updated_at=? WHERE id=?", boolToInt(enabled), time.Now(), id)
@@ -1077,7 +1369,11 @@ func (s *Storage) Get(key string) (string, error) {
 }
 
 // Set stores a value in the KV store.
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) Set(key, value string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), kv write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec("INSERT OR REPLACE INTO kv_store (key, value, updated_at) VALUES (?, ?, ?)", key, value, time.Now())
@@ -1144,10 +1440,16 @@ func boolToInt(b bool) int {
 }
 
 // VACUUM reclaims space.
+// 对已有数据库（auto_vacuum=0），执行完整 VACUUM 重建数据库文件，
+// 同时切换到 auto_vacuum=incremental 模式。
+// 注意：VACUUM 会临时锁定整个数据库，大数据库上耗时较长。
 func (s *Storage) Vacuum() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec("PRAGMA incremental_vacuum")
+	// 先确保 auto_vacuum 模式设置（VACUUM 时会应用此设置）
+	s.db.Exec("PRAGMA auto_vacuum=incremental")
+	// 执行完整 VACUUM 重建数据库
+	_, err := s.db.Exec("VACUUM")
 	return err
 }
 

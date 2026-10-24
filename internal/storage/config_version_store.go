@@ -26,7 +26,11 @@ type ConfigVersion struct {
 }
 
 // SaveConfigVersion 保存配置版本
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveConfigVersion(v *ConfigVersion) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), config version write skipped")
+	}
 	if v.ID == "" {
 		v.ID = uuid.New().String()
 	}

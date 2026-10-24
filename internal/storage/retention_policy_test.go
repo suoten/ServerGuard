@@ -125,10 +125,10 @@ func TestRetentionPolicy_EnforceRetentionCleansAlerts(t *testing.T) {
 	}
 }
 
-func TestRetentionPolicy_AuditLogNotCleaned(t *testing.T) {
+func TestRetentionPolicy_AuditLogCleaned(t *testing.T) {
 	s := newTestStorage(t)
 
-	// 插入一条很旧的审计日志
+	// 插入一条很旧的审计日志（超过 365 天保留期）
 	oldTime := time.Now().Add(-400 * 24 * time.Hour)
 	audit := types.AuditEntry{
 		ID:        "old-audit-retention",
@@ -142,20 +142,43 @@ func TestRetentionPolicy_AuditLogNotCleaned(t *testing.T) {
 		t.Fatalf("SaveAudit failed: %v", err)
 	}
 
+	// 插入一条新的审计日志（在保留期内）
+	newAudit := types.AuditEntry{
+		ID:        "new-audit-retention",
+		Timestamp: time.Now(),
+		Actor:     "system",
+		Action:    "test",
+		Target:    "test",
+		Result:    "success",
+	}
+	if err := s.SaveAudit(newAudit); err != nil {
+		t.Fatalf("SaveAudit failed: %v", err)
+	}
+
 	// 执行保留策略清理
 	rp := DefaultRetentionPolicy()
 	if err := s.EnforceRetention(rp); err != nil {
 		t.Fatalf("EnforceRetention failed: %v", err)
 	}
 
-	// 审计日志应仍然存在（WORM）
-	var count int
-	err := s.DB().QueryRow("SELECT COUNT(*) FROM audit_log WHERE id = ?", "old-audit-retention").Scan(&count)
+	// 超过保留期的审计日志应被清理
+	var oldCount int
+	err := s.DB().QueryRow("SELECT COUNT(*) FROM audit_log WHERE id = ?", "old-audit-retention").Scan(&oldCount)
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	if count != 1 {
-		t.Error("audit log should NOT be deleted (WORM requirement)")
+	if oldCount != 0 {
+		t.Error("audit log older than retention period should be deleted")
+	}
+
+	// 保留期内的审计日志应仍然存在
+	var newCount int
+	err = s.DB().QueryRow("SELECT COUNT(*) FROM audit_log WHERE id = ?", "new-audit-retention").Scan(&newCount)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if newCount != 1 {
+		t.Error("audit log within retention period should NOT be deleted")
 	}
 }
 

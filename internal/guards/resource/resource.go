@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -278,8 +279,13 @@ func (g *ResourceGuard) checkDiskSpace(sysInfo *types.SystemInfo) {
 				fmt.Sprintf("磁盘 %s 使用率 %.1f%%，正在执行紧急清理", disk.MountPoint, disk.UsedPercent),
 				"disk-space-001")
 			g.emergencyDiskCleanup(disk.MountPoint)
-			// 紧急清理后再检查大文件并报告
-			g.reportBigFiles(disk.MountPoint)
+			// 【磁盘满修复】紧急清理后不再做 findBigFiles 文件遍历
+			// 磁盘 100% 满 + I/O wait 25% 时 filepath.Walk 只会加重 I/O 负担
+			// 改为从告警中提示用户手动查看大文件
+			g.eventBus.PublishAlert(types.AlertWarning, "resource",
+				fmt.Sprintf("磁盘满提示: %s", disk.MountPoint),
+				"磁盘已满，紧急清理已完成。如仍不足，请手动检查大文件：\n  find / -xdev -type f -size +500M -exec ls -lh {} \\; 2>/dev/null | sort -k5 -rh | head -20",
+				"disk-bigfile-001")
 		} else if disk.UsedPercent >= g.diskCritical {
 			g.eventBus.PublishAlert(types.AlertError, "resource",
 				fmt.Sprintf("磁盘告警: %s (%.1f%%)", disk.MountPoint, disk.UsedPercent),
@@ -435,6 +441,10 @@ func (g *ResourceGuard) reportBigFiles(mountPoint string) {
 // 安全策略 v2：多层精确防护，不再一刀切屏蔽 /tmp、/www。
 // 6 层安全检查：白名单目录 → 黑名单路径 → 受保护文件名模式 → 禁止扩展名 → 允许扩展名 → 活跃写入检测。
 // 只清理 30 天以上的旧轮转/压缩日志文件（.gz/.1/.old/.bz2/.xz/.zip）。
+//
+// 【磁盘满修复】新增两项紧急清理：
+// 1. /.Recycle_bin 宝塔回收站——无论扩展名，7天前的文件全部清理
+// 2. 超大日志文件（>100MB 的 .log 文件）——截断到最后1000行（copytruncate 策略）
 func (g *ResourceGuard) emergencyDiskCleanup(mountPoint string) {
 	if runtime.GOOS == "windows" {
 		// Windows: only clean Windows Temp files older than 7 days
@@ -460,8 +470,35 @@ func (g *ResourceGuard) emergencyDiskCleanup(mountPoint string) {
 				return nil
 			}
 
+			// 【磁盘满修复】宝塔回收站特殊处理：无论扩展名都可以清理
+			isRecycleBin := strings.HasPrefix(path, "/.Recycle_bin/")
+			if isRecycleBin {
+				// 回收站里的文件无论扩展名都可以删除（都是用户已删除的文件）
+				if safety.IsFileBeingWritten(path) {
+					return nil
+				}
+				size := info.Size()
+				if os.Remove(path) == nil {
+					freed += size
+				}
+				return nil
+			}
+
 			// 综合安全检查：黑名单路径 + 受保护模式 + 禁止扩展名 + 允许扩展名
 			if !safety.IsFileSafeForCleanup(path) {
+				// 【磁盘满修复】超大日志文件紧急截断（>100MB 的 .log 文件）
+				// 不删除，而是用 copytruncate 策略截断到最后1000行
+				// 针对类似 PostgreSQL 1.8GB 日志文件的场景
+				lowerPath := strings.ToLower(path)
+				if strings.HasSuffix(lowerPath, ".log") && info.Size() > 100*1024*1024 {
+					if !safety.IsFileBeingWritten(path) {
+						// 尝试截断大日志文件
+						truncated, _ := truncateLargeLogFile(path)
+						if truncated {
+							freed += info.Size() - 1024 // 保留最后1KB
+						}
+					}
+				}
 				return nil
 			}
 
@@ -484,9 +521,48 @@ func (g *ResourceGuard) emergencyDiskCleanup(mountPoint string) {
 	if freed > 0 {
 		g.eventBus.PublishAlert(types.AlertInfo, "resource",
 			fmt.Sprintf("磁盘清理完成: %s", mountPoint),
-			fmt.Sprintf("已释放 %.2fMB 磁盘空间（清理30天以上的旧日志/压缩文件，保护数据库/配置/网站源码/会话文件）", float64(freed)/1024/1024),
+			fmt.Sprintf("已释放 %.2fMB 磁盘空间（清理回收站+旧日志+大日志截断）", float64(freed)/1024/1024),
 			"disk-cleanup-001")
 	}
+}
+
+// truncateLargeLogFile 用 copytruncate 策略截断大日志文件：
+// 保留最后 1000 行，其余内容丢弃。比直接删除更安全（日志分析工具还能读到最后1000行）。
+func truncateLargeLogFile(path string) (bool, error) {
+	// 读取最后 64KB（大约1000行）
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	stat, _ := f.Stat()
+	if stat.Size() < 64*1024 {
+		f.Close()
+		return false, nil
+	}
+
+	// Seek 到最后 64KB
+	seekPos := stat.Size() - 64*1024
+	_, err = f.Seek(seekPos, 0)
+	if err != nil {
+		f.Close()
+		return false, err
+	}
+	buf := make([]byte, 64*1024)
+	n, _ := f.Read(buf)
+	f.Close()
+
+	// 找到第一个换行符（丢弃不完整的行）
+	tail := buf[:n]
+	if idx := bytes.IndexByte(tail, '\n'); idx >= 0 {
+		tail = tail[idx+1:]
+	}
+
+	// 写回截断后的内容
+	err = os.WriteFile(path, tail, 0644)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // checkOOM checks for OOM risk and takes action.

@@ -31,7 +31,11 @@ type Finding struct {
 
 // SaveFinding 保存安全发现项
 // 如果已存在相同 scanner+title+target 的 open 状态发现，则跳过（去重）
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveFinding(f *Finding) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), finding write skipped")
+	}
 	if f.ID == "" {
 		f.ID = uuid.New().String()
 	}
@@ -139,7 +143,11 @@ func (s *Storage) GetFindingCountByScanner() (map[string]int, error) {
 }
 
 // UpdateFindingStatus 更新发现项状态
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) UpdateFindingStatus(id, status, confirmedBy string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), finding status update skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -184,6 +192,9 @@ func (s *Storage) ResolveStaleFindings(scanner string, currentKeys []string) err
 	// 使仪表盘上的安全发现数量瞬间归零。
 	if len(currentKeys) == 0 {
 		return nil
+	}
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), stale findings resolve skipped")
 	}
 
 	s.mu.Lock()
@@ -239,6 +250,9 @@ func (s *Storage) ResolveStaleFindingsByTarget(scanner string, targetPrefix stri
 	// 当本次扫描返回 0 条发现时，不清理（保护历史数据）
 	if len(currentKeys) == 0 {
 		return nil
+	}
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), stale findings resolve by target skipped")
 	}
 
 	s.mu.Lock()

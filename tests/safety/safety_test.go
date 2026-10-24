@@ -98,9 +98,9 @@ func TestDegradationMatrix_T_SAFE_07(t *testing.T) {
 		t.Fatalf("should start in normal mode, got %v", mode)
 	}
 
-	degradedMode := sm.EvaluateSystemState(95.0, 50.0, 10.0)
+	degradedMode := sm.EvaluateSystemState(95.0, 50.0, 10.0, 50.0)
 	t.Logf("degraded mode under high load: %v", degradedMode)
 
-	normalMode := sm.EvaluateSystemState(10.0, 4096.0, 0.5)
+	normalMode := sm.EvaluateSystemState(10.0, 4096.0, 0.5, 50.0)
 	t.Logf("mode under normal load: %v", normalMode)
 }

@@ -214,15 +214,15 @@ func TestSafetyManager_ShouldRunGuards(t *testing.T) {
 	sm := New(testSafetyConfig())
 
 	// Normal 模式应运行 Guards
-	sm.EvaluateSystemState(50, 500, 1.0)
-	if !sm.ShouldRunGuards() {
-		t.Error("should run guards in normal mode")
+sm.EvaluateSystemState(50, 500, 1.0, 50)
+if !sm.ShouldRunGuards() {
+t.Error("should run guards in normal mode")
 	}
 
 	// Survival 模式应跳过 Guards
-	sm.EvaluateSystemState(96, 500, 1.0)
-	if sm.ShouldRunGuards() {
-		t.Error("should NOT run guards in survival mode")
+sm.EvaluateSystemState(96, 500, 1.0, 50)
+if sm.ShouldRunGuards() {
+t.Error("should NOT run guards in survival mode")
 	}
 }
 
@@ -230,26 +230,26 @@ func TestSafetyManager_GetCollectInterval_AllModes(t *testing.T) {
 	sm := New(testSafetyConfig())
 
 	// Normal: default interval
-	sm.EvaluateSystemState(50, 500, 1.0)
-	if interval := sm.GetCollectInterval(5 * time.Second); interval != 5*time.Second {
-		t.Errorf("normal mode interval = %v, want 5s", interval)
+sm.EvaluateSystemState(50, 500, 1.0, 50)
+if interval := sm.GetCollectInterval(5 * time.Second); interval != 5*time.Second {
+t.Errorf("normal mode interval = %v, want 5s", interval)
 	}
 
 	// Throttled: 15s
-	sm.EvaluateSystemState(75, 500, 1.0)
-	if interval := sm.GetCollectInterval(5 * time.Second); interval != 15*time.Second {
-		t.Errorf("throttled mode interval = %v, want 15s", interval)
+sm.EvaluateSystemState(75, 500, 1.0, 50)
+if interval := sm.GetCollectInterval(5 * time.Second); interval != 15*time.Second {
+t.Errorf("throttled mode interval = %v, want 15s", interval)
 	}
 
 	// Minimal: 60s
-	sm.EvaluateSystemState(87, 500, 1.0)
-	if interval := sm.GetCollectInterval(5 * time.Second); interval != 60*time.Second {
-		t.Errorf("minimal mode interval = %v, want 60s", interval)
+sm.EvaluateSystemState(87, 500, 1.0, 50)
+if interval := sm.GetCollectInterval(5 * time.Second); interval != 60*time.Second {
+t.Errorf("minimal mode interval = %v, want 60s", interval)
 	}
 
 	// Survival: 60s
-	sm.EvaluateSystemState(96, 500, 1.0)
-	if interval := sm.GetCollectInterval(5 * time.Second); interval != 60*time.Second {
-		t.Errorf("survival mode interval = %v, want 60s", interval)
+sm.EvaluateSystemState(96, 500, 1.0, 50)
+if interval := sm.GetCollectInterval(5 * time.Second); interval != 60*time.Second {
+t.Errorf("survival mode interval = %v, want 60s", interval)
 	}
 }

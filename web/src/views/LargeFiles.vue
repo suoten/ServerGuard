@@ -791,7 +791,10 @@ async function cleanGhostFiles() {
     const r = await axios.post('/api/ghost-files/clean', {}, { timeout: 120000 }) // 2 分钟超时：大量进程需要批量 kill
     const freed = r.data.freedGB || 0
     const remaining = r.data.count || 0
-    if (freed > 0) {
+    if (r.data.success === false) {
+      // 清理被安全机制拦截
+      ElMessage.warning(r.data.message || '清理被安全机制拦截，请稍后重试')
+    } else if (freed > 0) {
       ElMessage.success(`已释放 ${freed.toFixed(2)}GB 幽灵空间` + (remaining > 0 ? `，剩余 ${remaining} 个需手动处理` : ''))
     } else if (remaining > 0) {
       ElMessage.warning(r.data.message || `${remaining} 个幽灵文件由关键进程持有，需手动重启服务释放`)

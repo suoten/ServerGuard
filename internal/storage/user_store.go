@@ -34,7 +34,11 @@ type User struct {
 }
 
 // CreateUser 创建新用户
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) CreateUser(username, password, role, tenantID string) (*User, error) {
+	if s.IsWriteDegraded() {
+		return nil, fmt.Errorf("storage degraded (disk full), user create skipped")
+	}
 	if username == "" {
 		return nil, fmt.Errorf("用户名不能为空")
 	}
@@ -80,7 +84,11 @@ func (s *Storage) CreateUser(username, password, role, tenantID string) (*User, 
 }
 
 // UpdateUser 更新用户信息（不含密码）
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) UpdateUser(id int64, role, tenantID string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), user update skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -95,7 +103,11 @@ func (s *Storage) UpdateUser(id int64, role, tenantID string) error {
 }
 
 // UpdateUserPassword 重置用户密码
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) UpdateUserPassword(id int64, newPassword string) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), password update skipped")
+	}
 	if newPassword == "" {
 		return fmt.Errorf("新密码不能为空")
 	}
@@ -122,7 +134,11 @@ func (s *Storage) UpdateUserPassword(id int64, newPassword string) error {
 }
 
 // DeleteUser 删除用户
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) DeleteUser(id int64) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), user delete skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

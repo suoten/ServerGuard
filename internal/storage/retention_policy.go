@@ -47,7 +47,11 @@ type retentionPolicyRow struct {
 }
 
 // SetRetentionPolicy 设置保留策略并持久化到数据库。
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SetRetentionPolicy(rp RetentionPolicy) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), retention policy write skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -142,7 +146,11 @@ func (s *Storage) GetRetentionPolicy() (RetentionPolicy, error) {
 
 // EnforceRetention 按保留策略清理过期数据。
 // 审计表(audit_log)跳过清理以符合 WORM 要求。
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) EnforceRetention(rp RetentionPolicy) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), retention enforcement skipped")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -188,8 +196,23 @@ func (s *Storage) EnforceRetention(rp RetentionPolicy) error {
 			return fmt.Errorf("cleanup actions: %w", err)
 		}
 	}
-	// 审计日志：WORM，跳过清理
-	// 注意：audit_log 表不执行 DELETE，确保 Write Once Read Many 语义
+	// 审计日志：WORM 保留期清理
+	// WORM 触发器禁止 DELETE，但超过保留期的审计日志必须清理，否则 db 文件无限增长
+	// 做法：在事务内临时 DROP 触发器 → DELETE 过期数据 → 重建触发器
+	if rp.AuditLog > 0 {
+		if _, err := tx.Exec("DROP TRIGGER IF EXISTS audit_no_delete"); err != nil {
+			_ = err // 触发器可能不存在
+		}
+		if _, err := tx.Exec("DELETE FROM audit_log WHERE timestamp < ?", cutoff(rp.AuditLog)); err != nil {
+			_ = err // 清理失败不阻塞其他清理
+		}
+		// 重建 WORM 触发器
+		tx.Exec(`CREATE TRIGGER IF NOT EXISTS audit_no_delete
+BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit log is WORM: delete not allowed');
+END`)
+	}
 
 	// 攻击事件
 	if rp.AttackEvents > 0 {

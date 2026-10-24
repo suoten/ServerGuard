@@ -133,10 +133,26 @@ foreach ($p in $platforms) {
         Copy-Item -Path "configs/cis_benchmark/*" -Destination "$pkgDir/configs/cis_benchmark/" -Recurse -Force
     }
 
-    # 打 zip 包
+    # 打 zip 包（用 Python zipfile 避免 Compress-Archive 的权限问题）
     $zipball = "release/serverguard-$Version-$tag.zip"
     Write-Host "  Creating $zipball..." -ForegroundColor DarkGray
-    Compress-Archive -Path "$pkgDir/*" -DestinationPath $zipball -Force
+    $pyScript = @"
+import zipfile, os, sys
+src = r'$pkgDir'
+dst = r'$zipball'
+with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk(src):
+        for f in files:
+            full = os.path.join(root, f)
+            arc = os.path.relpath(full, src)
+            zf.write(full, arc)
+print('OK')
+"@
+    $pyResult = python -c $pyScript 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Python zip failed: $pyResult" -ForegroundColor Red
+        exit 1
+    }
 
     $size = [math]::Round((Get-Item $zipball).Length / 1MB, 1)
     Write-Host "  -> $zipball ($size MB)" -ForegroundColor Yellow

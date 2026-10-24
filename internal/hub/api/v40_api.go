@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1149,6 +1150,19 @@ func (a *API) notifyShortCodeAck(c *gin.Context) {
 // 幽灵文件检测 API — 已删除但句柄未释放的隐形空间杀手
 // ────────────────────────────────────────────────
 
+// uniqueStrings 去重字符串切片
+func uniqueStrings(s []string) []string {
+	seen := make(map[string]bool, len(s))
+	out := make([]string, 0, len(s))
+	for _, v := range s {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // getGhostFiles GET /api/ghost-files
 // 返回最近一次自动扫描结果（不触发新扫描，扫描由后端定时自动执行）
 func (a *API) getGhostFiles(c *gin.Context) {
@@ -1273,11 +1287,39 @@ func (a *API) cleanGhostFiles(c *gin.Context) {
 
 	// 指导用户：如果是关键进程持有的幽灵文件，提示手动重启
 	hasCritical := false
+	criticalNames := []string{}
 	for _, g := range cachedGhosts {
 		if log.IsGhostCriticalProcess(g.ProcessName) {
 			hasCritical = true
-			break
+			criticalNames = append(criticalNames, g.ProcessName)
 		}
+	}
+
+	// 【关键修复】清理前先检查安全状态，避免静默失败
+	// 用户点击"自动清理"后什么都没发生，重新扫描还是 48 个文件
+	if sm.ShouldPauseDangerousActions() {
+		mode := sm.GetMode()
+		var reason string
+		switch mode {
+		case types.ModeSurvival:
+			reason = "Agent 当前处于生存模式（系统资源极度紧张），所有危险操作已暂停"
+		case types.ModeMinimal:
+			reason = "Agent 当前处于最小模式（系统资源紧张），危险操作已暂停"
+		case types.ModeThrottled:
+			reason = "Agent 当前处于节流模式，危险操作已暂停"
+		default:
+			reason = "当前处于维护窗口或远程暂停期，危险操作已暂停"
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"success":     false,
+			"freed":       0,
+			"freedGB":     0,
+			"ghosts":      cachedGhosts,
+			"count":       cachedCount,
+			"beforeCount": cachedCount,
+			"message":     fmt.Sprintf("清理已跳过：%s。\n请等待系统资源恢复正常后重试，或在维护窗口外手动重启持有幽灵文件的服务释放空间。", reason),
+		})
+		return
 	}
 
 	cleaner := log.NewGhostFileCleaner(nil, sm)
@@ -1296,7 +1338,12 @@ func (a *API) cleanGhostFiles(c *gin.Context) {
 		message += fmt.Sprintf("，剩余 %d 个幽灵文件需手动处理（关键进程无法自动重启）", len(afterGhosts))
 	}
 	if hasCritical && freed == 0 {
-		message = fmt.Sprintf("检测到 %d 个幽灵文件，但均由关键系统进程（如 MySQL/Nginx/PHP）持有，无法自动终止。\n建议在维护窗口手动重启对应服务释放空间。", len(cachedGhosts))
+		uniqueNames := strings.Join(uniqueStrings(criticalNames), "、")
+		message = fmt.Sprintf("检测到 %d 个幽灵文件，但均由关键系统进程（%s）持有，无法自动终止。\n建议在维护窗口手动重启对应服务释放空间。", len(cachedGhosts), uniqueNames)
+	}
+	// 【关键修复】如果 freed=0 且没有关键进程，说明所有进程都被安全审批拒绝了
+	if freed == 0 && !hasCritical && len(beforeGhosts) > 0 {
+		message = fmt.Sprintf("检测到 %d 个幽灵文件，但安全审批拒绝了所有进程终止操作。\n可能原因：进程在白名单中、kill 预算耗尽、或级联观察期未结束。\n建议手动重启持有幽灵文件的服务释放空间。", len(beforeGhosts))
 	}
 
 	c.JSON(http.StatusOK, gin.H{

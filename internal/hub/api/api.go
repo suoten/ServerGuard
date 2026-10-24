@@ -4596,10 +4596,10 @@ func (a *API) Serve(addr string) error {
 	srv := &http.Server{
 		Addr:           addr,
 		Handler:        a.router,
-		ReadTimeout:    10 * time.Second, // 读请求体超时
-		WriteTimeout:   30 * time.Second, // 写响应超时（含 DB 查询时间）
-		IdleTimeout:    60 * time.Second, // 空闲连接超时（keepalive）
-		MaxHeaderBytes: 1 << 20,          // 1MB 请求头上限
+		ReadTimeout:    10 * time.Second,  // 读请求体超时
+		WriteTimeout:   120 * time.Second, // 写响应超时（含 DB 查询时间）
+		IdleTimeout:    60 * time.Second,  // 空闲连接超时（keepalive）
+		MaxHeaderBytes: 1 << 20,           // 1MB 请求头上限
 	}
 	return srv.ListenAndServe()
 }
@@ -5303,7 +5303,7 @@ func (a *API) getLargeFiles(c *gin.Context) {
 func (a *API) doLargeFileScan(minSizeMB int) *largeFilesCache {
 	minSizeBytes := int64(minSizeMB) * 1024 * 1024
 
-	scanDirs := []string{"/var/log", "/tmp", "/var/tmp", "/www/wwwlogs", "/www/server", "/root", "/home", "/opt", "/var/lib"}
+	scanDirs := []string{"/var/log", "/tmp", "/var/tmp", "/www/wwwlogs", "/www/server", "/root", "/home", "/opt", "/var/lib/serverguard"}
 	if runtime.GOOS == "windows" {
 		scanDirs = []string{"C:\\Users", "C:\\Program Files", "C:\\Windows\\Temp", "C:\\Temp"}
 	}
@@ -5312,7 +5312,8 @@ func (a *API) doLargeFileScan(minSizeMB int) *largeFilesCache {
 	maxFiles := 200
 
 	// 使用独立 context（不依赖请求 context，因为是异步的）
-	scanCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// 超时从 120s 延长到 300s，低配服务器磁盘 I/O 慢
+	scanCtx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
 	for _, dir := range scanDirs {
@@ -5361,6 +5362,10 @@ func scanDirForLargeFiles(ctx context.Context, dir string, minSize int64, files 
 	// UID → username 缓存，避免重复查找
 	uidCache := make(map[uint32]string)
 
+	// 计算根目录的路径深度，用于限制相对扫描深度
+	rootDepth := strings.Count(dir, string(filepath.Separator))
+	maxRelativeDepth := 8 // 最多递归 8 层子目录，避免无限遍历
+
 	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || len(*files) >= maxFiles {
 			if err != nil {
@@ -5387,8 +5392,20 @@ func scanDirForLargeFiles(ctx context.Context, dir string, minSize int64, files 
 			skipDirs := map[string]bool{
 				".git": true, "__pycache__": true, "node_modules": true,
 				"site-packages": true, ".cache": true, "vendor": true,
+				// 额外跳过占用 I/O 的目录
+				".npm": true, ".cargo": true, ".rustup": true,
+				".gradle": true, ".m2": true,
+				// 跳过容器和虚拟机镜像存储
+				"overlay2": true, "aufs": true, "containers": true,
+				// 跳过包管理器缓存
+				"apt": true, "yum": true, "dnf": true, "pacman": true,
 			}
 			if skipDirs[base] {
+				return filepath.SkipDir
+			}
+			// 限制扫描深度：超过最大相对深度时跳过子目录
+			currentDepth := strings.Count(path, string(filepath.Separator)) - rootDepth
+			if currentDepth > maxRelativeDepth {
 				return filepath.SkipDir
 			}
 			return nil
@@ -5446,6 +5463,12 @@ func canDeleteFile(path string, info os.FileInfo) (bool, string) {
 		if strings.HasPrefix(path, prefix) {
 			return false, "系统关键目录，不可删除"
 		}
+	}
+
+	// ─── 1.5. ServerGuard 自身数据库文件 ───
+	baseName := strings.ToLower(filepath.Base(path))
+	if strings.HasPrefix(baseName, "serverguard.db") {
+		return false, "ServerGuard 数据库，不可删除"
 	}
 
 	// ─── 2. 数据库数据目录 ───

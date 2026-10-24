@@ -162,16 +162,22 @@ func (sm *SafetyManager) UpdateKillBudget(hourly, daily int) {
 // EvaluateSystemState determines the agent mode based on system resources.
 // 阈值设计原则：宁可误判降频，也不冒险影响服务器性能
 // 注意：这里的 CPU/内存是系统级别的（不是 Agent 自身的）
-func (sm *SafetyManager) EvaluateSystemState(cpuPercent float64, memAvailableMB float64, loadFactor float64) types.AgentMode {
+//
+// 【磁盘满修复】新增 diskFullPercent 参数：
+// 磁盘 > 95% 时直接进入 Survival——磁盘满时 SQLite 写不进去、日志写不进去，
+// Agent 继续采集和写入只会疯狂重试消耗 CPU，反而加剧服务器故障。
+// 磁盘 > 90% 时进入 Minimal，暂停非必要操作只保留核心监控。
+func (sm *SafetyManager) EvaluateSystemState(cpuPercent float64, memAvailableMB float64, loadFactor float64, diskFullPercent float64) types.AgentMode {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	switch {
-	// 临界（CPU > 95% 或可用内存 < 50MB）→ 只存活+告警（对齐规划文档 §8.11）
-	case cpuPercent > 95 || memAvailableMB < 50:
+	// 临界（CPU > 95% 或可用内存 < 50MB 或磁盘 > 95%）→ 只存活+告警
+	// 磁盘满时 Agent 必须立即停止一切非必要操作，否则会火上浇油
+	case cpuPercent > 95 || memAvailableMB < 50 || diskFullPercent >= 95:
 		sm.mode = types.ModeSurvival
-	// 危险（CPU > 85% 或可用内存 < 100MB）→ 最小模式，暂停危险操作
-	case cpuPercent > 85 || memAvailableMB < 100:
+	// 危险（CPU > 85% 或可用内存 < 100MB 或磁盘 > 90%）→ 最小模式
+	case cpuPercent > 85 || memAvailableMB < 100 || diskFullPercent >= 90:
 		sm.mode = types.ModeMinimal
 	// 繁忙（CPU > 70% 或可用内存 < 200MB）→ 降频，关闭重分析
 	case cpuPercent > 70 || memAvailableMB < 200:

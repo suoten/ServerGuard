@@ -50,6 +50,9 @@ var CleanupWhitelist = []string{
 	"/tmp",
 	"/var/tmp",
 
+	// ── 宝塔回收站（紧急清理时清空，通常都是用户删除的旧文件） ──
+	"/.Recycle_bin",
+
 	// ── Java 应用日志目录（自动发现，用于紧急清理 Java 暴日志场景） ──
 	// wvp-gb28181-pro 等Java应用常见日志路径
 	"/opt/wvp/logs",

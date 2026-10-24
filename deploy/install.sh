@@ -125,6 +125,26 @@ done
 
 # ── 生成配置文件 ──────────────────────────────────────
 echo -e "${GREEN}[3/8]${NC} 生成配置文件"
+
+# 检测旧数据库：如果过大（>100MB），提示清理以避免启动时 VACUUM 导致 OOM
+OLD_DB="/var/lib/serverguard/serverguard.db"
+if [ -f "$OLD_DB" ]; then
+  OLD_DB_MB=$(du -m "$OLD_DB" 2>/dev/null | cut -f1)
+  if [ -n "$OLD_DB_MB" ] && [ "$OLD_DB_MB" -gt 100 ]; then
+    echo -e "${YELLOW}⚠ 检测到旧数据库（${OLD_DB_MB}MB），可能导致启动时 OOM 崩溃${NC}"
+    echo -e "  ${CYAN}建议：备份后清理旧数据库，重新开始（历史数据会丢失）${NC}"
+    echo -e "  ${CYAN}命令: mv ${OLD_DB} ${OLD_DB}.bak && rm -f ${OLD_DB}-wal ${OLD_DB}-shm${NC}"
+    echo -n -e "  ${YELLOW}是否现在清理旧数据库？(y/N) ${NC}"
+    read -r CLEAN_DB < /dev/tty
+    if [ "$CLEAN_DB" = "y" ] || [ "$CLEAN_DB" = "Y" ]; then
+      mv "$OLD_DB" "${OLD_DB}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+      rm -f "${OLD_DB}-wal" "${OLD_DB}-shm" 2>/dev/null || true
+      echo -e "  ${GREEN}✓ 旧数据库已备份并清理${NC}"
+    else
+      echo -e "  ${YELLOW}跳过。如果 Agent 启动崩溃，请手动清理: mv ${OLD_DB} ${OLD_DB}.bak${NC}"
+    fi
+  fi
+fi
 JWT_SECRET=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
 # 随机面板密码：安全产品不应有固定默认口令，安装时生成并只显示一次
 ADMIN_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 16)
@@ -409,6 +429,100 @@ if ! systemctl is-active --quiet serverguard-agent; then
   sleep 10
 fi
 
+# 检查是否在崩溃-重启循环中（systemd NRestarts > 3 说明不稳定）
+RESTART_COUNT=$(systemctl show serverguard-agent -p NRestarts 2>/dev/null | cut -d= -f2)
+if [ -n "$RESTART_COUNT" ] && [ "$RESTART_COUNT" -gt 3 ]; then
+  echo -e "${RED}⚠ Agent 在崩溃-重启循环中（已重启 ${RESTART_COUNT} 次）${NC}"
+  echo -e "${YELLOW}─── 崩溃诊断 ───${NC}"
+  echo -e "  ${CYAN}最近日志:${NC}"
+  journalctl -u serverguard-agent -n 20 --no-pager 2>/dev/null || true
+  echo ""
+  # 检查旧数据库是否过大导致 OOM
+  DB_PATH="/var/lib/serverguard/serverguard.db"
+  if [ -f "$DB_PATH" ]; then
+    DB_SIZE_MB=$(du -m "$DB_PATH" 2>/dev/null | cut -f1)
+    if [ -n "$DB_SIZE_MB" ] && [ "$DB_SIZE_MB" -gt 100 ]; then
+      echo -e "${RED}⚠ 数据库过大（${DB_SIZE_MB}MB），启动时 VACUUM 导致 OOM 崩溃${NC}"
+      echo -e "${YELLOW}  正在清理旧数据库并重启...${NC}"
+      systemctl stop serverguard-agent 2>/dev/null || true
+      mv "$DB_PATH" "${DB_PATH}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+      # 同时清理 WAL 和 SHM 文件
+      rm -f "${DB_PATH}-wal" "${DB_PATH}-shm" 2>/dev/null || true
+      systemctl start serverguard-agent
+      sleep 10
+    fi
+  fi
+  # 检查 OOM
+  if dmesg -T 2>/dev/null | grep -qiE "out of memory|oom.?kill.*serverguard"; then
+    echo -e "${RED}⚠ 检测到 OOM Kill！${NC}"
+    echo -e "${YELLOW}  正在增大内存限制并重启...${NC}"
+    # 将 MemoryMax 翻倍
+    CURRENT_MAX=$(grep "^MemoryMax=" /etc/systemd/system/serverguard-agent.service | cut -d= -f2)
+    if [ -n "$CURRENT_MAX" ]; then
+      CURRENT_NUM=$(echo "$CURRENT_MAX" | grep -oP '[0-9]+')
+      NEW_NUM=$((CURRENT_NUM * 2))
+      NEW_MAX="${NEW_NUM}M"
+      sed -i "s/^MemoryMax=.*/MemoryMax=${NEW_MAX}/" /etc/systemd/system/serverguard-agent.service
+      sed -i "s/^MemoryHigh=.*/MemoryHigh=$((NEW_NUM * 2 / 3))M/" /etc/systemd/system/serverguard-agent.service
+      echo -e "${YELLOW}  MemoryMax 已从 ${CURRENT_MAX} 调整为 ${NEW_MAX}${NC}"
+      systemctl daemon-reload
+      systemctl restart serverguard-agent
+      sleep 10
+    fi
+  fi
+fi
+
+if systemctl is-active --quiet serverguard-agent; then
+  # 等待 HTTP server 完全就绪（额外等 3 秒让 gin 初始化完成）
+  sleep 3
+  # 用 curl 本机测试 API 是否真正响应（不只是进程存活）
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:${LISTEN_PORT}/api/status 2>/dev/null)
+  if [ "$HTTP_CODE" = "000" ] || [ -z "$HTTP_CODE" ]; then
+    echo -e "${YELLOW}⚠ 进程存活但 HTTP 不响应（HTTP ${HTTP_CODE}），可能在初始化中或崩溃${NC}"
+    echo -e "  等待 10 秒后重试..."
+    sleep 10
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:${LISTEN_PORT}/api/status 2>/dev/null)
+  fi
+  if [ "$HTTP_CODE" = "000" ] || [ -z "$HTTP_CODE" ]; then
+    echo -e "${RED}✗ Agent HTTP server 不响应（进程存活但连接被拒绝）${NC}"
+    echo -e "${YELLOW}  这通常是崩溃-重启循环的表现。正在诊断...${NC}"
+    echo -e "  ${CYAN}最近日志:${NC}"
+    journalctl -u serverguard-agent -n 30 --no-pager 2>/dev/null || true
+    echo ""
+    # 检查 OOM
+    if dmesg -T 2>/dev/null | grep -qiE "out of memory|oom.?kill.*serverguard"; then
+      echo -e "${RED}⚠ 检测到 OOM Kill！Agent 因内存不足被反复杀掉${NC}"
+      DB_PATH="/var/lib/serverguard/serverguard.db"
+      if [ -f "$DB_PATH" ]; then
+        DB_SIZE_MB=$(du -m "$DB_PATH" 2>/dev/null | cut -f1)
+        if [ -n "$DB_SIZE_MB" ] && [ "$DB_SIZE_MB" -gt 50 ]; then
+          echo -e "${YELLOW}  数据库 ${DB_SIZE_MB}MB 过大，正在清理...${NC}"
+          systemctl stop serverguard-agent 2>/dev/null || true
+          mv "$DB_PATH" "${DB_PATH}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+          rm -f "${DB_PATH}-wal" "${DB_PATH}-shm" 2>/dev/null || true
+          systemctl start serverguard-agent
+          sleep 10
+        fi
+      fi
+      # 同时增大内存限制
+      CURRENT_MAX=$(grep "^MemoryMax=" /etc/systemd/system/serverguard-agent.service 2>/dev/null | cut -d= -f2)
+      if [ -n "$CURRENT_MAX" ]; then
+        CURRENT_NUM=$(echo "$CURRENT_MAX" | grep -oP '[0-9]+')
+        NEW_NUM=$((CURRENT_NUM * 2))
+        if [ "$NEW_NUM" -gt 1024 ]; then NEW_NUM=1024; fi
+        sed -i "s/^MemoryMax=.*/MemoryMax=${NEW_NUM}M/" /etc/systemd/system/serverguard-agent.service
+        sed -i "s/^MemoryHigh=.*/MemoryHigh=$((NEW_NUM * 2 / 3))M/" /etc/systemd/system/serverguard-agent.service
+        echo -e "${YELLOW}  MemoryMax 已从 ${CURRENT_MAX} 调整为 ${NEW_NUM}M${NC}"
+        systemctl daemon-reload
+        systemctl restart serverguard-agent
+        sleep 10
+      fi
+    fi
+    # 重新检查
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1:${LISTEN_PORT}/api/status 2>/dev/null)
+  fi
+fi
+
 if systemctl is-active --quiet serverguard-agent; then
   SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
   if [ -z "$SERVER_IP" ]; then
@@ -495,7 +609,27 @@ else
   # 显示最近的 journal 日志
   journalctl -u serverguard-agent -n 30 --no-pager 2>/dev/null || true
   echo ""
-  echo -e "${CYAN}─── 手动测试 ───${NC}"
+  # 检查是否 OOM
+  if dmesg -T 2>/dev/null | grep -qiE "out of memory|oom.?kill.*serverguard"; then
+    echo -e "${RED}⚠ 检测到 OOM Kill！Agent 因内存不足被杀。${NC}"
+    echo -e "${YELLOW}  当前 MemoryMax=${MEM_MAX}，可能不够。${NC}"
+    echo -e "${YELLOW}  解决方法：编辑 /etc/systemd/system/serverguard-agent.service${NC}"
+    echo -e "${YELLOW}  将 MemoryMax 改大（如 256M），然后:${NC}"
+    echo -e "${YELLOW}  systemctl daemon-reload && systemctl restart serverguard-agent${NC}"
+    echo ""
+  fi
+  # 检查密码/密钥问题
+  if grep -qiE "jwt_secret.*change_me|password.*admin123|jwt_secret.*CHANGE_ME|password.*CHANGE" "${INSTALL_DIR}/config.yaml" 2>/dev/null; then
+    echo -e "${RED}⚠ 配置文件中的密码或密钥是占位符/弱值，Agent 会拒绝启动！${NC}"
+    echo -e "${YELLOW}  解决方法：${NC}"
+    echo -e "${YELLOW}  JWT=\$(openssl rand -hex 32)${NC}"
+    echo -e "${YELLOW}  PASS=\$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)${NC}"
+    echo -e "${YELLOW}  sed -i \"s/password:.*/password: \"\$PASS\"/\" ${INSTALL_DIR}/config.yaml${NC}"
+    echo -e "${YELLOW}  sed -i \"s/jwt_secret:.*/jwt_secret: \"\$JWT\"/\" ${INSTALL_DIR}/config.yaml${NC}"
+    echo -e "${YELLOW}  systemctl restart serverguard-agent${NC}"
+    echo ""
+  fi
+  echo -e "${CYAN}─── 手动测试（直接运行看报错）───${NC}"
   echo -e "  ${YELLOW}手动运行查看详细错误:${NC}"
   echo -e "  ${INSTALL_DIR}/serverguard-agent -config ${INSTALL_DIR}/config.yaml"
   echo ""
@@ -503,6 +637,39 @@ else
   echo -e "  1. 端口冲突: 检查 ss -tlnp | grep ${LISTEN_PORT}"
   echo -e "  2. 目录权限: ls -la /var/lib/serverguard/"
   echo -e "  3. 配置文件: cat ${INSTALL_DIR}/config.yaml"
+  echo -e "  4. 内存不足: dmesg | grep -i oom"
+  echo -e "  5. 如果外网访问 502 但本机 curl 200：检查 Nginx 反代端口是否为 ${LISTEN_PORT}"
+fi
+
+# ── Nginx 反代端口一致性检查 ──────────────────────────
+echo ""
+echo -e "${GREEN}[检查]${NC} Nginx 反向代理配置一致性"
+NGINX_PROXY_FOUND=false
+for ngdir in /www/server/panel/vhost/nginx /etc/nginx/conf.d /etc/nginx/sites-enabled; do
+  if [ -d "$ngdir" ]; then
+    PROXY_LINE=$(grep -rn "proxy_pass.*127.0.0.1" "$ngdir" 2>/dev/null | grep -iE "serverguard|${LISTEN_PORT}|9090|8443" | head -3 || true)
+    if [ -n "$PROXY_LINE" ]; then
+      NGINX_PROXY_FOUND=true
+      echo -e "  ${YELLOW}发现 Nginx 反代配置:${NC}"
+      echo -e "  $PROXY_LINE"
+      # 检查端口是否匹配
+      if echo "$PROXY_LINE" | grep -q ":${LISTEN_PORT}"; then
+        echo -e "  ${GREEN}✓ Nginx 反代端口与 Agent 监听端口一致 (${LISTEN_PORT})${NC}"
+      else
+        echo -e "  ${RED}✗ Nginx 反代端口与 Agent 监听端口不一致！${NC}"
+        echo -e "  ${YELLOW}  Agent 监听: ${LISTEN_PORT}${NC}"
+        echo -e "  ${YELLOW}  Nginx 反代到上面的端口${NC}"
+        echo -e "  ${YELLOW}  解决方法：${NC}"
+        echo -e "  ${YELLOW}  方案 A：修改 Nginx 配置中的 proxy_pass 为 127.0.0.1:${LISTEN_PORT}${NC}"
+        echo -e "  ${YELLOW}  方案 B：修改 /opt/serverguard/config.yaml 中 web.listen 为 Nginx 反代的端口${NC}"
+      fi
+    fi
+  fi
+done
+if [ "$NGINX_PROXY_FOUND" = false ]; then
+  echo -e "  ${YELLOW}未检测到指向 ServerGuard 的 Nginx 反代配置${NC}"
+  echo -e "  ${YELLOW}如需通过域名访问，请在宝塔面板 → 网站 → 反向代理中设置：${NC}"
+  echo -e "  ${YELLOW}  目标 URL: http://127.0.0.1:${LISTEN_PORT}${NC}"
 fi
 
 # ── 通知渠道引导（交互式，仅终端安装时）──

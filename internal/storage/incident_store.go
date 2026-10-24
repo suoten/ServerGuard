@@ -50,7 +50,11 @@ CREATE INDEX IF NOT EXISTS idx_incidents_started ON incidents(started_at DESC);
 }
 
 // SaveIncident 插入或更新一个故障事件（按 ID upsert）。
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) SaveIncident(inc types.Incident) error {
+	if s.IsWriteDegraded() {
+		return fmt.Errorf("storage degraded (disk full), incident write skipped")
+	}
 	if err := s.ensureIncidentSchema(); err != nil {
 		return err
 	}
@@ -164,7 +168,11 @@ func scanIncidents(rows *sql.Rows) ([]types.Incident, error) {
 
 // ResolveStaleIncidents 把超过 maxAge 无新成员的 open 事件标记为 resolved。
 // 返回本次关闭的事件（供引擎做知识沉淀与通知）。
+// 【磁盘满保护】降级时快速失败，避免 _busy_timeout 阻塞 5 秒
 func (s *Storage) ResolveStaleIncidents(maxAge time.Duration) ([]types.Incident, error) {
+	if s.IsWriteDegraded() {
+		return nil, fmt.Errorf("storage degraded (disk full), stale incidents resolve skipped")
+	}
 	if err := s.ensureIncidentSchema(); err != nil {
 		return nil, err
 	}
